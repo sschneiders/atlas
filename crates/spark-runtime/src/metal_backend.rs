@@ -2819,6 +2819,135 @@ mod tests {
         backend.free(out_ptr).unwrap();
     }
 
+    /// `selective_scan_decode` parity. Drives 3 decode steps so the
+    /// in-place state buffer is genuinely exercised, not coincidentally
+    /// always reading the same values. CPU reference uses the exact
+    /// same arithmetic — softplus(dt + dt_bias), -exp(A_log) decay,
+    /// FP32 state update, FP32 head-reduction for y.
+    #[test]
+    fn metal_selective_scan_decode_matches_reference() {
+        let modules = atlas_kernels::metallib_modules();
+        let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+
+        let num_heads: u32 = 4;
+        let num_channels: u32 = 16;
+
+        let a_log: Vec<f32> = (0..num_heads).map(|h| -1.0 - 0.1 * h as f32).collect();
+        let dt_bias: Vec<half::bf16> = (0..num_heads)
+            .map(|h| half::bf16::from_f32(-2.0 + 0.5 * h as f32))
+            .collect();
+
+        // Initial state: small non-zero values so the decay path is
+        // visibly contributing.
+        let mut state_cpu: Vec<half::bf16> = (0..(num_heads * num_channels))
+            .map(|i| half::bf16::from_f32(0.05 * (i as f32 * 0.13).sin()))
+            .collect();
+
+        let a_log_bytes: Vec<u8> = a_log.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let dt_bias_bytes = bf16_slice_to_bytes(&dt_bias);
+        let a_ptr = backend.alloc(a_log_bytes.len()).unwrap();
+        let dtb_ptr = backend.alloc(dt_bias_bytes.len()).unwrap();
+        let dt_ptr = backend.alloc(num_heads as usize * 2).unwrap();
+        let b_ptr = backend.alloc(num_heads as usize * 2).unwrap();
+        let c_ptr = backend.alloc(num_heads as usize * 2).unwrap();
+        let x_ptr = backend.alloc(num_channels as usize * 2).unwrap();
+        let state_ptr = backend.alloc((num_heads * num_channels) as usize * 2).unwrap();
+        let y_ptr = backend.alloc(num_channels as usize * 2).unwrap();
+        backend.copy_h2d(&a_log_bytes, a_ptr).unwrap();
+        backend.copy_h2d(&dt_bias_bytes, dtb_ptr).unwrap();
+        backend
+            .copy_h2d(&bf16_slice_to_bytes(&state_cpu), state_ptr)
+            .unwrap();
+
+        let kernel = backend
+            .kernel("selective_scan_decode", "selective_scan_decode")
+            .unwrap();
+
+        for step in 0..3u32 {
+            // Per-step inputs — varied so the state genuinely rotates.
+            let dt_raw: Vec<half::bf16> = (0..num_heads)
+                .map(|h| half::bf16::from_f32(0.5 + 0.1 * step as f32 + 0.05 * h as f32))
+                .collect();
+            let b_in: Vec<half::bf16> = (0..num_heads)
+                .map(|h| half::bf16::from_f32(0.3 + 0.05 * h as f32 - 0.01 * step as f32))
+                .collect();
+            let c_in: Vec<half::bf16> = (0..num_heads)
+                .map(|h| half::bf16::from_f32(0.2 - 0.03 * h as f32 + 0.02 * step as f32))
+                .collect();
+            let x_in: Vec<half::bf16> = (0..num_channels)
+                .map(|c| half::bf16::from_f32(0.4 + 0.01 * c as f32 + 0.05 * step as f32))
+                .collect();
+
+            backend.copy_h2d(&bf16_slice_to_bytes(&dt_raw), dt_ptr).unwrap();
+            backend.copy_h2d(&bf16_slice_to_bytes(&b_in), b_ptr).unwrap();
+            backend.copy_h2d(&bf16_slice_to_bytes(&c_in), c_ptr).unwrap();
+            backend.copy_h2d(&bf16_slice_to_bytes(&x_in), x_ptr).unwrap();
+
+            // CPU reference: identical arithmetic.
+            let mut expected = vec![half::bf16::ZERO; num_channels as usize];
+            for c in 0..num_channels as usize {
+                let xc = x_in[c].to_f32();
+                let mut acc = 0.0f32;
+                for h in 0..num_heads as usize {
+                    let a_eff = -(a_log[h]).exp();
+                    let dt_pre = dt_raw[h].to_f32() + dt_bias[h].to_f32();
+                    // Softplus with the same numeric guard as the kernel.
+                    let dt = if dt_pre > 20.0 { dt_pre } else { (1.0 + dt_pre.exp()).ln() };
+                    let decay = (dt * a_eff).exp();
+                    let bv = b_in[h].to_f32();
+                    let cv = c_in[h].to_f32();
+                    let old_s =
+                        state_cpu[h * num_channels as usize + c].to_f32();
+                    let new_s = old_s * decay + dt * bv * xc;
+                    state_cpu[h * num_channels as usize + c] =
+                        half::bf16::from_f32(new_s);
+                    acc += new_s * cv;
+                }
+                expected[c] = half::bf16::from_f32(acc);
+            }
+
+            backend
+                .launch_typed(
+                    kernel,
+                    [num_channels, 1, 1],
+                    [64, 1, 1],
+                    0,
+                    backend.default_stream(),
+                    &[
+                        KernelArg::Bytes(&num_heads.to_le_bytes()),
+                        KernelArg::Bytes(&num_channels.to_le_bytes()),
+                        KernelArg::Buffer(a_ptr),
+                        KernelArg::Buffer(dtb_ptr),
+                        KernelArg::Buffer(dt_ptr),
+                        KernelArg::Buffer(b_ptr),
+                        KernelArg::Buffer(c_ptr),
+                        KernelArg::Buffer(x_ptr),
+                        KernelArg::Buffer(state_ptr),
+                        KernelArg::Buffer(y_ptr),
+                    ],
+                )
+                .expect("launch selective_scan_decode");
+            backend.synchronize(backend.default_stream()).unwrap();
+
+            let mut y_raw = vec![0u8; num_channels as usize * 2];
+            backend.copy_d2h(y_ptr, &mut y_raw).unwrap();
+            let actual = bytes_to_bf16_vec(&y_raw);
+
+            for c in 0..num_channels as usize {
+                let e = expected[c].to_f32();
+                let a = actual[c].to_f32();
+                assert!(
+                    (e - a).abs() < 0.02,
+                    "step {step} ch {c}: expected {e}, got {a}"
+                );
+            }
+        }
+
+        for ptr in [a_ptr, dtb_ptr, dt_ptr, b_ptr, c_ptr, x_ptr, state_ptr, y_ptr] {
+            backend.free(ptr).unwrap();
+        }
+    }
+
     /// `causal_conv1d_decode` parity. Drives a few decode steps
     /// against the CPU reference so the in-place state shift is
     /// pinned (a read-after-write bug there would corrupt the next
