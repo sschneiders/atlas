@@ -4,7 +4,10 @@
 #![deny(clippy::all)]
 
 pub mod buffers;
+#[cfg(feature = "cuda")]
 pub mod cuda_backend;
+#[cfg(feature = "metal")]
+pub mod metal_backend;
 #[cfg(unix)]
 pub mod fast_weights;
 pub mod gpu;

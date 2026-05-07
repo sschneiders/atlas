@@ -7,6 +7,9 @@ description = "Atlas Spark runtime — GPU backend, weight loading, KV cache, sc
 autobenches = false
 
 [features]
+default = ["cuda"]
+cuda = ["dep:cudarc", "atlas-core/cuda"]
+metal = ["atlas-core/metal"]
 test-utils = []
 
 [[bin]]
@@ -28,7 +31,7 @@ required-features = ["test-utils"]
 [dependencies]
 atlas-core = { workspace = true }
 atlas-kernels = { workspace = true }
-cudarc = { workspace = true }
+cudarc = { workspace = true, optional = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

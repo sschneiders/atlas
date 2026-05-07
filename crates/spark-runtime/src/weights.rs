@@ -13,19 +13,21 @@ use std::path::Path;
 /// After copying tensors to GPU, the mmap pages linger in the page cache,
 /// consuming memory that should be available for KV cache and inference buffers.
 /// This function tells the kernel those pages are no longer needed.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(crate) fn evict_page_cache(file: &std::fs::File) {
     use std::os::unix::io::AsRawFd;
-    // POSIX_FADV_DONTNEED = 4 on Linux (POSIX standard)
+    // POSIX_FADV_DONTNEED = 4 on Linux (POSIX standard).
+    // macOS lacks posix_fadvise — see the non-linux branch below.
     const POSIX_FADV_DONTNEED: libc::c_int = 4;
     unsafe {
         libc::posix_fadvise(file.as_raw_fd(), 0, 0, POSIX_FADV_DONTNEED);
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn evict_page_cache(_file: &std::fs::File) {
-    // No-op on non-Unix platforms.
+    // No-op: macOS/BSD have no posix_fadvise. Apple Silicon UMA already
+    // shares page cache with the GPU pool, so eviction is unnecessary.
 }
 
 /// Data type of a weight tensor.

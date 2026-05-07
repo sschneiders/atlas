@@ -8,6 +8,10 @@
 //! Shared utilities for Criterion benchmarks and correctness tests.
 //! Expects a running Atlas Spark server (default: `http://localhost:8888`).
 
+// `gpu` wraps `cudarc` + raw CUDA driver FFI, so it's only available when
+// the cuda feature is on. The HTTP-level benchmarks below are platform-
+// agnostic and stay unconditionally exported.
+#[cfg(feature = "cuda")]
 pub mod gpu;
 
 use std::io::BufRead;

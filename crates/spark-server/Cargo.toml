@@ -5,6 +5,14 @@ edition = "2024"
 license.workspace = true
 description = "Atlas Spark — pure Rust LLM inference server"
 
+[features]
+default = ["cuda"]
+# Forwards through to atlas-core/spark-runtime/spark-model so the default
+# Linux build still activates the cuda backend after atlas-core became
+# default-features = false at the workspace level.
+cuda = ["atlas-core/cuda", "spark-runtime/cuda", "spark-model/cuda"]
+metal = ["atlas-core/metal", "spark-runtime/metal", "spark-model/metal"]
+
 [[bin]]
 name = "spark"
 path = "src/main.rs"
@@ -12,8 +20,10 @@ path = "src/main.rs"
 [dependencies]
 atlas-core = { workspace = true }
 atlas-kernels = { workspace = true }
-spark-runtime = { path = "../spark-runtime" }
-spark-model = { path = "../spark-model" }
+# `default-features = false` on path-deps so the metal feature actually
+# disables the cuda default that each downstream crate inherits.
+spark-runtime = { path = "../spark-runtime", default-features = false }
+spark-model = { path = "../spark-model", default-features = false }
 spark-comm = { path = "../spark-comm" }
 spark-storage = { path = "../spark-storage" }
 anyhow = { workspace = true }

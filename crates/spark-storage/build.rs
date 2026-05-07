@@ -27,6 +27,18 @@ const KERNELS: &[&str] = &[
 fn main() {
     println!("cargo:rerun-if-env-changed=ATLAS_SKIP_BUILD");
     println!("cargo:rerun-if-env-changed=SKIP_ATLAS_BUILD");
+
+    // Apple Silicon hosts have no libcuda and no nvcc. Emit the stub and
+    // skip the linker hint so `cargo check` works under
+    // `--no-default-features --features metal`. Production CUDA builds
+    // still link libcuda below.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "macos" {
+        emit_stub();
+        println!("cargo:rerun-if-changed=build.rs");
+        return;
+    }
+
     // libcuda must always be linked — the skip flag only suppresses nvcc
     // PTX compilation, not the rustc linker step. Examples and binaries
     // still call into `cuda_min` / `cuda_module` and need the dynamic

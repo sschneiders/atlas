@@ -6,9 +6,16 @@ license.workspace = true
 description = "Atlas: shared types, model config parsing, registry, and per-target build manifests for the Atlas inference engine."
 repository.workspace = true
 
+[features]
+# Default to CUDA so existing Linux/NVIDIA builds remain unchanged. macOS
+# Apple Silicon builds opt out via `--no-default-features --features metal`.
+default = ["cuda"]
+cuda = ["dep:cudarc"]
+metal = []
+
 [dependencies]
 anyhow = { workspace = true }
-cudarc = { workspace = true }
+cudarc = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

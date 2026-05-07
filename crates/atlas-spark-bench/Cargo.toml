@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["cuda"]
+cuda = ["dep:cudarc", "atlas-core/cuda"]
+metal = ["atlas-core/metal"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -13,7 +18,7 @@ ureq = { version = "3", features = ["json"] }
 # Kernel microbenchmark dependencies
 atlas-core = { workspace = true }
 atlas-kernels = { workspace = true }
-cudarc = { workspace = true }
+cudarc = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

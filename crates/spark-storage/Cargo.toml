@@ -18,6 +18,12 @@ rand_distr = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# io-uring is Linux-only — macOS is `cfg(unix)` but lacks the syscall layer
+# (uses kqueue instead). Gating on `target_os = "linux"` lets the rest of
+# spark-storage compile-check on Apple Silicon, even though the NVMe-swap
+# code paths that actually need io-uring won't be reachable there.
+[target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
 
 [dev-dependencies]

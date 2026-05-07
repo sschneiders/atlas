@@ -49,7 +49,10 @@ anyhow = "1"
 parking_lot = "0.12"
 
 # Workspace crates
-atlas-core = { path = "crates/atlas-core" }
+# atlas-core: `default-features = false` so each consumer crate forwards the
+# right backend feature explicitly (cuda or metal). Without this, every
+# member would silently pull in cudarc via atlas-core's `cuda` default.
+atlas-core = { path = "crates/atlas-core", default-features = false }
 atlas-quant = { path = "crates/atlas-quant" }
 atlas-norm = { path = "crates/atlas-norm" }
 atlas-activation = { path = "crates/atlas-activation" }
