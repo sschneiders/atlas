@@ -148,6 +148,73 @@ fn test_parse_qwen3_vl_config() {
     assert!(cfg.norm_topk_prob);
 }
 
+/// Qwen3.5-VL detection: the trunk `model_type` stays `qwen3_5`
+/// (same as the text-only variant) but the upstream config ships a
+/// `vision_config` block plus `architectures =
+/// ["Qwen3_5ForConditionalGeneration"]`. `is_qwen3_vl()` must
+/// distinguish via the parsed `config.vision` so the factory routes
+/// the checkpoint to the VL weight loader instead of the dense LLM
+/// loader.
+#[test]
+fn test_parse_qwen3_5_vl_config() {
+    let json = r#"{
+        "model_type": "qwen3_5",
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "text_config": {
+            "model_type": "qwen3_5",
+            "hidden_size": 2560,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "intermediate_size": 9216,
+            "vocab_size": 248320,
+            "rope_theta": 10000000.0
+        },
+        "vision_config": {
+            "hidden_size": 1024,
+            "num_hidden_layers": 27,
+            "num_attention_heads": 16,
+            "intermediate_size": 4096,
+            "patch_size": 16,
+            "spatial_merge_size": 2
+        }
+    }"#;
+    let cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.model_type, "qwen3_5");
+    assert!(
+        cfg.is_qwen3_vl(),
+        "Qwen3.5-VL detected via model_type=qwen3_5 + vision_config presence"
+    );
+    assert!(cfg.vision.is_some());
+}
+
+/// Counter-test: a text-only `qwen3_5` config WITHOUT `vision_config`
+/// must NOT be misclassified as VL. Pins the gate condition is
+/// actually using `vision.is_some()`, not just model_type.
+#[test]
+fn test_qwen3_5_text_only_not_vl() {
+    let json = r#"{
+        "model_type": "qwen3_5",
+        "text_config": {
+            "model_type": "qwen3_5",
+            "hidden_size": 2560,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "vocab_size": 151936,
+            "rope_theta": 10000000.0
+        }
+    }"#;
+    let cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.model_type, "qwen3_5");
+    assert!(
+        !cfg.is_qwen3_vl(),
+        "qwen3_5 without vision_config must not be classified as VL"
+    );
+}
+
 /// Regression for the alpha-2.99 dispatch bug:
 /// Kbenkhaled/Qwen3.5-27B-NVFP4 is a *dense* hybrid (top model_type
 /// "qwen3_5", num_experts=0) that nonetheless enables MRoPE in

@@ -182,8 +182,24 @@ impl ModelConfig {
     }
 
     /// Factory use only.
+    ///
+    /// Recognises the upstream `qwen3_vl_moe` model_type (Qwen3-VL MoE)
+    /// and Qwen3.5-VL — which ships with `model_type = "qwen3_5"` plus
+    /// `architectures = ["Qwen3_5ForConditionalGeneration"]` and a
+    /// populated `vision_config` block. The vision_config presence is
+    /// the durable signal: the trunk model_type stays `qwen3_5` whether
+    /// the checkpoint is text-only or VL, but VL ships an extra
+    /// vision encoder which the parser exposes as `config.vision`.
     pub fn is_qwen3_vl(&self) -> bool {
-        self.model_type == "qwen3_vl_moe"
+        if self.model_type == "qwen3_vl_moe" {
+            return true;
+        }
+        // Qwen3.5-VL: trunk model_type is `qwen3_5`; the vision tower
+        // is detected by the parsed `vision_config` block.
+        if self.model_type == "qwen3_5" && self.vision.is_some() {
+            return true;
+        }
+        false
     }
 
     /// Whether to skip NVFP4 quantization of the LM head.
