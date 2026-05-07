@@ -2076,6 +2076,93 @@ mod tests {
         backend.free(result_ptr).unwrap();
     }
 
+    /// `dense_gemm_bf16` parity. Multi-token prefill BF16 matmul
+    /// vs CPU FP32 reference. Same weight layout as
+    /// `dense_gemv_bf16` (`[N, K]` row-major) so the ViT prefill
+    /// path can use either kernel without reshaping weights.
+    #[test]
+    fn metal_dense_gemm_bf16_matches_reference() {
+        let modules = atlas_kernels::metallib_modules();
+        let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+
+        let m: u32 = 4;
+        let n: u32 = 8;
+        let k: u32 = 64;
+
+        let x: Vec<half::bf16> = (0..(m * k))
+            .map(|i| half::bf16::from_f32(0.1 + 0.001 * i as f32))
+            .collect();
+        let w: Vec<half::bf16> = (0..(n * k))
+            .map(|i| {
+                let row = i / k;
+                let col = i % k;
+                half::bf16::from_f32(0.001 + 0.0005 * row as f32 + 0.0007 * col as f32)
+            })
+            .collect();
+
+        let mut expected: Vec<half::bf16> = vec![half::bf16::ZERO; (m * n) as usize];
+        for mi in 0..m as usize {
+            for ni in 0..n as usize {
+                let mut acc = 0.0f32;
+                for ki in 0..k as usize {
+                    acc += x[mi * k as usize + ki].to_f32()
+                        * w[ni * k as usize + ki].to_f32();
+                }
+                expected[mi * n as usize + ni] = half::bf16::from_f32(acc);
+            }
+        }
+
+        let x_bytes = bf16_slice_to_bytes(&x);
+        let w_bytes = bf16_slice_to_bytes(&w);
+        let x_ptr = backend.alloc(x_bytes.len()).unwrap();
+        let w_ptr = backend.alloc(w_bytes.len()).unwrap();
+        let y_ptr = backend.alloc((m * n) as usize * 2).unwrap();
+        backend.copy_h2d(&x_bytes, x_ptr).unwrap();
+        backend.copy_h2d(&w_bytes, w_ptr).unwrap();
+
+        let kernel = backend.kernel("dense_gemm_bf16", "dense_gemm_bf16").unwrap();
+        let block_x = 16u32;
+        let block_y = 16u32;
+        backend
+            .launch_typed(
+                kernel,
+                [n.div_ceil(block_x), m.div_ceil(block_y), 1],
+                [block_x, block_y, 1],
+                0,
+                backend.default_stream(),
+                &[
+                    KernelArg::Bytes(&m.to_le_bytes()),
+                    KernelArg::Bytes(&n.to_le_bytes()),
+                    KernelArg::Bytes(&k.to_le_bytes()),
+                    KernelArg::Buffer(x_ptr),
+                    KernelArg::Buffer(w_ptr),
+                    KernelArg::Buffer(y_ptr),
+                ],
+            )
+            .expect("launch dense_gemm_bf16");
+        backend.synchronize(backend.default_stream()).unwrap();
+
+        let mut y_raw = vec![0u8; (m * n) as usize * 2];
+        backend.copy_d2h(y_ptr, &mut y_raw).unwrap();
+        let actual = bytes_to_bf16_vec(&y_raw);
+
+        let mut max_abs_diff: f32 = 0.0;
+        for i in 0..(m * n) as usize {
+            let d = (expected[i].to_f32() - actual[i].to_f32()).abs();
+            if d > max_abs_diff {
+                max_abs_diff = d;
+            }
+        }
+        assert!(
+            max_abs_diff < 0.05,
+            "dense_gemm_bf16: max |expected - actual| = {max_abs_diff}"
+        );
+
+        backend.free(x_ptr).unwrap();
+        backend.free(w_ptr).unwrap();
+        backend.free(y_ptr).unwrap();
+    }
+
     /// `dense_gemv_bf16` parity. Pure BF16 matvec vs CPU FP32
     /// reference. Same reduction shape as `mlx_int8_gemv` minus
     /// the fused dequant.
