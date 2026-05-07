@@ -244,10 +244,124 @@ pub fn target_for_vendor(vendor: Option<&str>) -> Box<dyn ComputeTarget> {
         Some(Vendor::Nvidia) | None => {
             Box::new(NvidiaTarget::new().expect("nvcc not found — install CUDA toolkit"))
         }
-        Some(v) => {
-            panic!("Compute target '{v}' is not yet implemented. Only 'nvidia' is supported.")
-        }
+        Some(Vendor::Apple) => Box::new(
+            AppleTarget::new()
+                .expect("xcrun not found — install Xcode Command Line Tools (xcode-select --install)"),
+        ),
+        Some(v) => panic!(
+            "Compute target '{v}' is not yet implemented. \
+             Supported: 'nvidia', 'apple'."
+        ),
     }
+}
+
+/// Apple Metal compilation target: `.metal` → `metallib` via the
+/// two-step `xcrun -sdk macosx metal -c {src} -o {tmp}.air` then
+/// `xcrun -sdk macosx metallib {tmp}.air -o {dst}.metallib` pipeline.
+pub struct AppleTarget {
+    xcrun_path: PathBuf,
+}
+
+impl AppleTarget {
+    /// Locate `xcrun`. Returns `None` when Xcode Command Line Tools are
+    /// missing — the caller decides whether that's fatal.
+    pub fn new() -> Option<Self> {
+        find_xcrun().map(|xcrun_path| Self { xcrun_path })
+    }
+
+    /// Construct with an explicit `xcrun` path (escape hatch for unusual
+    /// toolchain layouts).
+    pub fn with_compiler(xcrun_path: PathBuf) -> Self {
+        Self { xcrun_path }
+    }
+}
+
+impl ComputeTarget for AppleTarget {
+    fn source_extension(&self) -> &str {
+        "metal"
+    }
+
+    fn output_extension(&self) -> &str {
+        "metallib"
+    }
+
+    fn output_is_text(&self) -> bool {
+        false
+    }
+
+    fn find_compiler(&self) -> Option<PathBuf> {
+        Some(self.xcrun_path.clone())
+    }
+
+    fn compile(
+        &self,
+        source: &Path,
+        output: &Path,
+        arch: &str,
+        extra_flags: &[String],
+    ) -> Result<(), String> {
+        // Stage 1: source.metal → tmp.air
+        let air_path = output.with_extension("air");
+        let mut metal_args: Vec<String> =
+            vec!["-sdk".into(), "macosx".into(), "metal".into()];
+        if !arch.is_empty() {
+            metal_args.push(format!("-std={arch}"));
+        }
+        metal_args.push("-c".into());
+        metal_args.push("-O3".into());
+        metal_args.extend(extra_flags.iter().cloned());
+        metal_args.push(source.to_str().unwrap().into());
+        metal_args.push("-o".into());
+        metal_args.push(air_path.to_str().unwrap().into());
+
+        let result = std::process::Command::new(&self.xcrun_path)
+            .args(&metal_args)
+            .output()
+            .map_err(|e| format!("Failed to run xcrun metal: {e}"))?;
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            return Err(format!(
+                "xcrun metal failed for {}: {}",
+                source.display(),
+                stderr
+            ));
+        }
+
+        // Stage 2: tmp.air → output.metallib
+        let result = std::process::Command::new(&self.xcrun_path)
+            .args([
+                "-sdk",
+                "macosx",
+                "metallib",
+                air_path.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+            ])
+            .output()
+            .map_err(|e| format!("Failed to run xcrun metallib: {e}"))?;
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            return Err(format!(
+                "xcrun metallib failed for {}: {}",
+                source.display(),
+                stderr
+            ));
+        }
+        Ok(())
+    }
+
+    fn vendor(&self) -> Vendor {
+        Vendor::Apple
+    }
+}
+
+/// Locate xcrun via the canonical path or PATH fallback.
+fn find_xcrun() -> Option<PathBuf> {
+    let canonical = PathBuf::from("/usr/bin/xcrun");
+    if canonical.exists() {
+        return Some(canonical);
+    }
+    which_in_path("xcrun")
 }
 
 #[cfg(test)]

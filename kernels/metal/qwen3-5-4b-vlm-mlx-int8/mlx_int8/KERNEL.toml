@@ -1,0 +1,6 @@
+[build]
+# Per-quant overrides: empty for now. Vision-tower kernels will live next
+# to this file (Phase 6).
+extra_metal_flags = []
+
+[modules]

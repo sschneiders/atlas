@@ -10,6 +10,7 @@ use super::{DflashRaw, ModelTypeMatch, SamplingCat};
 
 pub(super) fn parse_kernel_toml(
     kernel_dir: &std::path::Path,
+    vendor: &str,
 ) -> (Vec<String>, HashMap<String, String>) {
     let kernel_toml_path = kernel_dir.join("KERNEL.toml");
     let kernel_toml: toml::Value = toml::from_str(
@@ -19,9 +20,17 @@ pub(super) fn parse_kernel_toml(
     .unwrap_or_else(|e| panic!("Bad TOML in {}: {e}", kernel_toml_path.display()));
     println!("cargo:rerun-if-changed={}", kernel_toml_path.display());
 
+    // Per-vendor extra flag keys. NVIDIA reads `extra_nvcc_flags`; Apple
+    // reads `extra_metal_flags`. KERNEL.toml may declare both — only the
+    // vendor-matching list is forwarded so flags don't bleed across
+    // toolchains (e.g. nvcc's `--fmad=false` is invalid for xcrun metal).
+    let flag_key = match vendor {
+        "apple" | "metal" => "extra_metal_flags",
+        _ => "extra_nvcc_flags",
+    };
     let extra_flags: Vec<String> = kernel_toml
         .get("build")
-        .and_then(|b| b.get("extra_nvcc_flags"))
+        .and_then(|b| b.get(flag_key))
         .and_then(|f| f.as_array())
         .map(|arr| {
             arr.iter()

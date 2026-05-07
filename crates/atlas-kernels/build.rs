@@ -155,14 +155,17 @@ fn main() {
         .and_then(|v| v.as_str());
     let compute_target = resolve_compute_target(vendor_str);
     let output_ext = compute_target.output_extension();
+    let output_is_text = compute_target.output_is_text();
 
     // Per-target: (target_idx, vec of (stem, module_name))
     let mut all_target_modules: Vec<Vec<(String, String)>> = Vec::new();
 
+    let source_ext = compute_target.source_extension();
     for (idx, target) in targets.iter().enumerate() {
         let cu_files = collect_cu_files(
             target.common_kernel_dir.as_deref(),
             &target.model_kernel_dir,
+            source_ext,
         );
         assert!(
             !cu_files.is_empty(),
@@ -218,7 +221,7 @@ fn main() {
         if let Some(ref common) = target.common_kernel_dir {
             println!("cargo:rerun-if-changed={}", common.display());
         }
-        let n_overrides = find_cu_files(&target.model_kernel_dir).len();
+        let n_overrides = find_cu_files(&target.model_kernel_dir, source_ext).len();
         println!(
             "cargo:warning=atlas-kernels: compiled {} kernels for target {} ({}, {}, {}){}",
             cu_files.len(),
@@ -235,7 +238,8 @@ fn main() {
     }
 
     // ── Generate target_ptx.rs ──
-    let generated = generate_target_ptx_rs(&targets, &all_target_modules);
+    let generated =
+        generate_target_ptx_rs(&targets, &all_target_modules, output_ext, output_is_text);
     let gen_path = out_dir.join("target_ptx.rs");
     std::fs::write(&gen_path, &generated)
         .unwrap_or_else(|e| panic!("Failed to write {}: {e}", gen_path.display()));
@@ -266,6 +270,12 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
     let arch = hw_toml["hardware"]["arch"]
         .as_str()
         .expect("hardware.arch must be a string in HARDWARE.toml")
+        .to_string();
+    // Vendor steers per-vendor flag-key parsing in parse_kernel_toml
+    // (e.g. extra_metal_flags vs extra_nvcc_flags).
+    let target_vendor = hw_toml["hardware"]["vendor"]
+        .as_str()
+        .unwrap_or("nvidia")
         .to_string();
     println!("cargo:rerun-if-changed={}", hw_toml_path.display());
 
@@ -335,7 +345,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
             } else {
                 &model_kernel_dir
             };
-            let (extra_flags, module_overrides) = parse_kernel_toml(toml_dir);
+            let (extra_flags, module_overrides) = parse_kernel_toml(toml_dir, &target_vendor);
 
             // Parse sampling presets, behavior, and model_types from MODEL.toml
             let (s_tt, s_tc, s_nt, s_tools) = parse_sampling_presets(&model_dir);
@@ -413,24 +423,27 @@ use build_parse::{
     parse_behavior, parse_dflash, parse_kernel_toml, parse_model_types, parse_sampling_presets,
 };
 
-/// Collect .cu files with shadowing: common dir provides the base set,
-/// model-specific dir can override individual files by matching filename.
+/// Collect kernel-source files with shadowing: common dir provides the
+/// base set, model-specific dir can override individual files by matching
+/// filename. `source_ext` is the per-vendor extension (e.g. "cu" for
+/// NVIDIA, "metal" for Apple).
 fn collect_cu_files(
     common_dir: Option<&std::path::Path>,
     model_dir: &std::path::Path,
+    source_ext: &str,
 ) -> Vec<PathBuf> {
     let mut files: HashMap<String, PathBuf> = HashMap::new();
 
     // Base layer: common kernels
     if let Some(common) = common_dir {
-        for f in find_cu_files(common) {
+        for f in find_cu_files(common, source_ext) {
             let stem = f.file_stem().unwrap().to_str().unwrap().to_string();
             files.insert(stem, f);
         }
     }
 
-    // Override layer: model-specific .cu files shadow common ones
-    for f in find_cu_files(model_dir) {
+    // Override layer: model-specific kernel files shadow common ones
+    for f in find_cu_files(model_dir, source_ext) {
         let stem = f.file_stem().unwrap().to_str().unwrap().to_string();
         files.insert(stem, f);
     }
@@ -440,15 +453,16 @@ fn collect_cu_files(
     result
 }
 
-/// Find all .cu files in a directory. Returns empty vec if dir doesn't exist.
-fn find_cu_files(kernel_dir: &std::path::Path) -> Vec<PathBuf> {
+/// Find all kernel-source files (extension `source_ext`) in a directory.
+/// Returns empty vec if dir doesn't exist.
+fn find_cu_files(kernel_dir: &std::path::Path, source_ext: &str) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(kernel_dir) else {
         return Vec::new();
     };
     entries
         .filter_map(|entry| {
             let path = entry.ok()?.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("cu") {
+            if path.extension().and_then(|e| e.to_str()) == Some(source_ext) {
                 Some(path)
             } else {
                 None
