@@ -33,6 +33,14 @@ name = "metal_layer3_attention"
 path = "examples/metal_layer3_attention.rs"
 required-features = ["metal"]
 
+# Parallel demo for the ViT vision tower: loads
+# `vision_tower.blocks.0` (real BF16 weights, no MLX quantization)
+# and runs a single non-causal attention + GeLU MLP block forward.
+[[example]]
+name = "metal_vision_block_forward"
+path = "examples/metal_vision_block_forward.rs"
+required-features = ["metal"]
+
 # Integration test gated by `test-utils` because it depends on the
 # `gpu::mock` module, which is itself `cfg(any(test, feature = "test-utils"))`.
 # Without this gate, default `cargo test --workspace` would attempt to compile
