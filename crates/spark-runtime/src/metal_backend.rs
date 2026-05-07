@@ -2076,6 +2076,142 @@ mod tests {
         backend.free(result_ptr).unwrap();
     }
 
+    /// `bf16_add` parity. Trivial element-wise check — the kernel
+    /// is one line of math but it's the residual primitive every
+    /// transformer block uses, so a regression here would silently
+    /// blow up every layer's output.
+    #[test]
+    fn metal_bf16_add_matches_reference() {
+        let modules = atlas_kernels::metallib_modules();
+        let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+
+        let n: u32 = 257; // odd to verify bounds-check on tail thread
+        let a: Vec<half::bf16> = (0..n)
+            .map(|i| half::bf16::from_f32(0.1 + 0.001 * i as f32))
+            .collect();
+        let b: Vec<half::bf16> = (0..n)
+            .map(|i| half::bf16::from_f32(-0.05 + 0.0007 * i as f32))
+            .collect();
+
+        let mut expected = vec![half::bf16::ZERO; n as usize];
+        for i in 0..n as usize {
+            expected[i] = half::bf16::from_f32(a[i].to_f32() + b[i].to_f32());
+        }
+
+        let a_bytes = bf16_slice_to_bytes(&a);
+        let b_bytes = bf16_slice_to_bytes(&b);
+        let a_ptr = backend.alloc(a_bytes.len()).unwrap();
+        let b_ptr = backend.alloc(b_bytes.len()).unwrap();
+        let out_ptr = backend.alloc(a_bytes.len()).unwrap();
+        backend.copy_h2d(&a_bytes, a_ptr).unwrap();
+        backend.copy_h2d(&b_bytes, b_ptr).unwrap();
+
+        let kernel = backend.kernel("bf16_add", "bf16_add").unwrap();
+        let block: u32 = 64;
+        backend
+            .launch_typed(
+                kernel,
+                [n.div_ceil(block), 1, 1],
+                [block, 1, 1],
+                0,
+                backend.default_stream(),
+                &[
+                    KernelArg::Bytes(&n.to_le_bytes()),
+                    KernelArg::Buffer(a_ptr),
+                    KernelArg::Buffer(b_ptr),
+                    KernelArg::Buffer(out_ptr),
+                ],
+            )
+            .expect("launch bf16_add");
+        backend.synchronize(backend.default_stream()).unwrap();
+
+        let mut out_raw = vec![0u8; a_bytes.len()];
+        backend.copy_d2h(out_ptr, &mut out_raw).unwrap();
+        let actual = bytes_to_bf16_vec(&out_raw);
+
+        for i in 0..n as usize {
+            assert!(
+                (expected[i].to_f32() - actual[i].to_f32()).abs() < 1e-4,
+                "bf16_add mismatch at idx {i}"
+            );
+        }
+
+        backend.free(a_ptr).unwrap();
+        backend.free(b_ptr).unwrap();
+        backend.free(out_ptr).unwrap();
+    }
+
+    /// `sigmoid_gate` parity. `out = sigmoid(gate) * x`. Distinct
+    /// from `silu_gate` (which is `gate * sigmoid(gate) * up`) —
+    /// Qwen3.5 uses this for `attn_output_gate`.
+    #[test]
+    fn metal_sigmoid_gate_matches_reference() {
+        let modules = atlas_kernels::metallib_modules();
+        let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+
+        let n: u32 = 128;
+        let gate: Vec<half::bf16> = (0..n)
+            .map(|i| half::bf16::from_f32(-3.0 + 6.0 * i as f32 / (n - 1) as f32))
+            .collect();
+        let x: Vec<half::bf16> = (0..n)
+            .map(|i| half::bf16::from_f32(0.5 + 0.01 * i as f32))
+            .collect();
+
+        let mut expected = vec![half::bf16::ZERO; n as usize];
+        for i in 0..n as usize {
+            let g = gate[i].to_f32();
+            let v = x[i].to_f32();
+            let sig = 1.0 / (1.0 + (-g).exp());
+            expected[i] = half::bf16::from_f32(sig * v);
+        }
+
+        let g_bytes = bf16_slice_to_bytes(&gate);
+        let x_bytes = bf16_slice_to_bytes(&x);
+        let g_ptr = backend.alloc(g_bytes.len()).unwrap();
+        let x_ptr = backend.alloc(x_bytes.len()).unwrap();
+        let out_ptr = backend.alloc(g_bytes.len()).unwrap();
+        backend.copy_h2d(&g_bytes, g_ptr).unwrap();
+        backend.copy_h2d(&x_bytes, x_ptr).unwrap();
+
+        let kernel = backend.kernel("sigmoid_gate", "sigmoid_gate").unwrap();
+        backend
+            .launch_typed(
+                kernel,
+                [n.div_ceil(64), 1, 1],
+                [64, 1, 1],
+                0,
+                backend.default_stream(),
+                &[
+                    KernelArg::Bytes(&n.to_le_bytes()),
+                    KernelArg::Buffer(g_ptr),
+                    KernelArg::Buffer(x_ptr),
+                    KernelArg::Buffer(out_ptr),
+                ],
+            )
+            .expect("launch sigmoid_gate");
+        backend.synchronize(backend.default_stream()).unwrap();
+
+        let mut out_raw = vec![0u8; g_bytes.len()];
+        backend.copy_d2h(out_ptr, &mut out_raw).unwrap();
+        let actual = bytes_to_bf16_vec(&out_raw);
+
+        let mut max_abs_diff: f32 = 0.0;
+        for i in 0..n as usize {
+            let d = (expected[i].to_f32() - actual[i].to_f32()).abs();
+            if d > max_abs_diff {
+                max_abs_diff = d;
+            }
+        }
+        assert!(
+            max_abs_diff < 0.02,
+            "sigmoid_gate: max |expected - actual| = {max_abs_diff}"
+        );
+
+        backend.free(g_ptr).unwrap();
+        backend.free(x_ptr).unwrap();
+        backend.free(out_ptr).unwrap();
+    }
+
     /// `causal_conv1d_decode` parity. Drives a few decode steps
     /// against the CPU reference so the in-place state shift is
     /// pinned (a read-after-write bug there would corrupt the next
