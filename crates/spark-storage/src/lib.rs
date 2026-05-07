@@ -78,6 +78,15 @@ pub use eviction::EvictionPolicy;
 #[cfg(feature = "cuda")]
 pub use high_speed_swap::{HighSpeedSwap, install_local, local_installed, with_local};
 
+// Non-cuda stub surface — same names as the real CUDA orchestrator
+// above so spark-model's call sites compile unchanged. `with_local`
+// always returns None (orchestrator absent), `local_installed` is
+// false, and `install_local` bails — see `stubs.rs` for rationale.
+#[cfg(not(feature = "cuda"))]
+mod stubs;
+#[cfg(not(feature = "cuda"))]
+pub use stubs::{HighSpeedSwap, install_local, local_installed, with_local};
+
 #[cfg(feature = "cuda")]
 pub use predictor::{Predictor, PredictorDims};
 #[cfg(feature = "cuda")]

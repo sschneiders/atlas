@@ -158,6 +158,15 @@ pub(crate) fn preflight_reserve(
     })
 }
 
+/// Initialize the GPU backend for the active feature.
+///
+/// Compile-time dispatch:
+/// - `cuda` feature → `AtlasCudaBackend` loading PTX modules from `ptx_set`.
+/// - `metal` feature → `MetalGpuBackend` loading metallib modules from
+///   `atlas_kernels::metallib_modules()`. The `ptx_set` argument is
+///   accepted (for ABI symmetry with the cuda variant) but ignored;
+///   metal kernels live in a parallel registry.
+#[cfg(feature = "cuda")]
 pub(crate) fn init_gpu_backend(
     args: &cli::ServeArgs,
     ptx_set: &atlas_kernels::TargetPtxSet,
@@ -170,6 +179,27 @@ pub(crate) fn init_gpu_backend(
     let free_mem = gpu.free_memory()?;
     tracing::info!(
         "GPU {}: {:.1} GB total, {:.1} GB free",
+        args.gpu_ordinal,
+        total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
+        free_mem as f64 / (1024.0 * 1024.0 * 1024.0),
+    );
+    Ok((gpu, free_mem))
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub(crate) fn init_gpu_backend(
+    args: &cli::ServeArgs,
+    _ptx_set: &atlas_kernels::TargetPtxSet,
+) -> Result<(Box<dyn spark_runtime::gpu::GpuBackend>, usize)> {
+    let modules = atlas_kernels::metallib_modules();
+    let gpu: Box<dyn spark_runtime::gpu::GpuBackend> = Box::new(
+        spark_runtime::metal_backend::MetalGpuBackend::new(args.gpu_ordinal, &modules)
+            .context("Failed to initialize Metal backend")?,
+    );
+    let total_mem = gpu.total_memory()?;
+    let free_mem = gpu.free_memory()?;
+    tracing::info!(
+        "Metal device {}: {:.1} GB total, {:.1} GB free",
         args.gpu_ordinal,
         total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
         free_mem as f64 / (1024.0 * 1024.0 * 1024.0),

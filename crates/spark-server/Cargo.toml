@@ -10,8 +10,18 @@ default = ["cuda"]
 # Forwards through to atlas-core/spark-runtime/spark-model so the default
 # Linux build still activates the cuda backend after atlas-core became
 # default-features = false at the workspace level.
-cuda = ["atlas-core/cuda", "spark-runtime/cuda", "spark-model/cuda"]
-metal = ["atlas-core/metal", "spark-runtime/metal", "spark-model/metal"]
+cuda = [
+    "atlas-core/cuda",
+    "spark-runtime/cuda",
+    "spark-model/cuda",
+    "spark-storage/cuda",
+]
+metal = [
+    "atlas-core/metal",
+    "spark-runtime/metal",
+    "spark-model/metal",
+    "spark-storage/metal",
+]
 
 [[bin]]
 name = "spark"
@@ -25,7 +35,7 @@ atlas-kernels = { workspace = true }
 spark-runtime = { path = "../spark-runtime", default-features = false }
 spark-model = { path = "../spark-model", default-features = false }
 spark-comm = { path = "../spark-comm" }
-spark-storage = { path = "../spark-storage" }
+spark-storage = { path = "../spark-storage", default-features = false }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

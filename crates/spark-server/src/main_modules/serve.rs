@@ -108,10 +108,16 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     // 2a-2. OOM watchdog: background async task that polls GPU memory every 2s.
     // On GB10 unified memory, GPU OOM = system freeze, so we exit(1) early.
     // Threshold: 2 GB (enough to detect runaway allocation before system locks up).
+    //
+    // CUDA-only: Apple Silicon UMA already exposes `currentAllocatedSize`
+    // and the OS handles memory pressure via Metal's working-set policy,
+    // so the dedicated watchdog isn't needed.
+    #[cfg(feature = "cuda")]
     let _oom_watchdog = spark_runtime::cuda_backend::spawn_oom_watchdog(
         2048, // 2 GB threshold
         std::time::Duration::from_secs(2),
     );
+    #[cfg(feature = "cuda")]
     tracing::info!("OOM watchdog started (threshold: 2 GB, interval: 2s)");
 
     // 2b. Resolve TP / EP topology and set on model config.

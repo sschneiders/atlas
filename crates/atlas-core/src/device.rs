@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use cudarc::driver::CudaContext;
-use std::sync::Arc;
-
-use crate::error::{AtlasError, Result};
+//! Device-context wrapper + per-hardware constants.
+//!
+//! `sm121` is a pure-constants module (NUM_SMS, SMEM_PER_SM, …) that
+//! kernel-launch heuristics in spark-model consume regardless of the
+//! active backend — keeping it always-compiled lets metal-feature
+//! builds reuse the same dispatch tables and code paths.
+//!
+//! `AtlasDevice` is the cudarc-wrapped device handle, gated behind
+//! the `cuda` feature.
 
 /// SM121 hardware constants for DGX Spark GB10.
 pub mod sm121 {
@@ -30,17 +35,28 @@ pub mod sm121 {
     pub const COMPUTE_MINOR: u32 = 1;
 }
 
-/// Wrapper around a cudarc CudaContext with SM121-specific configuration.
-#[derive(Clone)]
-pub struct AtlasDevice {
-    pub ctx: Arc<CudaContext>,
-    pub ordinal: usize,
-}
+#[cfg(feature = "cuda")]
+mod cuda_impl {
+    use cudarc::driver::CudaContext;
+    use std::sync::Arc;
 
-impl AtlasDevice {
-    /// Initialize an Atlas device on the given GPU ordinal.
-    pub fn new(ordinal: usize) -> Result<Self> {
-        let ctx = CudaContext::new(ordinal).map_err(AtlasError::CudaDriver)?;
-        Ok(Self { ctx, ordinal })
+    use crate::error::{AtlasError, Result};
+
+    /// Wrapper around a cudarc CudaContext with SM121-specific configuration.
+    #[derive(Clone)]
+    pub struct AtlasDevice {
+        pub ctx: Arc<CudaContext>,
+        pub ordinal: usize,
+    }
+
+    impl AtlasDevice {
+        /// Initialize an Atlas device on the given GPU ordinal.
+        pub fn new(ordinal: usize) -> Result<Self> {
+            let ctx = CudaContext::new(ordinal).map_err(AtlasError::CudaDriver)?;
+            Ok(Self { ctx, ordinal })
+        }
     }
 }
+
+#[cfg(feature = "cuda")]
+pub use cuda_impl::AtlasDevice;
