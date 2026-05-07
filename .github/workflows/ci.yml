@@ -246,5 +246,42 @@ jobs:
       # is run locally on GB10 hardware via `-- --ignored`.
       - run: cargo test --workspace --locked
 
+  test-macos-metal:
+    name: cargo test --features metal (macOS aarch64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Apple Silicon path: no CUDA toolchain, no nvcc. The `metal`
+      # feature opts out of cudarc workspace-wide and into the Metal
+      # runtime backend (objc2-metal). xcrun + metallib are part of
+      # macOS's built-in Xcode Command Line Tools and don't need a
+      # separate install on macos-14 runners.
+      - name: cargo check --workspace --features metal
+        run: cargo check --workspace --no-default-features --features atlas-core/metal,spark-runtime/metal,spark-storage/metal,spark-model/metal,spark-server/metal,atlas-spark-bench/metal
+      # Build the metal kernel set + run every metal_backend parity
+      # test. The real-model parity tests (`#[ignore]`-gated) require
+      # a local copy of mlx-community/Qwen3.5-4B-MLX-8bit and only
+      # run on a developer machine; default `cargo test` skips them.
+      - name: cargo test -p spark-runtime --features metal
+        env:
+          ATLAS_TARGET_HW: metal
+          ATLAS_TARGET_MODEL: qwen3-5-4b-vlm-mlx-int8
+          ATLAS_TARGET_QUANT: mlx_int8
+        run: |
+          cargo test -p spark-runtime --no-default-features \
+            --features metal --locked metal_backend
+      # Sanity check: the metal-feature spark-server binary must not
+      # link against libcuda. Anything else means a stray
+      # `rustc-link-lib=cuda` directive snuck through a build.rs.
+      - name: assert no libcuda linkage in metal binary
+        run: |
+          cargo build --no-default-features --features atlas-core/metal,spark-runtime/metal,spark-storage/metal,spark-model/metal,spark-server/metal -p spark-server --bin spark
+          if otool -L target/debug/spark | grep -i cuda; then
+            echo "::error::metal-feature spark binary links libcuda"
+            exit 1
+          fi
+
   # cargo-deny runs in security.yml with path filters on Cargo.toml / Cargo.lock /
   # deny.toml plus a weekly cron. Not duplicated here.

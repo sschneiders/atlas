@@ -15,12 +15,14 @@ cuda = [
     "spark-runtime/cuda",
     "spark-model/cuda",
     "spark-storage/cuda",
+    "spark-comm/cuda",
 ]
 metal = [
     "atlas-core/metal",
     "spark-runtime/metal",
     "spark-model/metal",
     "spark-storage/metal",
+    "spark-comm/metal",
 ]
 
 [[bin]]
@@ -34,7 +36,7 @@ atlas-kernels = { workspace = true }
 # disables the cuda default that each downstream crate inherits.
 spark-runtime = { path = "../spark-runtime", default-features = false }
 spark-model = { path = "../spark-model", default-features = false }
-spark-comm = { path = "../spark-comm" }
+spark-comm = { path = "../spark-comm", default-features = false }
 spark-storage = { path = "../spark-storage", default-features = false }
 anyhow = { workspace = true }
 serde = { workspace = true }
