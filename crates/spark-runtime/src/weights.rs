@@ -226,4 +226,5 @@ pub(crate) fn parse_expert_index(name: &str) -> Option<usize> {
 }
 
 mod loader;
+pub mod mlx_int8;
 pub(crate) use loader::{check_oom_guard, estimate_has_fp8, estimate_load_bytes};

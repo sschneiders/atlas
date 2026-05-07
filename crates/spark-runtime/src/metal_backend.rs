@@ -971,4 +971,174 @@ mod tests {
         backend.free(biases_ptr).unwrap();
         backend.free(out_ptr).unwrap();
     }
+
+    /// Real-data parity check. Loads the actual `embed_tokens` triplet
+    /// from a local copy of `mlx-community/Qwen3.5-4B-MLX-8bit`,
+    /// dequantizes a 4-row × 128-col slice via the Metal kernel, and
+    /// compares against a CPU reference computed from the same bytes.
+    ///
+    /// The test is `#[ignore]`-gated by default — it requires the
+    /// model to be present at `~/models/Qwen3.5-4B-MLX-8bit/` (or at
+    /// `$ATLAS_MLX_MODEL_DIR`). Run with:
+    ///
+    ///   cargo test -p spark-runtime --no-default-features \
+    ///              --features metal -- --ignored \
+    ///              metal_mlx_int8_dequant_real_model
+    #[test]
+    #[ignore = "requires local copy of mlx-community/Qwen3.5-4B-MLX-8bit"]
+    fn metal_mlx_int8_dequant_real_model() {
+        use safetensors::SafeTensors;
+
+        let model_dir = std::env::var("ATLAS_MLX_MODEL_DIR")
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").expect("HOME unset");
+                format!("{home}/models/Qwen3.5-4B-MLX-8bit")
+            });
+        let st_path = std::path::Path::new(&model_dir).join("model.safetensors");
+        if !st_path.exists() {
+            eprintln!("skipping: {} not found", st_path.display());
+            return;
+        }
+
+        // mmap the safetensors file via memmap2 (already a spark-runtime
+        // dep) and parse the header.
+        let file = std::fs::File::open(&st_path).expect("open safetensors");
+        let mmap = unsafe { memmap2::Mmap::map(&file).expect("mmap") };
+        let st = SafeTensors::deserialize(&mmap).expect("parse safetensors header");
+
+        // Pick a 4-row × 128-col slice from `language_model.model.embed_tokens`
+        // — 4 rows × 32 uint32 packed = 128 columns; 128 cols / 64 group = 2
+        // groups per row of scales/biases.
+        let base = "language_model.model.embed_tokens";
+        let weight = st.tensor(&format!("{base}.weight")).expect("weight");
+        let scales = st.tensor(&format!("{base}.scales")).expect("scales");
+        let biases = st.tensor(&format!("{base}.biases")).expect("biases");
+
+        assert_eq!(weight.dtype(), safetensors::Dtype::U32);
+        assert_eq!(scales.dtype(), safetensors::Dtype::BF16);
+        assert_eq!(biases.dtype(), safetensors::Dtype::BF16);
+        let weight_shape = weight.shape();
+        assert_eq!(weight_shape.len(), 2);
+
+        let full_in_cols_packed = weight_shape[1];
+        // Slice dims
+        let n_rows = 4usize;
+        let n_cols = 128usize;
+        let group_size = 64u32;
+        let n_packed_cols = n_cols / 4;
+        let groups_per_slice_row = (n_cols / group_size as usize) as usize;
+
+        let weight_data = weight.data();
+        let scales_data = scales.data();
+        let biases_data = biases.data();
+
+        // Extract row strides (in bytes).
+        let row_stride_packed = full_in_cols_packed * 4; // u32 per col
+        let row_stride_groups = (full_in_cols_packed * 4) / group_size as usize; // groups in full row
+        let row_stride_scales = row_stride_groups * 2; // bf16 per group
+
+        let mut packed_slice: Vec<u8> = Vec::with_capacity(n_rows * n_packed_cols * 4);
+        let mut scales_slice: Vec<u8> = Vec::with_capacity(n_rows * groups_per_slice_row * 2);
+        let mut biases_slice: Vec<u8> = Vec::with_capacity(n_rows * groups_per_slice_row * 2);
+        for r in 0..n_rows {
+            let p_off = r * row_stride_packed;
+            packed_slice.extend_from_slice(&weight_data[p_off..p_off + n_packed_cols * 4]);
+            let s_off = r * row_stride_scales;
+            scales_slice.extend_from_slice(&scales_data[s_off..s_off + groups_per_slice_row * 2]);
+            biases_slice.extend_from_slice(&biases_data[s_off..s_off + groups_per_slice_row * 2]);
+        }
+
+        // CPU reference. Walk byte by byte through the packed slice.
+        let mut expected: Vec<half::bf16> = vec![half::bf16::ZERO; n_rows * n_cols];
+        for r in 0..n_rows {
+            for c in 0..n_cols {
+                let word_offset = r * n_packed_cols * 4 + (c / 4) * 4;
+                let word = u32::from_le_bytes([
+                    packed_slice[word_offset],
+                    packed_slice[word_offset + 1],
+                    packed_slice[word_offset + 2],
+                    packed_slice[word_offset + 3],
+                ]);
+                let byte = ((word >> ((c % 4) * 8)) & 0xFF) as f32;
+                let g = c / group_size as usize;
+                let s_idx = (r * groups_per_slice_row + g) * 2;
+                let s = half::bf16::from_le_bytes([
+                    scales_slice[s_idx],
+                    scales_slice[s_idx + 1],
+                ])
+                .to_f32();
+                let b = half::bf16::from_le_bytes([
+                    biases_slice[s_idx],
+                    biases_slice[s_idx + 1],
+                ])
+                .to_f32();
+                expected[r * n_cols + c] = half::bf16::from_f32(byte * s + b);
+            }
+        }
+
+        // Run the kernel on the slice.
+        let modules = atlas_kernels::metallib_modules();
+        let backend =
+            MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+
+        let packed_ptr = backend.alloc(packed_slice.len()).expect("alloc packed");
+        let scales_ptr = backend.alloc(scales_slice.len()).expect("alloc scales");
+        let biases_ptr = backend.alloc(biases_slice.len()).expect("alloc biases");
+        let out_bytes = n_rows * n_cols * 2;
+        let out_ptr = backend.alloc(out_bytes).expect("alloc out");
+        backend.copy_h2d(&packed_slice, packed_ptr).unwrap();
+        backend.copy_h2d(&scales_slice, scales_ptr).unwrap();
+        backend.copy_h2d(&biases_slice, biases_ptr).unwrap();
+
+        let kernel = backend
+            .kernel("mlx_int8_dequant", "mlx_int8_dequant")
+            .expect("kernel");
+        let block_x = 16u32;
+        let in_features_arg = n_cols as u32;
+        let out_features_arg = n_rows as u32;
+        let grid_x = in_features_arg.div_ceil(block_x);
+        backend
+            .launch_typed(
+                kernel,
+                [grid_x, out_features_arg, 1],
+                [block_x, 1, 1],
+                0,
+                backend.default_stream(),
+                &[
+                    KernelArg::Bytes(&out_features_arg.to_le_bytes()),
+                    KernelArg::Bytes(&in_features_arg.to_le_bytes()),
+                    KernelArg::Bytes(&group_size.to_le_bytes()),
+                    KernelArg::Buffer(packed_ptr),
+                    KernelArg::Buffer(scales_ptr),
+                    KernelArg::Buffer(biases_ptr),
+                    KernelArg::Buffer(out_ptr),
+                ],
+            )
+            .expect("launch_typed");
+        backend.synchronize(backend.default_stream()).unwrap();
+
+        let mut out_raw = vec![0u8; out_bytes];
+        backend.copy_d2h(out_ptr, &mut out_raw).unwrap();
+        let actual = bytes_to_bf16_vec(&out_raw);
+
+        // Embedding values are typically tiny; tolerate L∞ ≤ 1e-2.
+        let mut max_abs_diff: f32 = 0.0;
+        for i in 0..expected.len() {
+            let e = expected[i].to_f32();
+            let a = actual[i].to_f32();
+            let d = (e - a).abs();
+            if d > max_abs_diff {
+                max_abs_diff = d;
+            }
+        }
+        assert!(
+            max_abs_diff < 1e-2,
+            "real-model dequant mismatch: L∞ = {max_abs_diff}"
+        );
+
+        backend.free(packed_ptr).unwrap();
+        backend.free(scales_ptr).unwrap();
+        backend.free(biases_ptr).unwrap();
+        backend.free(out_ptr).unwrap();
+    }
 }
