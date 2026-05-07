@@ -9,7 +9,13 @@ autobenches = false
 [features]
 default = ["cuda"]
 cuda = ["dep:cudarc", "atlas-core/cuda"]
-metal = ["atlas-core/metal"]
+metal = [
+    "dep:objc2",
+    "dep:objc2-metal",
+    "dep:objc2-foundation",
+    "dep:dispatch2",
+    "atlas-core/metal",
+]
 test-utils = []
 
 [[bin]]
@@ -32,6 +38,31 @@ required-features = ["test-utils"]
 atlas-core = { workspace = true }
 atlas-kernels = { workspace = true }
 cudarc = { workspace = true, optional = true }
+
+# Apple Metal backend deps. Activated only by `--features metal`.
+objc2 = { version = "0.6", optional = true }
+objc2-metal = { version = "0.3", optional = true, features = [
+    "MTLDevice",
+    "MTLBuffer",
+    "MTLResource",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLLibrary",
+    "MTLBlitCommandEncoder",
+    "MTLEvent",
+    "block2",
+] }
+objc2-foundation = { version = "0.3", optional = true, features = [
+    "NSData",
+    "NSString",
+    "NSError",
+] }
+# `MTLDevice::newLibraryWithData_error` takes a `DispatchData` (libdispatch
+# byte container), not an `NSData`. dispatch2 ships the wrapper.
+dispatch2 = { version = "0.3", optional = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

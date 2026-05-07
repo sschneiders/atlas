@@ -9,6 +9,13 @@ fn main() {
         return;
     }
 
+    // libcuda is only needed when the cuda feature is on (i.e. when
+    // AtlasCudaBackend is compiled in). The metal feature build on
+    // Apple Silicon must not request -lcuda.
+    if std::env::var_os("CARGO_FEATURE_CUDA").is_none() {
+        return;
+    }
+
     // Link libcuda for AtlasCudaBackend's raw CUDA driver API calls.
     // The actual CUDA driver is a stub at compile time; at runtime
     // it resolves to the NVIDIA driver installed on the system.

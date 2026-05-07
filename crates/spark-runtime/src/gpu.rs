@@ -34,6 +34,26 @@ pub struct KernelHandle(pub u64);
 #[derive(Debug, Clone, Copy)]
 pub struct GraphHandle(pub u64);
 
+/// Typed kernel argument, used by `launch_typed`.
+///
+/// CUDA's `cuLaunchKernel` is type-blind — every arg is `void*` and the
+/// driver interprets bytes by kernel signature. Metal's
+/// `MTLComputeCommandEncoder` is not: buffer arguments require
+/// `setBuffer:offset:atIndex:` (the encoder tracks the resource) while
+/// scalar/struct args require `setBytes:length:atIndex:`. `KernelArg`
+/// preserves that distinction so both backends can dispatch correctly.
+#[derive(Debug, Clone, Copy)]
+pub enum KernelArg<'a> {
+    /// A device buffer at this base GPU address. The metal backend
+    /// resolves it to its owning `MTLBuffer` + offset via the alloc
+    /// registry; the cuda backend forwards the raw `u64` to the driver.
+    Buffer(DevicePtr),
+    /// Inline scalar/struct bytes, e.g. a `u32` count or an `f32` eps.
+    /// Length is forwarded to Metal's `setBytes:length:`; the cuda
+    /// backend zero-pads up to 8 bytes per slot.
+    Bytes(&'a [u8]),
+}
+
 /// GPU backend trait — SBIO IORouter for all CUDA operations.
 ///
 /// Implementations: `AtlasCudaBackend` (production), `MockGpuBackend` (tests).
@@ -87,6 +107,43 @@ pub trait GpuBackend: Send + Sync {
         stream: u64,
         params: &mut [*mut std::ffi::c_void],
     ) -> Result<()>;
+
+    /// Typed-args kernel launch.
+    ///
+    /// CUDA's default impl packs args into u64 slots and forwards to
+    /// `launch()`. The Metal backend overrides this to map each
+    /// `KernelArg::Buffer` to `setBuffer:offset:atIndex:` and each
+    /// `KernelArg::Bytes` to `setBytes:length:atIndex:`.
+    fn launch_typed(
+        &self,
+        func: KernelHandle,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        stream: u64,
+        args: &[KernelArg<'_>],
+    ) -> Result<()> {
+        // CUDA-compatible default: each arg becomes one u64 slot. The
+        // storage stays alive across the launch call so the *mut c_void
+        // pointers we hand to `launch()` remain valid.
+        let mut storage: Vec<u64> = Vec::with_capacity(args.len());
+        for arg in args {
+            match arg {
+                KernelArg::Buffer(p) => storage.push(p.0),
+                KernelArg::Bytes(b) => {
+                    let mut slot = [0u8; 8];
+                    let n = b.len().min(8);
+                    slot[..n].copy_from_slice(&b[..n]);
+                    storage.push(u64::from_le_bytes(slot));
+                }
+            }
+        }
+        let mut params: Vec<*mut std::ffi::c_void> = storage
+            .iter()
+            .map(|v| v as *const u64 as *mut std::ffi::c_void)
+            .collect();
+        self.launch(func, grid, block, shared_mem, stream, &mut params)
+    }
 
     /// Synchronize a CUDA stream (blocks until all work completes).
     fn synchronize(&self, stream: u64) -> Result<()>;
