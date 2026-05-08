@@ -61,12 +61,7 @@ pub(super) fn generate_target_ptx_rs(
 
         // Kernel-blob constants
         for (stem, module_name) in modules {
-            let const_name = format!(
-                "{}{}_{}",
-                prefix,
-                module_name.to_uppercase(),
-                const_suffix
-            );
+            let const_name = format!("{}{}_{}", prefix, module_name.to_uppercase(), const_suffix);
             g.push_str(&format!(
                 "pub const {const_name}: {ty} = \
                  {include_macro}(concat!(env!(\"ATLAS_PTX_DIR\"), \"/t{idx}__{stem}.{output_ext}\"));\n"
@@ -88,12 +83,7 @@ pub(super) fn generate_target_ptx_rs(
             "pub fn {fn_name}() -> {modules_ty} {{\n    vec![\n"
         ));
         for (_, module_name) in modules {
-            let const_name = format!(
-                "{}{}_{}",
-                prefix,
-                module_name.to_uppercase(),
-                const_suffix
-            );
+            let const_name = format!("{}{}_{}", prefix, module_name.to_uppercase(), const_suffix);
             g.push_str(&format!("        (\"{module_name}\", {const_name}),\n"));
         }
         g.push_str("    ]\n}\n\n");

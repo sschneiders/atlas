@@ -104,7 +104,5 @@ pub fn install_local(
     _cfg: HighSpeedSwapConfig,
     _model: ModelDims,
 ) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "HighSpeedSwap unavailable: spark-storage built without cuda feature"
-    )
+    anyhow::bail!("HighSpeedSwap unavailable: spark-storage built without cuda feature")
 }

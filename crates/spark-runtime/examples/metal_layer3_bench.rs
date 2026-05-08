@@ -79,9 +79,7 @@ fn main() -> Result<()> {
 
     // Load weights once.
     let load_bf16 = |name: &str| -> Result<DevicePtr> {
-        let t = st
-            .tensor(name)
-            .with_context(|| format!("missing {name}"))?;
+        let t = st.tensor(name).with_context(|| format!("missing {name}"))?;
         let p = backend.alloc(t.data().len())?;
         backend.copy_h2d(t.data(), p)?;
         Ok(p)
@@ -91,10 +89,30 @@ fn main() -> Result<()> {
     let q_norm = load_bf16(&format!("{layer}.self_attn.q_norm.weight"))?;
     let k_norm = load_bf16(&format!("{layer}.self_attn.k_norm.weight"))?;
     let post_ln = load_bf16(&format!("{layer}.post_attention_layernorm.weight"))?;
-    let q_proj = MlxInt8Weight::load(&backend, &st, &format!("{layer}.self_attn.q_proj"), group_size)?;
-    let k_proj = MlxInt8Weight::load(&backend, &st, &format!("{layer}.self_attn.k_proj"), group_size)?;
-    let v_proj = MlxInt8Weight::load(&backend, &st, &format!("{layer}.self_attn.v_proj"), group_size)?;
-    let o_proj = MlxInt8Weight::load(&backend, &st, &format!("{layer}.self_attn.o_proj"), group_size)?;
+    let q_proj = MlxInt8Weight::load(
+        &backend,
+        &st,
+        &format!("{layer}.self_attn.q_proj"),
+        group_size,
+    )?;
+    let k_proj = MlxInt8Weight::load(
+        &backend,
+        &st,
+        &format!("{layer}.self_attn.k_proj"),
+        group_size,
+    )?;
+    let v_proj = MlxInt8Weight::load(
+        &backend,
+        &st,
+        &format!("{layer}.self_attn.v_proj"),
+        group_size,
+    )?;
+    let o_proj = MlxInt8Weight::load(
+        &backend,
+        &st,
+        &format!("{layer}.self_attn.o_proj"),
+        group_size,
+    )?;
     let gate_p = MlxInt8Weight::load(&backend, &st, &format!("{layer}.mlp.gate_proj"), group_size)?;
     let up_p = MlxInt8Weight::load(&backend, &st, &format!("{layer}.mlp.up_proj"), group_size)?;
     let down_p = MlxInt8Weight::load(&backend, &st, &format!("{layer}.mlp.down_proj"), group_size)?;
@@ -126,10 +144,13 @@ fn main() -> Result<()> {
     let v_cache = alloc_bf16(max_seq * kv_dim)?;
     backend.copy_h2d(&bf16_slice_to_bytes(&x_init), x)?;
 
+    // Qwen3.5-VL partial RoPE — only first head_dim/4 (=64) elements
+    // of each head are rotated.
     let rope_theta: f32 = 10_000_000.0;
-    let half_dim = head_dim / 2;
+    let rotary_dim: u32 = head_dim / 4;
+    let half_dim = rotary_dim / 2;
     let inv_freq: Vec<u8> = (0..half_dim)
-        .map(|i| 1.0 / rope_theta.powf(2.0 * i as f32 / head_dim as f32))
+        .map(|i| 1.0 / rope_theta.powf(2.0 * i as f32 / rotary_dim as f32))
         .flat_map(|f: f32| f.to_le_bytes())
         .collect();
     let inv_freq_ptr = backend.alloc(inv_freq.len())?;
@@ -153,11 +174,20 @@ fn main() -> Result<()> {
     // Single-iteration forward closure.
     let do_forward = || -> Result<()> {
         // norm1
-        backend.launch_typed(rms, [n_tokens, 1, 1], [128, 1, 1], 0, stream, &[
-            KernelArg::Bytes(&hidden_size.to_le_bytes()),
-            KernelArg::Bytes(&rms_eps.to_le_bytes()),
-            KernelArg::Buffer(x), KernelArg::Buffer(input_ln), KernelArg::Buffer(x_norm),
-        ])?;
+        backend.launch_typed(
+            rms,
+            [n_tokens, 1, 1],
+            [128, 1, 1],
+            0,
+            stream,
+            &[
+                KernelArg::Bytes(&hidden_size.to_le_bytes()),
+                KernelArg::Bytes(&rms_eps.to_le_bytes()),
+                KernelArg::Buffer(x),
+                KernelArg::Buffer(input_ln),
+                KernelArg::Buffer(x_norm),
+            ],
+        )?;
         q_proj.gemv(&backend, x_norm, q_full, stream)?;
         k_proj.gemv(&backend, x_norm, k, stream)?;
         v_proj.gemv(&backend, x_norm, v, stream)?;
@@ -166,82 +196,183 @@ fn main() -> Result<()> {
         let gate_view = q_full.offset(q_only as usize * 2);
 
         // per-head q/k norm
-        backend.launch_typed(rms, [num_heads, 1, 1], [128, 1, 1], 0, stream, &[
-            KernelArg::Bytes(&head_dim.to_le_bytes()),
-            KernelArg::Bytes(&rms_eps.to_le_bytes()),
-            KernelArg::Buffer(q_view), KernelArg::Buffer(q_norm), KernelArg::Buffer(q_norm_out),
-        ])?;
-        backend.launch_typed(rms, [num_kv_heads, 1, 1], [128, 1, 1], 0, stream, &[
-            KernelArg::Bytes(&head_dim.to_le_bytes()),
-            KernelArg::Bytes(&rms_eps.to_le_bytes()),
-            KernelArg::Buffer(k), KernelArg::Buffer(k_norm), KernelArg::Buffer(k_norm_out),
-        ])?;
+        backend.launch_typed(
+            rms,
+            [num_heads, 1, 1],
+            [128, 1, 1],
+            0,
+            stream,
+            &[
+                KernelArg::Bytes(&head_dim.to_le_bytes()),
+                KernelArg::Bytes(&rms_eps.to_le_bytes()),
+                KernelArg::Buffer(q_view),
+                KernelArg::Buffer(q_norm),
+                KernelArg::Buffer(q_norm_out),
+            ],
+        )?;
+        backend.launch_typed(
+            rms,
+            [num_kv_heads, 1, 1],
+            [128, 1, 1],
+            0,
+            stream,
+            &[
+                KernelArg::Bytes(&head_dim.to_le_bytes()),
+                KernelArg::Bytes(&rms_eps.to_le_bytes()),
+                KernelArg::Buffer(k),
+                KernelArg::Buffer(k_norm),
+                KernelArg::Buffer(k_norm_out),
+            ],
+        )?;
         backend.copy_d2d_async(q_norm_out, q_view, q_only as usize * 2, stream)?;
         backend.copy_d2d_async(k_norm_out, k, kv_dim as usize * 2, stream)?;
 
-        // RoPE
-        backend.launch_typed(rope, [half_dim, num_heads, 1], [1, 1, 1], 0, stream, &[
-            KernelArg::Bytes(&n_tokens.to_le_bytes()),
-            KernelArg::Bytes(&num_heads.to_le_bytes()),
-            KernelArg::Bytes(&head_dim.to_le_bytes()),
-            KernelArg::Buffer(positions_ptr), KernelArg::Buffer(inv_freq_ptr), KernelArg::Buffer(q_view),
-        ])?;
-        backend.launch_typed(rope, [half_dim, num_kv_heads, 1], [1, 1, 1], 0, stream, &[
-            KernelArg::Bytes(&n_tokens.to_le_bytes()),
-            KernelArg::Bytes(&num_kv_heads.to_le_bytes()),
-            KernelArg::Bytes(&head_dim.to_le_bytes()),
-            KernelArg::Buffer(positions_ptr), KernelArg::Buffer(inv_freq_ptr), KernelArg::Buffer(k),
-        ])?;
+        // RoPE (partial — first rotary_dim of each head)
+        backend.launch_typed(
+            rope,
+            [half_dim, num_heads, 1],
+            [1, 1, 1],
+            0,
+            stream,
+            &[
+                KernelArg::Bytes(&n_tokens.to_le_bytes()),
+                KernelArg::Bytes(&num_heads.to_le_bytes()),
+                KernelArg::Bytes(&head_dim.to_le_bytes()),
+                KernelArg::Bytes(&rotary_dim.to_le_bytes()),
+                KernelArg::Buffer(positions_ptr),
+                KernelArg::Buffer(inv_freq_ptr),
+                KernelArg::Buffer(q_view),
+            ],
+        )?;
+        backend.launch_typed(
+            rope,
+            [half_dim, num_kv_heads, 1],
+            [1, 1, 1],
+            0,
+            stream,
+            &[
+                KernelArg::Bytes(&n_tokens.to_le_bytes()),
+                KernelArg::Bytes(&num_kv_heads.to_le_bytes()),
+                KernelArg::Bytes(&head_dim.to_le_bytes()),
+                KernelArg::Bytes(&rotary_dim.to_le_bytes()),
+                KernelArg::Buffer(positions_ptr),
+                KernelArg::Buffer(inv_freq_ptr),
+                KernelArg::Buffer(k),
+            ],
+        )?;
 
         // KV cache + attention
         let cache_pos: u32 = 0;
-        backend.launch_typed(kvap, [head_dim, num_kv_heads, 1], [1, 1, 1], 0, stream, &[
-            KernelArg::Bytes(&num_kv_heads.to_le_bytes()),
-            KernelArg::Bytes(&head_dim.to_le_bytes()),
-            KernelArg::Bytes(&cache_pos.to_le_bytes()),
-            KernelArg::Buffer(k), KernelArg::Buffer(v),
-            KernelArg::Buffer(k_cache), KernelArg::Buffer(v_cache),
-        ])?;
+        backend.launch_typed(
+            kvap,
+            [head_dim, num_kv_heads, 1],
+            [1, 1, 1],
+            0,
+            stream,
+            &[
+                KernelArg::Bytes(&num_kv_heads.to_le_bytes()),
+                KernelArg::Bytes(&head_dim.to_le_bytes()),
+                KernelArg::Bytes(&cache_pos.to_le_bytes()),
+                KernelArg::Buffer(k),
+                KernelArg::Buffer(v),
+                KernelArg::Buffer(k_cache),
+                KernelArg::Buffer(v_cache),
+            ],
+        )?;
         let seq_len: u32 = 1;
         let scale: f32 = 1.0 / (head_dim as f32).sqrt();
-        backend.launch_typed(attn, [num_heads, 1, 1], [32, 1, 1], 0, stream, &[
-            KernelArg::Bytes(&seq_len.to_le_bytes()),
-            KernelArg::Bytes(&num_heads.to_le_bytes()),
-            KernelArg::Bytes(&num_kv_heads.to_le_bytes()),
-            KernelArg::Bytes(&head_dim.to_le_bytes()),
-            KernelArg::Bytes(&scale.to_le_bytes()),
-            KernelArg::Buffer(q_view), KernelArg::Buffer(k_cache),
-            KernelArg::Buffer(v_cache), KernelArg::Buffer(attn_out),
-        ])?;
+        backend.launch_typed(
+            attn,
+            [num_heads, 1, 1],
+            [32, 1, 1],
+            0,
+            stream,
+            &[
+                KernelArg::Bytes(&seq_len.to_le_bytes()),
+                KernelArg::Bytes(&num_heads.to_le_bytes()),
+                KernelArg::Bytes(&num_kv_heads.to_le_bytes()),
+                KernelArg::Bytes(&head_dim.to_le_bytes()),
+                KernelArg::Bytes(&scale.to_le_bytes()),
+                KernelArg::Buffer(q_view),
+                KernelArg::Buffer(k_cache),
+                KernelArg::Buffer(v_cache),
+                KernelArg::Buffer(attn_out),
+            ],
+        )?;
 
         // gate + o_proj + residual
-        backend.launch_typed(sg, [q_only.div_ceil(64), 1, 1], [64, 1, 1], 0, stream, &[
-            KernelArg::Bytes(&q_only.to_le_bytes()),
-            KernelArg::Buffer(gate_view), KernelArg::Buffer(attn_out), KernelArg::Buffer(gated_attn),
-        ])?;
+        backend.launch_typed(
+            sg,
+            [q_only.div_ceil(64), 1, 1],
+            [64, 1, 1],
+            0,
+            stream,
+            &[
+                KernelArg::Bytes(&q_only.to_le_bytes()),
+                KernelArg::Buffer(gate_view),
+                KernelArg::Buffer(attn_out),
+                KernelArg::Buffer(gated_attn),
+            ],
+        )?;
         o_proj.gemv(&backend, gated_attn, o, stream)?;
-        backend.launch_typed(add, [hidden_size.div_ceil(64), 1, 1], [64, 1, 1], 0, stream, &[
-            KernelArg::Bytes(&hidden_size.to_le_bytes()),
-            KernelArg::Buffer(x), KernelArg::Buffer(o), KernelArg::Buffer(x_resid),
-        ])?;
+        backend.launch_typed(
+            add,
+            [hidden_size.div_ceil(64), 1, 1],
+            [64, 1, 1],
+            0,
+            stream,
+            &[
+                KernelArg::Bytes(&hidden_size.to_le_bytes()),
+                KernelArg::Buffer(x),
+                KernelArg::Buffer(o),
+                KernelArg::Buffer(x_resid),
+            ],
+        )?;
 
         // norm2 + FFN + residual
-        backend.launch_typed(rms, [n_tokens, 1, 1], [128, 1, 1], 0, stream, &[
-            KernelArg::Bytes(&hidden_size.to_le_bytes()),
-            KernelArg::Bytes(&rms_eps.to_le_bytes()),
-            KernelArg::Buffer(x_resid), KernelArg::Buffer(post_ln), KernelArg::Buffer(x_norm2),
-        ])?;
+        backend.launch_typed(
+            rms,
+            [n_tokens, 1, 1],
+            [128, 1, 1],
+            0,
+            stream,
+            &[
+                KernelArg::Bytes(&hidden_size.to_le_bytes()),
+                KernelArg::Bytes(&rms_eps.to_le_bytes()),
+                KernelArg::Buffer(x_resid),
+                KernelArg::Buffer(post_ln),
+                KernelArg::Buffer(x_norm2),
+            ],
+        )?;
         gate_p.gemv(&backend, x_norm2, gate_act, stream)?;
         up_p.gemv(&backend, x_norm2, up_act, stream)?;
-        backend.launch_typed(silu, [intermediate.div_ceil(64), 1, 1], [64, 1, 1], 0, stream, &[
-            KernelArg::Bytes(&intermediate.to_le_bytes()),
-            KernelArg::Buffer(gate_act), KernelArg::Buffer(up_act), KernelArg::Buffer(ffn_act),
-        ])?;
+        backend.launch_typed(
+            silu,
+            [intermediate.div_ceil(64), 1, 1],
+            [64, 1, 1],
+            0,
+            stream,
+            &[
+                KernelArg::Bytes(&intermediate.to_le_bytes()),
+                KernelArg::Buffer(gate_act),
+                KernelArg::Buffer(up_act),
+                KernelArg::Buffer(ffn_act),
+            ],
+        )?;
         down_p.gemv(&backend, ffn_act, ffn_out, stream)?;
-        backend.launch_typed(add, [hidden_size.div_ceil(64), 1, 1], [64, 1, 1], 0, stream, &[
-            KernelArg::Bytes(&hidden_size.to_le_bytes()),
-            KernelArg::Buffer(x_resid), KernelArg::Buffer(ffn_out), KernelArg::Buffer(x_final),
-        ])?;
+        backend.launch_typed(
+            add,
+            [hidden_size.div_ceil(64), 1, 1],
+            [64, 1, 1],
+            0,
+            stream,
+            &[
+                KernelArg::Bytes(&hidden_size.to_le_bytes()),
+                KernelArg::Buffer(x_resid),
+                KernelArg::Buffer(ffn_out),
+                KernelArg::Buffer(x_final),
+            ],
+        )?;
         backend.synchronize(stream)?;
         Ok(())
     };

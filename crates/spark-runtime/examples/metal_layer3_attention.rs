@@ -126,24 +126,9 @@ fn main() -> Result<()> {
         &format!("{layer}.self_attn.o_proj"),
         group_size,
     )?;
-    let gate_p = MlxInt8Weight::load(
-        &backend,
-        &st,
-        &format!("{layer}.mlp.gate_proj"),
-        group_size,
-    )?;
-    let up_p = MlxInt8Weight::load(
-        &backend,
-        &st,
-        &format!("{layer}.mlp.up_proj"),
-        group_size,
-    )?;
-    let down_p = MlxInt8Weight::load(
-        &backend,
-        &st,
-        &format!("{layer}.mlp.down_proj"),
-        group_size,
-    )?;
+    let gate_p = MlxInt8Weight::load(&backend, &st, &format!("{layer}.mlp.gate_proj"), group_size)?;
+    let up_p = MlxInt8Weight::load(&backend, &st, &format!("{layer}.mlp.up_proj"), group_size)?;
+    let down_p = MlxInt8Weight::load(&backend, &st, &format!("{layer}.mlp.down_proj"), group_size)?;
     println!("  → loaded in {:.2?}", t0.elapsed());
 
     // ── Synthetic input residual stream ─────────────────────────
@@ -173,11 +158,14 @@ fn main() -> Result<()> {
     let v_cache = alloc_bf16(max_seq * kv_dim)?;
     backend.copy_h2d(&bf16_slice_to_bytes(&x_init), x)?;
 
-    // RoPE inv_freq table.
+    // RoPE inv_freq table — Qwen3.5-VL applies partial RoPE
+    // (partial_rotary_factor=0.25), so only the first head_dim/4
+    // elements of each head are rotated.
     let rope_theta: f32 = 10_000_000.0;
-    let half_dim = head_dim / 2;
+    let rotary_dim: u32 = head_dim / 4;
+    let half_dim = rotary_dim / 2;
     let inv_freq: Vec<u8> = (0..half_dim)
-        .map(|i| 1.0 / rope_theta.powf(2.0 * i as f32 / head_dim as f32))
+        .map(|i| 1.0 / rope_theta.powf(2.0 * i as f32 / rotary_dim as f32))
         .flat_map(|f: f32| f.to_le_bytes())
         .collect();
     let inv_freq_ptr = backend.alloc(inv_freq.len())?;
@@ -193,22 +181,23 @@ fn main() -> Result<()> {
 
     // ── Stage 1: input_layernorm ────────────────────────────────
     let rms = backend.kernel("rms_norm", "rms_norm")?;
-    let launch_rms = |x_in: DevicePtr, w: DevicePtr, x_out: DevicePtr, n_tok: u32, hid: u32| -> Result<()> {
-        backend.launch_typed(
-            rms,
-            [n_tok, 1, 1],
-            [128, 1, 1],
-            0,
-            stream,
-            &[
-                KernelArg::Bytes(&hid.to_le_bytes()),
-                KernelArg::Bytes(&rms_eps.to_le_bytes()),
-                KernelArg::Buffer(x_in),
-                KernelArg::Buffer(w),
-                KernelArg::Buffer(x_out),
-            ],
-        )
-    };
+    let launch_rms =
+        |x_in: DevicePtr, w: DevicePtr, x_out: DevicePtr, n_tok: u32, hid: u32| -> Result<()> {
+            backend.launch_typed(
+                rms,
+                [n_tok, 1, 1],
+                [128, 1, 1],
+                0,
+                stream,
+                &[
+                    KernelArg::Bytes(&hid.to_le_bytes()),
+                    KernelArg::Bytes(&rms_eps.to_le_bytes()),
+                    KernelArg::Buffer(x_in),
+                    KernelArg::Buffer(w),
+                    KernelArg::Buffer(x_out),
+                ],
+            )
+        };
     launch_rms(x, input_ln, x_norm, n_tokens, hidden_size)?;
 
     // ── Stage 2: Q, K, V projections ────────────────────────────
@@ -241,6 +230,7 @@ fn main() -> Result<()> {
                 KernelArg::Bytes(&n_tokens.to_le_bytes()),
                 KernelArg::Bytes(&n_h.to_le_bytes()),
                 KernelArg::Bytes(&head_dim.to_le_bytes()),
+                KernelArg::Bytes(&rotary_dim.to_le_bytes()),
                 KernelArg::Buffer(positions_ptr),
                 KernelArg::Buffer(inv_freq_ptr),
                 KernelArg::Buffer(x_inout),
@@ -382,7 +372,13 @@ fn main() -> Result<()> {
         "  output [hidden={}]: mean|x| = {:.4}, max|x| = {:.4}, non-finite = {}",
         hidden_size, mean_abs, max_abs, nan_inf
     );
-    println!("  first 8 outputs: {:?}", &final_vals[..8].iter().map(|v| v.to_f32()).collect::<Vec<_>>());
+    println!(
+        "  first 8 outputs: {:?}",
+        &final_vals[..8]
+            .iter()
+            .map(|v| v.to_f32())
+            .collect::<Vec<_>>()
+    );
 
     if nan_inf != 0 {
         anyhow::bail!("non-finite output detected");

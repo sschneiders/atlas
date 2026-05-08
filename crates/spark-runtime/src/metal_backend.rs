@@ -121,18 +121,16 @@ impl MetalGpuBackend {
     /// `newLibraryWithData_error:`. The default stream (handle 0) is
     /// materialized eagerly so the first launch doesn't pay queue-
     /// creation latency.
-    pub fn new(
-        ordinal: usize,
-        kernel_modules: &[(&'static str, &'static [u8])],
-    ) -> Result<Self> {
+    pub fn new(ordinal: usize, kernel_modules: &[(&'static str, &'static [u8])]) -> Result<Self> {
         if ordinal != 0 {
             bail!(
                 "Metal: only ordinal 0 is supported (Apple Silicon has one \
                  system default device); requested ordinal {ordinal}"
             );
         }
-        let device: ObjDevice = MTLCreateSystemDefaultDevice()
-            .ok_or_else(|| anyhow!("MTLCreateSystemDefaultDevice returned null — no Metal-capable GPU"))?;
+        let device: ObjDevice = MTLCreateSystemDefaultDevice().ok_or_else(|| {
+            anyhow!("MTLCreateSystemDefaultDevice returned null — no Metal-capable GPU")
+        })?;
 
         // Build the library cache up-front. `newLibraryWithData_error`
         // takes a `DispatchData`, which is libdispatch's reference-
@@ -142,14 +140,12 @@ impl MetalGpuBackend {
         let mut libraries: HashMap<String, ObjLibrary> = HashMap::new();
         for (name, bytes) in kernel_modules {
             let data = dispatch2::DispatchData::from_static_bytes(bytes);
-            let lib = device
-                .newLibraryWithData_error(&data)
-                .map_err(|e| {
-                    anyhow!(
-                        "newLibraryWithData failed for module '{name}': {}",
-                        e.localizedDescription()
-                    )
-                })?;
+            let lib = device.newLibraryWithData_error(&data).map_err(|e| {
+                anyhow!(
+                    "newLibraryWithData failed for module '{name}': {}",
+                    e.localizedDescription()
+                )
+            })?;
             libraries.insert((*name).to_string(), lib);
         }
 
@@ -204,7 +200,11 @@ impl MetalGpuBackend {
     /// Resolve a stream handle to its slab index. Handle 0 → slot 0
     /// (default stream); other handles index `handle - 1`.
     fn stream_index(handle: u64, slab: &[MetalStream]) -> Result<usize> {
-        let idx = if handle == 0 { 0 } else { (handle - 1) as usize };
+        let idx = if handle == 0 {
+            0
+        } else {
+            (handle - 1) as usize
+        };
         if idx >= slab.len() {
             bail!("Metal: invalid stream handle {handle}");
         }
@@ -327,12 +327,7 @@ impl GpuBackend for MetalGpuBackend {
         Ok(())
     }
 
-    fn copy_d2h_on_stream(
-        &self,
-        src: DevicePtr,
-        dst: &mut [u8],
-        stream: u64,
-    ) -> Result<()> {
+    fn copy_d2h_on_stream(&self, src: DevicePtr, dst: &mut [u8], stream: u64) -> Result<()> {
         // UMA: synchronize the stream so prior kernels have written
         // their bytes back through the cache, then memcpy.
         self.synchronize(stream)?;
@@ -436,16 +431,8 @@ impl GpuBackend for MetalGpuBackend {
         // Snapshot the alloc registry so we can resolve Buffer args
         // (and so the encoder can `useResource:` every live buffer
         // without holding the alloc lock during encoding).
-        let live_buffers: Vec<ObjBuffer> = self
-            .allocations
-            .lock()
-            .values()
-            .cloned()
-            .collect();
-        let allocs_snapshot: BTreeMap<u64, ObjBuffer> = self
-            .allocations
-            .lock()
-            .clone();
+        let live_buffers: Vec<ObjBuffer> = self.allocations.lock().values().cloned().collect();
+        let allocs_snapshot: BTreeMap<u64, ObjBuffer> = self.allocations.lock().clone();
 
         let cmd_buf = self.current_cmd_buf(stream)?;
         let enc = cmd_buf
@@ -457,8 +444,7 @@ impl GpuBackend for MetalGpuBackend {
         // hazard tracking keeps them resident. Cheap on Apple Silicon
         // because `useResource:` is a hint, not a copy.
         for buf in &live_buffers {
-            let resource: &ProtocolObject<dyn MTLResource> =
-                ProtocolObject::from_ref(&**buf);
+            let resource: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**buf);
             enc.useResource_usage(
                 resource,
                 objc2_metal::MTLResourceUsage::Read | objc2_metal::MTLResourceUsage::Write,
@@ -566,13 +552,7 @@ impl GpuBackend for MetalGpuBackend {
         Ok(())
     }
 
-    fn memset_async(
-        &self,
-        ptr: DevicePtr,
-        value: u8,
-        bytes: usize,
-        _stream: u64,
-    ) -> Result<()> {
+    fn memset_async(&self, ptr: DevicePtr, value: u8, bytes: usize, _stream: u64) -> Result<()> {
         // UMA + StorageModeShared makes the synchronous memset semantically
         // equivalent (no host/device cache split to flush).
         self.memset(ptr, value, bytes)
@@ -582,9 +562,7 @@ impl GpuBackend for MetalGpuBackend {
         // On Apple Silicon UMA, "device memory" = system RAM. Probe
         // hw.memsize via sysctl for the authoritative number; fall
         // back to MTLDevice.recommendedMaxWorkingSetSize otherwise.
-        Ok(sysctl_memsize().unwrap_or_else(|| {
-            self.device.recommendedMaxWorkingSetSize() as usize
-        }))
+        Ok(sysctl_memsize().unwrap_or_else(|| self.device.recommendedMaxWorkingSetSize() as usize))
     }
 
     fn free_memory(&self) -> Result<usize> {
@@ -631,9 +609,9 @@ impl GpuBackend for MetalGpuBackend {
     fn record_event(&self, event: u64, stream: u64) -> Result<()> {
         let value = {
             let mut slab = self.events.lock();
-            let idx = (event as usize).checked_sub(1).ok_or_else(|| {
-                anyhow!("record_event: invalid event handle {event}")
-            })?;
+            let idx = (event as usize)
+                .checked_sub(1)
+                .ok_or_else(|| anyhow!("record_event: invalid event handle {event}"))?;
             let slot = slab
                 .get_mut(idx)
                 .ok_or_else(|| anyhow!("record_event: event handle {event} out of range"))?;
@@ -649,8 +627,7 @@ impl GpuBackend for MetalGpuBackend {
         // Encode the signal on the active command buffer. Metal will
         // signal value=`value` once everything queued on this buffer
         // up to this point has completed.
-        let proto: &ProtocolObject<dyn MTLEvent> =
-            ProtocolObject::from_ref(&*event_obj);
+        let proto: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*event_obj);
         cmd_buf.encodeSignalEvent_value(proto, value);
         Ok(())
     }
@@ -658,9 +635,9 @@ impl GpuBackend for MetalGpuBackend {
     fn stream_wait_event(&self, stream: u64, event: u64) -> Result<()> {
         let (event_obj, value) = {
             let slab = self.events.lock();
-            let idx = (event as usize).checked_sub(1).ok_or_else(|| {
-                anyhow!("stream_wait_event: invalid event handle {event}")
-            })?;
+            let idx = (event as usize)
+                .checked_sub(1)
+                .ok_or_else(|| anyhow!("stream_wait_event: invalid event handle {event}"))?;
             let slot = slab
                 .get(idx)
                 .ok_or_else(|| anyhow!("stream_wait_event: event handle {event} out of range"))?;
@@ -670,8 +647,7 @@ impl GpuBackend for MetalGpuBackend {
             (slot.event.clone(), slot.next.saturating_sub(1))
         };
         let cmd_buf = self.current_cmd_buf(stream)?;
-        let proto: &ProtocolObject<dyn MTLEvent> =
-            ProtocolObject::from_ref(&*event_obj);
+        let proto: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*event_obj);
         cmd_buf.encodeWaitForEvent_value(proto, value);
         Ok(())
     }
@@ -826,9 +802,15 @@ mod tests {
         // First 16 bytes should now be all-zero floats; the rest of
         // the buffer should retain the original pattern.
         let mut after = vec![0u8; bytes];
-        backend.copy_d2h(ptr, &mut after).expect("copy_d2h post-launch");
+        backend
+            .copy_d2h(ptr, &mut after)
+            .expect("copy_d2h post-launch");
         assert_eq!(&after[..16], &[0u8; 16], "kernel did not zero out[0..4]");
-        assert_eq!(&after[16..], &pattern[16..], "kernel touched out-of-range bytes");
+        assert_eq!(
+            &after[16..],
+            &pattern[16..],
+            "kernel touched out-of-range bytes"
+        );
 
         backend.free(ptr).expect("free");
     }
@@ -876,8 +858,12 @@ mod tests {
         let mut biases: Vec<half::bf16> = Vec::with_capacity(n_rows * groups_per_row);
         for r in 0..n_rows {
             for g in 0..groups_per_row {
-                scales.push(half::bf16::from_f32(0.01 * (1.0 + r as f32) + 0.001 * g as f32));
-                biases.push(half::bf16::from_f32(-0.5 + 0.1 * r as f32 + 0.05 * g as f32));
+                scales.push(half::bf16::from_f32(
+                    0.01 * (1.0 + r as f32) + 0.001 * g as f32,
+                ));
+                biases.push(half::bf16::from_f32(
+                    -0.5 + 0.1 * r as f32 + 0.05 * g as f32,
+                ));
             }
         }
 
@@ -1079,13 +1065,15 @@ mod tests {
         backend.copy_h2d(&x_bytes, x_ptr).unwrap();
 
         let kernel = backend.kernel("mlx_int8_gemv", "mlx_int8_gemv").unwrap();
-        // 64 threads/group → two simdgroups, exercises the
-        // cross-simdgroup reduction in shared memory.
-        let threads_per_tg: u32 = 64;
+        // Multi-row kernel layout: 4 rows per threadgroup, one
+        // simdgroup (32 threads) per row → 128 threads/group total.
+        const ROWS_PER_TG: u32 = 4;
+        let threads_per_tg: u32 = 128;
+        let row_groups = n.div_ceil(ROWS_PER_TG);
         backend
             .launch_typed(
                 kernel,
-                [n, 1, 1],
+                [row_groups, 1, 1],
                 [threads_per_tg, 1, 1],
                 0,
                 backend.default_stream(),
@@ -1122,8 +1110,16 @@ mod tests {
             max_abs_diff < 0.05,
             "mlx_int8_gemv: max |expected - actual| = {max_abs_diff}; \
              expected/actual head: {:?} vs {:?}",
-            &expected.iter().take(4).map(|v| v.to_f32()).collect::<Vec<_>>(),
-            &actual.iter().take(4).map(|v| v.to_f32()).collect::<Vec<_>>()
+            &expected
+                .iter()
+                .take(4)
+                .map(|v| v.to_f32())
+                .collect::<Vec<_>>(),
+            &actual
+                .iter()
+                .take(4)
+                .map(|v| v.to_f32())
+                .collect::<Vec<_>>()
         );
 
         backend.free(packed_ptr).unwrap();
@@ -1156,16 +1152,13 @@ mod tests {
             .map(|i| {
                 let row = i / k;
                 let col = i % k;
-                half::bf16::from_f32(
-                    0.3 + 0.01 * row as f32 + 0.001 * col as f32,
-                )
+                half::bf16::from_f32(0.3 + 0.01 * row as f32 + 0.001 * col as f32)
             })
             .collect();
         let x_bytes = bf16_slice_to_bytes(&x_bf16);
 
         // CPU reference: Y[mi, ni] = sum_k X[mi, k] * W[ni, k]
-        let mut expected: Vec<half::bf16> =
-            vec![half::bf16::ZERO; (m * n) as usize];
+        let mut expected: Vec<half::bf16> = vec![half::bf16::ZERO; (m * n) as usize];
         for mi in 0..m as usize {
             for ni in 0..n as usize {
                 let mut acc: f32 = 0.0;
@@ -1278,13 +1271,10 @@ mod tests {
                         } else {
                             let mut dot = 0.0f32;
                             for d in 0..head_dim as usize {
-                                let qv = q[(m * num_heads as usize + h)
-                                    * head_dim as usize
-                                    + d]
+                                let qv = q[(m * num_heads as usize + h) * head_dim as usize + d]
                                     .to_f32();
-                                let kvv = k[(s * num_kv_heads as usize + kv_h)
-                                    * head_dim as usize
-                                    + d]
+                                let kvv = k
+                                    [(s * num_kv_heads as usize + kv_h) * head_dim as usize + d]
                                     .to_f32();
                                 dot += qv * kvv;
                             }
@@ -1302,10 +1292,8 @@ mod tests {
                 for d in 0..head_dim as usize {
                     let mut acc = 0.0f32;
                     for s in 0..seq_len as usize {
-                        let vv = v[(s * num_kv_heads as usize + kv_h)
-                            * head_dim as usize
-                            + d]
-                            .to_f32();
+                        let vv =
+                            v[(s * num_kv_heads as usize + kv_h) * head_dim as usize + d].to_f32();
                         acc += scores[s] * inv * vv;
                     }
                     expected[(m * num_heads as usize + h) * head_dim as usize + d] =
@@ -1474,7 +1462,9 @@ mod tests {
         backend.copy_h2d(&nk_bytes, new_k_ptr).unwrap();
         backend.copy_h2d(&nv_bytes, new_v_ptr).unwrap();
 
-        let kernel = backend.kernel("kv_cache_append", "kv_cache_append").unwrap();
+        let kernel = backend
+            .kernel("kv_cache_append", "kv_cache_append")
+            .unwrap();
         backend
             .launch_typed(
                 kernel,
@@ -1560,8 +1550,7 @@ mod tests {
             .collect();
 
         // FP32 reference: same algorithm as the kernel.
-        let mut expected: Vec<half::bf16> =
-            vec![half::bf16::ZERO; (num_heads * head_dim) as usize];
+        let mut expected: Vec<half::bf16> = vec![half::bf16::ZERO; (num_heads * head_dim) as usize];
         let group = num_heads / num_kv_heads;
         for h in 0..num_heads as usize {
             let kv_h = h / group as usize;
@@ -1572,10 +1561,8 @@ mod tests {
                     let mut dot = 0.0f32;
                     for d in 0..head_dim as usize {
                         let qv = q[h * head_dim as usize + d].to_f32();
-                        let kvv = k[(s * num_kv_heads as usize + kv_h)
-                            * head_dim as usize
-                            + d]
-                            .to_f32();
+                        let kvv =
+                            k[(s * num_kv_heads as usize + kv_h) * head_dim as usize + d].to_f32();
                         dot += qv * kvv;
                     }
                     dot * scale
@@ -1593,8 +1580,7 @@ mod tests {
             for d in 0..head_dim as usize {
                 let mut acc = 0.0f32;
                 for s in 0..seq_len as usize {
-                    let vv = v[(s * num_kv_heads as usize + kv_h) * head_dim as usize + d]
-                        .to_f32();
+                    let vv = v[(s * num_kv_heads as usize + kv_h) * head_dim as usize + d].to_f32();
                     acc += scores[s] * inv * vv;
                 }
                 expected[h * head_dim as usize + d] = half::bf16::from_f32(acc);
@@ -1612,7 +1598,9 @@ mod tests {
         backend.copy_h2d(&k_bytes, k_ptr).unwrap();
         backend.copy_h2d(&v_bytes, v_ptr).unwrap();
 
-        let kernel = backend.kernel("attention_decode", "attention_decode").unwrap();
+        let kernel = backend
+            .kernel("attention_decode", "attention_decode")
+            .unwrap();
         backend
             .launch_typed(
                 kernel,
@@ -1701,22 +1689,15 @@ mod tests {
                     let lo = x[base + d].to_f32();
                     let hi = x[base + d + half_dim as usize].to_f32();
                     expected[base + d] = half::bf16::from_f32(lo * c - hi * s);
-                    expected[base + d + half_dim as usize] =
-                        half::bf16::from_f32(lo * s + hi * c);
+                    expected[base + d + half_dim as usize] = half::bf16::from_f32(lo * s + hi * c);
                 }
             }
         }
 
         // Upload + launch.
         let x_bytes = bf16_slice_to_bytes(&x);
-        let inv_freq_bytes: Vec<u8> = inv_freq
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
-        let positions_bytes: Vec<u8> = positions
-            .iter()
-            .flat_map(|p| p.to_le_bytes())
-            .collect();
+        let inv_freq_bytes: Vec<u8> = inv_freq.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let positions_bytes: Vec<u8> = positions.iter().flat_map(|p| p.to_le_bytes()).collect();
 
         let x_ptr = backend.alloc(x_bytes.len()).unwrap();
         let inv_freq_ptr = backend.alloc(inv_freq_bytes.len()).unwrap();
@@ -1726,6 +1707,8 @@ mod tests {
         backend.copy_h2d(&positions_bytes, positions_ptr).unwrap();
 
         let kernel = backend.kernel("rope_apply", "rope_apply").unwrap();
+        // Full-rotation parity: rotary_dim == head_dim.
+        let rotary_dim: u32 = head_dim;
         backend
             .launch_typed(
                 kernel,
@@ -1737,6 +1720,7 @@ mod tests {
                     KernelArg::Bytes(&num_tokens.to_le_bytes()),
                     KernelArg::Bytes(&num_heads.to_le_bytes()),
                     KernelArg::Bytes(&head_dim.to_le_bytes()),
+                    KernelArg::Bytes(&rotary_dim.to_le_bytes()),
                     KernelArg::Buffer(positions_ptr),
                     KernelArg::Buffer(inv_freq_ptr),
                     KernelArg::Buffer(x_ptr),
@@ -1759,7 +1743,10 @@ mod tests {
             }
             // Hard bail on the first wildly-wrong element to make
             // failures localizable.
-            assert!(d < 0.05, "rope_apply mismatch at idx {i}: expected {e}, got {a}");
+            assert!(
+                d < 0.05,
+                "rope_apply mismatch at idx {i}: expected {e}, got {a}"
+            );
         }
         assert!(max_abs_diff < 0.02);
 
@@ -1870,11 +1857,11 @@ mod tests {
                 half::bf16::from_f32(0.1 + 0.01 * r as f32 + 0.001 * c as f32)
             })
             .collect();
-        let weight: Vec<half::bf16> =
-            (0..hidden).map(|i| half::bf16::from_f32(1.0 + 0.005 * i as f32)).collect();
+        let weight: Vec<half::bf16> = (0..hidden)
+            .map(|i| half::bf16::from_f32(1.0 + 0.005 * i as f32))
+            .collect();
 
-        let mut expected: Vec<half::bf16> =
-            vec![half::bf16::ZERO; (num_tokens * hidden) as usize];
+        let mut expected: Vec<half::bf16> = vec![half::bf16::ZERO; (num_tokens * hidden) as usize];
         for r in 0..num_tokens as usize {
             let mut ssq: f32 = 0.0;
             for c in 0..hidden as usize {
@@ -1885,8 +1872,7 @@ mod tests {
             for c in 0..hidden as usize {
                 let v = x[r * hidden as usize + c].to_f32();
                 let w = weight[c].to_f32();
-                expected[r * hidden as usize + c] =
-                    half::bf16::from_f32(v * inv_rms * w);
+                expected[r * hidden as usize + c] = half::bf16::from_f32(v * inv_rms * w);
             }
         }
 
@@ -1966,21 +1952,16 @@ mod tests {
             })
             .collect();
 
-        let mut expected: Vec<half::bf16> =
-            vec![half::bf16::ZERO; (num_tokens * hidden) as usize];
+        let mut expected: Vec<half::bf16> = vec![half::bf16::ZERO; (num_tokens * hidden) as usize];
         for (ti, &v) in tokens.iter().enumerate() {
             for h in 0..hidden as usize {
                 if v < vocab {
-                    expected[ti * hidden as usize + h] =
-                        table[v as usize * hidden as usize + h];
+                    expected[ti * hidden as usize + h] = table[v as usize * hidden as usize + h];
                 }
             }
         }
 
-        let token_bytes: Vec<u8> = tokens
-            .iter()
-            .flat_map(|t| t.to_le_bytes())
-            .collect();
+        let token_bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
         let table_bytes = bf16_slice_to_bytes(&table);
         let token_ptr = backend.alloc(token_bytes.len()).unwrap();
         let table_ptr = backend.alloc(table_bytes.len()).unwrap();
@@ -2106,17 +2087,14 @@ mod tests {
             .map(|i| half::bf16::from_f32(0.01 * (i as f32 * 0.013).sin()))
             .collect();
         let weight: Vec<half::bf16> = (0..(out_c * kt * kh * kw * in_c))
-            .map(|i| {
-                half::bf16::from_f32(0.005 + 0.0003 * (i as f32 * 0.011).cos())
-            })
+            .map(|i| half::bf16::from_f32(0.005 + 0.0003 * (i as f32 * 0.011).cos()))
             .collect();
         let bias: Vec<half::bf16> = (0..out_c)
             .map(|i| half::bf16::from_f32(0.1 + 0.05 * i as f32))
             .collect();
 
         // CPU reference — same loop nest as the kernel.
-        let mut expected =
-            vec![half::bf16::ZERO; (out_c * t_out * h_out * w_out) as usize];
+        let mut expected = vec![half::bf16::ZERO; (out_c * t_out * h_out * w_out) as usize];
         for c_out_ in 0..out_c as usize {
             for t_o in 0..t_out as usize {
                 for h_o in 0..h_out as usize {
@@ -2126,8 +2104,7 @@ mod tests {
                             for dh in 0..kh as usize {
                                 for dw in 0..kw as usize {
                                     for ic in 0..in_c as usize {
-                                        let w_off = (((c_out_ * kt as usize + dt)
-                                            * kh as usize
+                                        let w_off = (((c_out_ * kt as usize + dt) * kh as usize
                                             + dh)
                                             * kw as usize
                                             + dw)
@@ -2136,20 +2113,16 @@ mod tests {
                                         let t_idx = t_o * kt as usize + dt;
                                         let h_idx = h_o * kh as usize + dh;
                                         let w_idx = w_o * kw as usize + dw;
-                                        let i_off = ((ic * t_in as usize + t_idx)
-                                            * h_in as usize
+                                        let i_off = ((ic * t_in as usize + t_idx) * h_in as usize
                                             + h_idx)
                                             * w_in as usize
                                             + w_idx;
-                                        acc += weight[w_off].to_f32()
-                                            * input[i_off].to_f32();
+                                        acc += weight[w_off].to_f32() * input[i_off].to_f32();
                                     }
                                 }
                             }
                         }
-                        let out_idx = ((c_out_ * t_out as usize + t_o)
-                            * h_out as usize
-                            + h_o)
+                        let out_idx = ((c_out_ * t_out as usize + t_o) * h_out as usize + h_o)
                             * w_out as usize
                             + w_o;
                         expected[out_idx] = half::bf16::from_f32(acc);
@@ -2255,8 +2228,7 @@ mod tests {
             for ni in 0..n as usize {
                 let mut acc = 0.0f32;
                 for ki in 0..k as usize {
-                    acc += x[mi * k as usize + ki].to_f32()
-                        * w[ni * k as usize + ki].to_f32();
+                    acc += x[mi * k as usize + ki].to_f32() * w[ni * k as usize + ki].to_f32();
                 }
                 expected[mi * n as usize + ni] = half::bf16::from_f32(acc);
             }
@@ -2270,7 +2242,9 @@ mod tests {
         backend.copy_h2d(&x_bytes, x_ptr).unwrap();
         backend.copy_h2d(&w_bytes, w_ptr).unwrap();
 
-        let kernel = backend.kernel("dense_gemm_bf16", "dense_gemm_bf16").unwrap();
+        let kernel = backend
+            .kernel("dense_gemm_bf16", "dense_gemm_bf16")
+            .unwrap();
         let block_x = 16u32;
         let block_y = 16u32;
         backend
@@ -2351,7 +2325,9 @@ mod tests {
         backend.copy_h2d(&w_bytes, w_ptr).unwrap();
         backend.copy_h2d(&x_bytes, x_ptr).unwrap();
 
-        let kernel = backend.kernel("dense_gemv_bf16", "dense_gemv_bf16").unwrap();
+        let kernel = backend
+            .kernel("dense_gemv_bf16", "dense_gemv_bf16")
+            .unwrap();
         backend
             .launch_typed(
                 kernel,
@@ -2409,13 +2385,14 @@ mod tests {
                 half::bf16::from_f32(0.1 + 0.01 * r as f32 + 0.001 * c as f32)
             })
             .collect();
-        let weight: Vec<half::bf16> =
-            (0..hidden).map(|i| half::bf16::from_f32(1.0 + 0.005 * i as f32)).collect();
-        let bias: Vec<half::bf16> =
-            (0..hidden).map(|i| half::bf16::from_f32(-0.05 + 0.002 * i as f32)).collect();
+        let weight: Vec<half::bf16> = (0..hidden)
+            .map(|i| half::bf16::from_f32(1.0 + 0.005 * i as f32))
+            .collect();
+        let bias: Vec<half::bf16> = (0..hidden)
+            .map(|i| half::bf16::from_f32(-0.05 + 0.002 * i as f32))
+            .collect();
 
-        let mut expected =
-            vec![half::bf16::ZERO; (num_tokens * hidden) as usize];
+        let mut expected = vec![half::bf16::ZERO; (num_tokens * hidden) as usize];
         for r in 0..num_tokens as usize {
             let mut sum = 0.0f32;
             for c in 0..hidden as usize {
@@ -2580,8 +2557,7 @@ mod tests {
             .map(|i| half::bf16::from_f32(0.5 + 0.001 * i as f32))
             .collect();
 
-        let mut expected =
-            vec![half::bf16::ZERO; (num_tokens * num_heads * head_dim) as usize];
+        let mut expected = vec![half::bf16::ZERO; (num_tokens * num_heads * head_dim) as usize];
         let group = num_heads / num_kv_heads;
         for m in 0..num_tokens as usize {
             for h in 0..num_heads as usize {
@@ -2590,13 +2566,9 @@ mod tests {
                     .map(|s| {
                         let mut dot = 0.0f32;
                         for d in 0..head_dim as usize {
-                            let qv = q[(m * num_heads as usize + h)
-                                * head_dim as usize
-                                + d]
-                                .to_f32();
-                            let kvv = k[(s * num_kv_heads as usize + kv_h)
-                                * head_dim as usize
-                                + d]
+                            let qv =
+                                q[(m * num_heads as usize + h) * head_dim as usize + d].to_f32();
+                            let kvv = k[(s * num_kv_heads as usize + kv_h) * head_dim as usize + d]
                                 .to_f32();
                             dot += qv * kvv;
                         }
@@ -2613,10 +2585,8 @@ mod tests {
                 for d in 0..head_dim as usize {
                     let mut acc = 0.0f32;
                     for s in 0..seq_len as usize {
-                        let vv = v[(s * num_kv_heads as usize + kv_h)
-                            * head_dim as usize
-                            + d]
-                            .to_f32();
+                        let vv =
+                            v[(s * num_kv_heads as usize + kv_h) * head_dim as usize + d].to_f32();
                         acc += scores[s] * inv * vv;
                     }
                     expected[(m * num_heads as usize + h) * head_dim as usize + d] =
@@ -2837,16 +2807,15 @@ mod tests {
         // Qwen3.5-style dims (smaller for fast test).
         let batch_size: u32 = 1;
         let num_k_heads: u32 = 2;
-        let num_v_heads: u32 = 4;   // head_repeat = 2
+        let num_v_heads: u32 = 4; // head_repeat = 2
         let k_dim: u32 = 128;
         let v_dim: u32 = 128;
         let head_repeat = num_v_heads / num_k_heads;
 
         // Initial H state, smaller magnitude so the norm clamp doesn't fire.
-        let h_state: Vec<f32> =
-            (0..(batch_size * num_v_heads * k_dim * v_dim) as usize)
-                .map(|i| 0.001 * ((i as f32) * 0.0123).sin())
-                .collect();
+        let h_state: Vec<f32> = (0..(batch_size * num_v_heads * k_dim * v_dim) as usize)
+            .map(|i| 0.001 * ((i as f32) * 0.0123).sin())
+            .collect();
 
         let query: Vec<half::bf16> = (0..(batch_size * num_k_heads * k_dim))
             .map(|i| half::bf16::from_f32(0.05 + 0.001 * (i as f32 * 0.07).sin()))
@@ -2921,7 +2890,9 @@ mod tests {
         let v_ptr = backend.alloc(v_bytes.len()).unwrap();
         let g_ptr = backend.alloc(g_bytes.len()).unwrap();
         let bt_ptr = backend.alloc(bt_bytes.len()).unwrap();
-        let out_ptr = backend.alloc((batch_size * num_v_heads * v_dim) as usize * 2).unwrap();
+        let out_ptr = backend
+            .alloc((batch_size * num_v_heads * v_dim) as usize * 2)
+            .unwrap();
 
         backend.copy_h2d(&h_state_bytes, h_ptr).unwrap();
         backend.copy_h2d(&q_bytes, q_ptr).unwrap();
@@ -3039,7 +3010,9 @@ mod tests {
         let b_ptr = backend.alloc(num_heads as usize * 2).unwrap();
         let c_ptr = backend.alloc(num_heads as usize * 2).unwrap();
         let x_ptr = backend.alloc(num_channels as usize * 2).unwrap();
-        let state_ptr = backend.alloc((num_heads * num_channels) as usize * 2).unwrap();
+        let state_ptr = backend
+            .alloc((num_heads * num_channels) as usize * 2)
+            .unwrap();
         let y_ptr = backend.alloc(num_channels as usize * 2).unwrap();
         backend.copy_h2d(&a_log_bytes, a_ptr).unwrap();
         backend.copy_h2d(&dt_bias_bytes, dtb_ptr).unwrap();
@@ -3066,10 +3039,18 @@ mod tests {
                 .map(|c| half::bf16::from_f32(0.4 + 0.01 * c as f32 + 0.05 * step as f32))
                 .collect();
 
-            backend.copy_h2d(&bf16_slice_to_bytes(&dt_raw), dt_ptr).unwrap();
-            backend.copy_h2d(&bf16_slice_to_bytes(&b_in), b_ptr).unwrap();
-            backend.copy_h2d(&bf16_slice_to_bytes(&c_in), c_ptr).unwrap();
-            backend.copy_h2d(&bf16_slice_to_bytes(&x_in), x_ptr).unwrap();
+            backend
+                .copy_h2d(&bf16_slice_to_bytes(&dt_raw), dt_ptr)
+                .unwrap();
+            backend
+                .copy_h2d(&bf16_slice_to_bytes(&b_in), b_ptr)
+                .unwrap();
+            backend
+                .copy_h2d(&bf16_slice_to_bytes(&c_in), c_ptr)
+                .unwrap();
+            backend
+                .copy_h2d(&bf16_slice_to_bytes(&x_in), x_ptr)
+                .unwrap();
 
             // CPU reference: identical arithmetic.
             let mut expected = vec![half::bf16::ZERO; num_channels as usize];
@@ -3080,15 +3061,17 @@ mod tests {
                     let a_eff = -(a_log[h]).exp();
                     let dt_pre = dt_raw[h].to_f32() + dt_bias[h].to_f32();
                     // Softplus with the same numeric guard as the kernel.
-                    let dt = if dt_pre > 20.0 { dt_pre } else { (1.0 + dt_pre.exp()).ln() };
+                    let dt = if dt_pre > 20.0 {
+                        dt_pre
+                    } else {
+                        (1.0 + dt_pre.exp()).ln()
+                    };
                     let decay = (dt * a_eff).exp();
                     let bv = b_in[h].to_f32();
                     let cv = c_in[h].to_f32();
-                    let old_s =
-                        state_cpu[h * num_channels as usize + c].to_f32();
+                    let old_s = state_cpu[h * num_channels as usize + c].to_f32();
                     let new_s = old_s * decay + dt * bv * xc;
-                    state_cpu[h * num_channels as usize + c] =
-                        half::bf16::from_f32(new_s);
+                    state_cpu[h * num_channels as usize + c] = half::bf16::from_f32(new_s);
                     acc += new_s * cv;
                 }
                 expected[c] = half::bf16::from_f32(acc);
@@ -3131,7 +3114,9 @@ mod tests {
             }
         }
 
-        for ptr in [a_ptr, dtb_ptr, dt_ptr, b_ptr, c_ptr, x_ptr, state_ptr, y_ptr] {
+        for ptr in [
+            a_ptr, dtb_ptr, dt_ptr, b_ptr, c_ptr, x_ptr, state_ptr, y_ptr,
+        ] {
             backend.free(ptr).unwrap();
         }
     }
@@ -3157,10 +3142,9 @@ mod tests {
                 half::bf16::from_f32(0.1 * (c as f32 + 1.0) + 0.05 * k as f32)
             })
             .collect();
-        let mut conv_state_cpu: Vec<half::bf16> =
-            (0..(num_channels as usize * state_len))
-                .map(|i| half::bf16::from_f32(0.01 * i as f32))
-                .collect();
+        let mut conv_state_cpu: Vec<half::bf16> = (0..(num_channels as usize * state_len))
+            .map(|i| half::bf16::from_f32(0.01 * i as f32))
+            .collect();
 
         let weights_bytes = bf16_slice_to_bytes(&weights);
         let weights_ptr = backend.alloc(weights_bytes.len()).unwrap();
@@ -3207,8 +3191,7 @@ mod tests {
                 expected[c] = half::bf16::from_f32(acc);
                 // Update the CPU-side state for the next iteration.
                 for i in 0..state_len {
-                    conv_state_cpu[c * state_len + i] =
-                        half::bf16::from_f32(past[i + 1]);
+                    conv_state_cpu[c * state_len + i] = half::bf16::from_f32(past[i + 1]);
                 }
             }
 
@@ -3278,11 +3261,10 @@ mod tests {
     fn metal_real_model_vision_block_forward() {
         use safetensors::SafeTensors;
 
-        let model_dir = std::env::var("ATLAS_MLX_MODEL_DIR")
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").expect("HOME unset");
-                format!("{home}/models/Qwen3.5-4B-MLX-8bit")
-            });
+        let model_dir = std::env::var("ATLAS_MLX_MODEL_DIR").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").expect("HOME unset");
+            format!("{home}/models/Qwen3.5-4B-MLX-8bit")
+        });
         let st_path = std::path::Path::new(&model_dir).join("model.safetensors");
         if !st_path.exists() {
             eprintln!("skipping: {} not found", st_path.display());
@@ -3355,8 +3337,12 @@ mod tests {
 
         // ── Helpers ─────────────────────────────────────────────
         let ln_kernel = backend.kernel("layer_norm", "layer_norm").unwrap();
-        let launch_ln = |x_in: DevicePtr, w: DevicePtr, b: DevicePtr, x_out: DevicePtr,
-                         hid: u32, n_tok: u32| {
+        let launch_ln = |x_in: DevicePtr,
+                         w: DevicePtr,
+                         b: DevicePtr,
+                         x_out: DevicePtr,
+                         hid: u32,
+                         n_tok: u32| {
             backend
                 .launch_typed(
                     ln_kernel,
@@ -3376,7 +3362,9 @@ mod tests {
                 .expect("layer_norm launch");
         };
 
-        let gemv_kernel = backend.kernel("dense_gemv_bf16", "dense_gemv_bf16").unwrap();
+        let gemv_kernel = backend
+            .kernel("dense_gemv_bf16", "dense_gemv_bf16")
+            .unwrap();
         let launch_gemv = |w: DevicePtr, x_in: DevicePtr, y: DevicePtr, n: u32, k: u32| {
             backend
                 .launch_typed(
@@ -3506,7 +3494,8 @@ mod tests {
         let mean_abs = sum_abs / final_vals.len() as f32;
 
         assert_eq!(
-            nan_or_inf, 0,
+            nan_or_inf,
+            0,
             "vision block: {nan_or_inf} non-finite outputs out of {}",
             final_vals.len()
         );
@@ -3521,11 +3510,33 @@ mod tests {
 
         // Free everything in batch — order doesn't matter on UMA.
         for ptr in [
-            norm1_w, norm1_b, qkv_w, qkv_b, proj_w, proj_b, norm2_w, norm2_b,
-            fc1_w, fc1_b, fc2_w, fc2_b,
-            x, x_norm, qkv, qkv_with_bias, attn_out, proj_out, proj_with_bias,
-            x_resid, x_norm2, fc1_out, fc1_with_bias, fc1_act, fc2_out,
-            fc2_with_bias, x_final,
+            norm1_w,
+            norm1_b,
+            qkv_w,
+            qkv_b,
+            proj_w,
+            proj_b,
+            norm2_w,
+            norm2_b,
+            fc1_w,
+            fc1_b,
+            fc2_w,
+            fc2_b,
+            x,
+            x_norm,
+            qkv,
+            qkv_with_bias,
+            attn_out,
+            proj_out,
+            proj_with_bias,
+            x_resid,
+            x_norm2,
+            fc1_out,
+            fc1_with_bias,
+            fc1_act,
+            fc2_out,
+            fc2_with_bias,
+            x_final,
         ] {
             backend.free(ptr).unwrap();
         }
@@ -3567,11 +3578,10 @@ mod tests {
         use crate::weights::mlx_int8::MlxInt8Weight;
         use safetensors::SafeTensors;
 
-        let model_dir = std::env::var("ATLAS_MLX_MODEL_DIR")
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").expect("HOME unset");
-                format!("{home}/models/Qwen3.5-4B-MLX-8bit")
-            });
+        let model_dir = std::env::var("ATLAS_MLX_MODEL_DIR").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").expect("HOME unset");
+            format!("{home}/models/Qwen3.5-4B-MLX-8bit")
+        });
         let st_path = std::path::Path::new(&model_dir).join("model.safetensors");
         if !st_path.exists() {
             eprintln!("skipping: {} not found", st_path.display());
@@ -3612,33 +3622,41 @@ mod tests {
 
         // MLX-int8 weights via the helper we built in PR5.
         let q_proj = MlxInt8Weight::load(
-            &backend, &st, &format!("{layer}.self_attn.q_proj"), group_size,
+            &backend,
+            &st,
+            &format!("{layer}.self_attn.q_proj"),
+            group_size,
         )
         .expect("load q_proj");
         let k_proj = MlxInt8Weight::load(
-            &backend, &st, &format!("{layer}.self_attn.k_proj"), group_size,
+            &backend,
+            &st,
+            &format!("{layer}.self_attn.k_proj"),
+            group_size,
         )
         .expect("load k_proj");
         let v_proj = MlxInt8Weight::load(
-            &backend, &st, &format!("{layer}.self_attn.v_proj"), group_size,
+            &backend,
+            &st,
+            &format!("{layer}.self_attn.v_proj"),
+            group_size,
         )
         .expect("load v_proj");
         let o_proj = MlxInt8Weight::load(
-            &backend, &st, &format!("{layer}.self_attn.o_proj"), group_size,
+            &backend,
+            &st,
+            &format!("{layer}.self_attn.o_proj"),
+            group_size,
         )
         .expect("load o_proj");
-        let gate_p = MlxInt8Weight::load(
-            &backend, &st, &format!("{layer}.mlp.gate_proj"), group_size,
-        )
-        .expect("load gate_proj");
-        let up_p = MlxInt8Weight::load(
-            &backend, &st, &format!("{layer}.mlp.up_proj"), group_size,
-        )
-        .expect("load up_proj");
-        let down_p = MlxInt8Weight::load(
-            &backend, &st, &format!("{layer}.mlp.down_proj"), group_size,
-        )
-        .expect("load down_proj");
+        let gate_p =
+            MlxInt8Weight::load(&backend, &st, &format!("{layer}.mlp.gate_proj"), group_size)
+                .expect("load gate_proj");
+        let up_p = MlxInt8Weight::load(&backend, &st, &format!("{layer}.mlp.up_proj"), group_size)
+            .expect("load up_proj");
+        let down_p =
+            MlxInt8Weight::load(&backend, &st, &format!("{layer}.mlp.down_proj"), group_size)
+                .expect("load down_proj");
 
         // Sanity-check the loader recovered the expected dims.
         assert_eq!(q_proj.out_features, q_total);
@@ -3656,9 +3674,7 @@ mod tests {
         let x_bytes = bf16_slice_to_bytes(&x_init);
 
         // Allocate every intermediate buffer up-front.
-        let alloc_bf16 = |n: u32| -> DevicePtr {
-            backend.alloc(n as usize * 2).unwrap()
-        };
+        let alloc_bf16 = |n: u32| -> DevicePtr { backend.alloc(n as usize * 2).unwrap() };
         let x = alloc_bf16(hidden_size);
         let x_norm = alloc_bf16(hidden_size);
         let q_full = alloc_bf16(q_total);
@@ -3680,11 +3696,14 @@ mod tests {
         let v_cache = alloc_bf16(max_seq * kv_dim);
         backend.copy_h2d(&x_bytes, x).unwrap();
 
-        // Pre-bake the inv_freq table for RoPE (head_dim/2 entries).
+        // Pre-bake the inv_freq table for partial RoPE. Qwen3.5-VL uses
+        // partial_rotary_factor=0.25 → rotary_dim = head_dim/4 (=64 for
+        // head_dim=256), so inv_freq has rotary_dim/2 = 32 entries.
         let rope_theta: f32 = 10_000_000.0; // Qwen3-family default
-        let half_dim = head_dim / 2;
+        let rotary_dim: u32 = head_dim / 4;
+        let half_dim = rotary_dim / 2;
         let inv_freq: Vec<f32> = (0..half_dim)
-            .map(|i| 1.0 / rope_theta.powf(2.0 * i as f32 / head_dim as f32))
+            .map(|i| 1.0 / rope_theta.powf(2.0 * i as f32 / rotary_dim as f32))
             .collect();
         let inv_freq_bytes: Vec<u8> = inv_freq.iter().flat_map(|f| f.to_le_bytes()).collect();
         let inv_freq_ptr = backend.alloc(inv_freq_bytes.len()).unwrap();
@@ -3698,8 +3717,7 @@ mod tests {
 
         // ── Stage 1: input_layernorm ─────────────────────────────
         let rms = backend.kernel("rms_norm", "rms_norm").unwrap();
-        let launch_rms = |x_in: DevicePtr, w: DevicePtr, x_out: DevicePtr,
-                          n_tok: u32, hid: u32| {
+        let launch_rms = |x_in: DevicePtr, w: DevicePtr, x_out: DevicePtr, n_tok: u32, hid: u32| {
             backend
                 .launch_typed(
                     rms,
@@ -3726,8 +3744,8 @@ mod tests {
 
         // ── Stage 3: split q_full into (Q, attn_gate) by offset ──
         // q_full is [Q | gate] laid out contiguously in BF16.
-        let q_view = q_full;                                    // first 4096 bf16
-        let gate_view = q_full.offset(q_only as usize * 2);     // second 4096 bf16
+        let q_view = q_full; // first 4096 bf16
+        let gate_view = q_full.offset(q_only as usize * 2); // second 4096 bf16
 
         // ── Stage 4: per-head q_norm / k_norm ─────────────────────
         // Treat each head as a 'token' of length head_dim.
@@ -3759,6 +3777,7 @@ mod tests {
                         KernelArg::Bytes(&n_tokens.to_le_bytes()),
                         KernelArg::Bytes(&n_h.to_le_bytes()),
                         KernelArg::Bytes(&head_dim.to_le_bytes()),
+                        KernelArg::Bytes(&rotary_dim.to_le_bytes()),
                         KernelArg::Buffer(positions_ptr),
                         KernelArg::Buffer(inv_freq_ptr),
                         KernelArg::Buffer(x_inout),
@@ -3771,7 +3790,9 @@ mod tests {
 
         // ── Stage 6: KV cache append at pos 0 ─────────────────────
         let cache_pos: u32 = 0;
-        let kvap = backend.kernel("kv_cache_append", "kv_cache_append").unwrap();
+        let kvap = backend
+            .kernel("kv_cache_append", "kv_cache_append")
+            .unwrap();
         backend
             .launch_typed(
                 kvap,
@@ -3794,7 +3815,9 @@ mod tests {
         // ── Stage 7: attention_decode ─────────────────────────────
         let seq_len: u32 = 1;
         let scale: f32 = 1.0 / (head_dim as f32).sqrt();
-        let attn = backend.kernel("attention_decode", "attention_decode").unwrap();
+        let attn = backend
+            .kernel("attention_decode", "attention_decode")
+            .unwrap();
         backend
             .launch_typed(
                 attn,
@@ -3909,7 +3932,8 @@ mod tests {
         let mean_abs = sum_abs / final_vals.len() as f32;
 
         assert_eq!(
-            nan_or_inf, 0,
+            nan_or_inf,
+            0,
             "x_final has {nan_or_inf} non-finite values out of {}",
             final_vals.len()
         );
@@ -3931,10 +3955,31 @@ mod tests {
 
         // Cleanup — release every allocation we made.
         for ptr in [
-            input_ln, q_norm, k_norm, post_ln, x, x_norm, q_full, k, v,
-            q_norm_out, k_norm_out, attn_out, gated_attn, o, x_resid, x_norm2,
-            gate_act, up_act, ffn_act, ffn_out, x_final, k_cache, v_cache,
-            inv_freq_ptr, positions_ptr,
+            input_ln,
+            q_norm,
+            k_norm,
+            post_ln,
+            x,
+            x_norm,
+            q_full,
+            k,
+            v,
+            q_norm_out,
+            k_norm_out,
+            attn_out,
+            gated_attn,
+            o,
+            x_resid,
+            x_norm2,
+            gate_act,
+            up_act,
+            ffn_act,
+            ffn_out,
+            x_final,
+            k_cache,
+            v_cache,
+            inv_freq_ptr,
+            positions_ptr,
         ] {
             backend.free(ptr).unwrap();
         }
@@ -3965,11 +4010,10 @@ mod tests {
     fn metal_real_model_chain_norm_then_qproj() {
         use safetensors::SafeTensors;
 
-        let model_dir = std::env::var("ATLAS_MLX_MODEL_DIR")
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").expect("HOME unset");
-                format!("{home}/models/Qwen3.5-4B-MLX-8bit")
-            });
+        let model_dir = std::env::var("ATLAS_MLX_MODEL_DIR").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").expect("HOME unset");
+            format!("{home}/models/Qwen3.5-4B-MLX-8bit")
+        });
         let st_path = std::path::Path::new(&model_dir).join("model.safetensors");
         if !st_path.exists() {
             eprintln!("skipping: {} not found", st_path.display());
@@ -3982,10 +4026,18 @@ mod tests {
 
         // Layer 3's input_layernorm and q_proj.
         let layer = "language_model.model.layers.3";
-        let ln = st.tensor(&format!("{layer}.input_layernorm.weight")).unwrap();
-        let q_w = st.tensor(&format!("{layer}.self_attn.q_proj.weight")).unwrap();
-        let q_s = st.tensor(&format!("{layer}.self_attn.q_proj.scales")).unwrap();
-        let q_b = st.tensor(&format!("{layer}.self_attn.q_proj.biases")).unwrap();
+        let ln = st
+            .tensor(&format!("{layer}.input_layernorm.weight"))
+            .unwrap();
+        let q_w = st
+            .tensor(&format!("{layer}.self_attn.q_proj.weight"))
+            .unwrap();
+        let q_s = st
+            .tensor(&format!("{layer}.self_attn.q_proj.scales"))
+            .unwrap();
+        let q_b = st
+            .tensor(&format!("{layer}.self_attn.q_proj.biases"))
+            .unwrap();
 
         // Real model dims.
         let hidden_size: u32 = 2560;
@@ -3994,7 +4046,10 @@ mod tests {
         let groups_per_row = (hidden_size / group_size) as usize;
 
         assert_eq!(ln.shape(), [hidden_size as usize]);
-        assert_eq!(q_w.shape(), [q_full_out as usize, (hidden_size / 4) as usize]);
+        assert_eq!(
+            q_w.shape(),
+            [q_full_out as usize, (hidden_size / 4) as usize]
+        );
 
         // Subset the q_proj to the first 64 rows so the CPU reference
         // stays cheap (~160 K dequant ops); kernel still uses the full
@@ -4054,16 +4109,10 @@ mod tests {
                 let byte = ((word >> ((c % 4) * 8)) & 0xFF) as f32;
                 let g = c / group_size as usize;
                 let s_idx = (r * groups_per_row + g) * 2;
-                let s = half::bf16::from_le_bytes([
-                    scales_subset[s_idx],
-                    scales_subset[s_idx + 1],
-                ])
-                .to_f32();
-                let b = half::bf16::from_le_bytes([
-                    biases_subset[s_idx],
-                    biases_subset[s_idx + 1],
-                ])
-                .to_f32();
+                let s = half::bf16::from_le_bytes([scales_subset[s_idx], scales_subset[s_idx + 1]])
+                    .to_f32();
+                let b = half::bf16::from_le_bytes([biases_subset[s_idx], biases_subset[s_idx + 1]])
+                    .to_f32();
                 let w = byte * s + b;
                 acc += w * x_norm_cpu[c];
             }
@@ -4144,10 +4193,7 @@ mod tests {
         for i in 0..n_rows {
             let e = expected_q[i].to_f32();
             let a = actual_q[i].to_f32();
-            assert!(
-                a.is_finite(),
-                "chain produced non-finite Q[{i}] = {a}"
-            );
+            assert!(a.is_finite(), "chain produced non-finite Q[{i}] = {a}");
             let d = (e - a).abs();
             if d > max_abs_diff {
                 max_abs_diff = d;
@@ -4195,11 +4241,10 @@ mod tests {
     fn metal_mlx_int8_gemv_real_model_q_proj() {
         use safetensors::SafeTensors;
 
-        let model_dir = std::env::var("ATLAS_MLX_MODEL_DIR")
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").expect("HOME unset");
-                format!("{home}/models/Qwen3.5-4B-MLX-8bit")
-            });
+        let model_dir = std::env::var("ATLAS_MLX_MODEL_DIR").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").expect("HOME unset");
+            format!("{home}/models/Qwen3.5-4B-MLX-8bit")
+        });
         let st_path = std::path::Path::new(&model_dir).join("model.safetensors");
         if !st_path.exists() {
             eprintln!("skipping: {} not found", st_path.display());
@@ -4221,8 +4266,14 @@ mod tests {
         let full_out = weight_shape[0];
         let in_packed_cols = weight_shape[1];
         let in_features = (in_packed_cols * 4) as u32;
-        assert_eq!(in_features, 2560, "expected hidden_size=2560 for Qwen3.5-4B");
-        assert_eq!(full_out, 8192, "expected num_heads*head_dim*2=8192 for layer 3 q_proj (with attn output gate)");
+        assert_eq!(
+            in_features, 2560,
+            "expected hidden_size=2560 for Qwen3.5-4B"
+        );
+        assert_eq!(
+            full_out, 8192,
+            "expected num_heads*head_dim*2=8192 for layer 3 q_proj (with attn output gate)"
+        );
 
         // Subset to the first N=128 output rows so the test runs in
         // a few hundred ms on M-series rather than ~21 M dequant ops.
@@ -4340,7 +4391,10 @@ mod tests {
             }
             // Also assert no NaN / inf — the real signal that the
             // chain is wired correctly.
-            assert!(a.is_finite(), "real-model gemv produced non-finite at row {i}: {a}");
+            assert!(
+                a.is_finite(),
+                "real-model gemv produced non-finite at row {i}: {a}"
+            );
         }
         assert!(
             max_abs_diff < 0.1 || max_rel_diff < 0.05,
@@ -4371,11 +4425,10 @@ mod tests {
     fn metal_mlx_int8_dequant_real_model() {
         use safetensors::SafeTensors;
 
-        let model_dir = std::env::var("ATLAS_MLX_MODEL_DIR")
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").expect("HOME unset");
-                format!("{home}/models/Qwen3.5-4B-MLX-8bit")
-            });
+        let model_dir = std::env::var("ATLAS_MLX_MODEL_DIR").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").expect("HOME unset");
+            format!("{home}/models/Qwen3.5-4B-MLX-8bit")
+        });
         let st_path = std::path::Path::new(&model_dir).join("model.safetensors");
         if !st_path.exists() {
             eprintln!("skipping: {} not found", st_path.display());
@@ -4444,24 +4497,17 @@ mod tests {
                 let byte = ((word >> ((c % 4) * 8)) & 0xFF) as f32;
                 let g = c / group_size as usize;
                 let s_idx = (r * groups_per_slice_row + g) * 2;
-                let s = half::bf16::from_le_bytes([
-                    scales_slice[s_idx],
-                    scales_slice[s_idx + 1],
-                ])
-                .to_f32();
-                let b = half::bf16::from_le_bytes([
-                    biases_slice[s_idx],
-                    biases_slice[s_idx + 1],
-                ])
-                .to_f32();
+                let s = half::bf16::from_le_bytes([scales_slice[s_idx], scales_slice[s_idx + 1]])
+                    .to_f32();
+                let b = half::bf16::from_le_bytes([biases_slice[s_idx], biases_slice[s_idx + 1]])
+                    .to_f32();
                 expected[r * n_cols + c] = half::bf16::from_f32(byte * s + b);
             }
         }
 
         // Run the kernel on the slice.
         let modules = atlas_kernels::metallib_modules();
-        let backend =
-            MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+        let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
 
         let packed_ptr = backend.alloc(packed_slice.len()).expect("alloc packed");
         let scales_ptr = backend.alloc(scales_slice.len()).expect("alloc scales");

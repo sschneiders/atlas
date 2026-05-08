@@ -102,8 +102,7 @@ impl MlxInt8Weight {
                 weight.dtype()
             );
         }
-        if scales.dtype() != safetensors::Dtype::BF16
-            || biases.dtype() != safetensors::Dtype::BF16
+        if scales.dtype() != safetensors::Dtype::BF16 || biases.dtype() != safetensors::Dtype::BF16
         {
             bail!(
                 "{base}.scales/biases: expected BF16, got scales={:?}, biases={:?}",
@@ -171,12 +170,7 @@ impl MlxInt8Weight {
     /// which must be a `DevicePtr` to a buffer of at least
     /// `out_features * in_features * 2` bytes. Runs the
     /// `mlx_int8_dequant` Metal kernel under the hood.
-    pub fn dequantize_to(
-        &self,
-        gpu: &dyn GpuBackend,
-        out: DevicePtr,
-        stream: u64,
-    ) -> Result<()> {
+    pub fn dequantize_to(&self, gpu: &dyn GpuBackend, out: DevicePtr, stream: u64) -> Result<()> {
         let kernel = gpu.kernel("mlx_int8_dequant", "mlx_int8_dequant")?;
         // 16×1 thread grid per (col_tile, row); covers all (r, c)
         // with bounds checks inside the kernel.
@@ -213,12 +207,17 @@ impl MlxInt8Weight {
         stream: u64,
     ) -> Result<()> {
         let kernel = gpu.kernel("mlx_int8_gemv", "mlx_int8_gemv")?;
-        // One threadgroup per output row; 64 threads per group is
-        // a safe default — two simdgroups, fits all M-series.
-        let threads_per_tg: u32 = 64;
+        // 4 rows per threadgroup, one simdgroup (32 threads) per row.
+        // Sharing `x[]` across 4 rows via L2 cache cuts input-side
+        // bandwidth by 4×; row-local simd_sum avoids cross-simdgroup
+        // reductions entirely.
+        const ROWS_PER_TG: u32 = 4;
+        const SIMDGROUP_SIZE: u32 = 32;
+        let threads_per_tg: u32 = ROWS_PER_TG * SIMDGROUP_SIZE; // 128
+        let row_groups = self.out_features.div_ceil(ROWS_PER_TG);
         gpu.launch_typed(
             kernel,
-            [self.out_features, 1, 1],
+            [row_groups, 1, 1],
             [threads_per_tg, 1, 1],
             0,
             stream,
@@ -230,6 +229,84 @@ impl MlxInt8Weight {
                 KernelArg::Buffer(self.scales),
                 KernelArg::Buffer(self.biases),
                 KernelArg::Buffer(x),
+                KernelArg::Buffer(y),
+            ],
+        )
+    }
+
+    /// Like `gemv_silu_gate`, but additionally folds the residual
+    /// stream addition into the same kernel:
+    ///   `y[n] = x_resid[n] + sum_k self[n, k] * (silu(gate[k]) ⊙ up[k])`
+    /// Eliminates the trailing `bf16_add` and the FFN-out staging
+    /// buffer on the decoder layer's exit.
+    pub fn gemv_silu_gate_resid(
+        &self,
+        gpu: &dyn GpuBackend,
+        gate: DevicePtr,
+        up: DevicePtr,
+        x_resid: DevicePtr,
+        y: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        let kernel = gpu.kernel("mlx_int8_gemv_silu_gate", "mlx_int8_gemv_silu_gate_resid")?;
+        const ROWS_PER_TG: u32 = 4;
+        const SIMDGROUP_SIZE: u32 = 32;
+        let threads_per_tg: u32 = ROWS_PER_TG * SIMDGROUP_SIZE;
+        let row_groups = self.out_features.div_ceil(ROWS_PER_TG);
+        gpu.launch_typed(
+            kernel,
+            [row_groups, 1, 1],
+            [threads_per_tg, 1, 1],
+            0,
+            stream,
+            &[
+                KernelArg::Bytes(&self.out_features.to_le_bytes()),
+                KernelArg::Bytes(&self.in_features.to_le_bytes()),
+                KernelArg::Bytes(&self.group_size.to_le_bytes()),
+                KernelArg::Buffer(self.packed),
+                KernelArg::Buffer(self.scales),
+                KernelArg::Buffer(self.biases),
+                KernelArg::Buffer(gate),
+                KernelArg::Buffer(up),
+                KernelArg::Buffer(x_resid),
+                KernelArg::Buffer(y),
+            ],
+        )
+    }
+
+    /// Decode-path FFN-residual fusion:
+    ///   `y = self @ (silu(gate) ⊙ up)`
+    /// Runs the fused `mlx_int8_gemv_silu_gate` kernel — replaces the
+    /// `silu_gate → gemv(down_proj)` pair with a single launch and
+    /// no INTERMEDIATE-sized staging buffer.
+    pub fn gemv_silu_gate(
+        &self,
+        gpu: &dyn GpuBackend,
+        gate: DevicePtr,
+        up: DevicePtr,
+        y: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        let kernel = gpu.kernel("mlx_int8_gemv_silu_gate", "mlx_int8_gemv_silu_gate")?;
+        const ROWS_PER_TG: u32 = 4;
+        const SIMDGROUP_SIZE: u32 = 32;
+        let threads_per_tg: u32 = ROWS_PER_TG * SIMDGROUP_SIZE;
+        let row_groups = self.out_features.div_ceil(ROWS_PER_TG);
+        gpu.launch_typed(
+            kernel,
+            [row_groups, 1, 1],
+            [threads_per_tg, 1, 1],
+            0,
+            stream,
+            &[
+                KernelArg::Bytes(&self.out_features.to_le_bytes()),
+                KernelArg::Bytes(&self.in_features.to_le_bytes()),
+                KernelArg::Bytes(&self.group_size.to_le_bytes()),
+                KernelArg::Buffer(self.packed),
+                KernelArg::Buffer(self.scales),
+                KernelArg::Buffer(self.biases),
+                KernelArg::Buffer(gate),
+                KernelArg::Buffer(up),
                 KernelArg::Buffer(y),
             ],
         )
@@ -282,6 +359,50 @@ impl MlxInt8Weight {
         gpu.free(self.biases)?;
         Ok(())
     }
+}
+
+/// Dual-output GEMV: `gate_y = gate @ x` and `up_y = up @ x` in one
+/// kernel launch. Halves the x-side memory bandwidth and removes one
+/// kernel-launch round-trip per FFN. Both projections must share
+/// `(out_features, in_features, group_size)`.
+pub fn gemv_gate_up(
+    gpu: &dyn GpuBackend,
+    gate: &MlxInt8Weight,
+    up: &MlxInt8Weight,
+    x: DevicePtr,
+    gate_y: DevicePtr,
+    up_y: DevicePtr,
+    stream: u64,
+) -> Result<()> {
+    debug_assert_eq!(gate.out_features, up.out_features);
+    debug_assert_eq!(gate.in_features, up.in_features);
+    debug_assert_eq!(gate.group_size, up.group_size);
+    let kernel = gpu.kernel("mlx_int8_gemv_gate_up", "mlx_int8_gemv_gate_up")?;
+    const ROWS_PER_TG: u32 = 4;
+    const SIMDGROUP_SIZE: u32 = 32;
+    let threads_per_tg: u32 = ROWS_PER_TG * SIMDGROUP_SIZE;
+    let row_groups = gate.out_features.div_ceil(ROWS_PER_TG);
+    gpu.launch_typed(
+        kernel,
+        [row_groups, 1, 1],
+        [threads_per_tg, 1, 1],
+        0,
+        stream,
+        &[
+            KernelArg::Bytes(&gate.out_features.to_le_bytes()),
+            KernelArg::Bytes(&gate.in_features.to_le_bytes()),
+            KernelArg::Bytes(&gate.group_size.to_le_bytes()),
+            KernelArg::Buffer(gate.packed),
+            KernelArg::Buffer(gate.scales),
+            KernelArg::Buffer(gate.biases),
+            KernelArg::Buffer(up.packed),
+            KernelArg::Buffer(up.scales),
+            KernelArg::Buffer(up.biases),
+            KernelArg::Buffer(x),
+            KernelArg::Buffer(gate_y),
+            KernelArg::Buffer(up_y),
+        ],
+    )
 }
 
 #[cfg(test)]

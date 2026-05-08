@@ -122,8 +122,7 @@ fn main() {
             pub fn ptx_modules() -> Vec<(&'static str, &'static str)> { Vec::new() }\n\
             pub fn metallib_modules() -> Vec<(&'static str, &'static [u8])> { Vec::new() }\n\
             pub fn all_ptx_sets() -> Vec<TargetPtxSet> { Vec::new() }\n";
-        std::fs::write(out_dir.join("target_ptx.rs"), stub)
-            .expect("write skip stub target_ptx.rs");
+        std::fs::write(out_dir.join("target_ptx.rs"), stub).expect("write skip stub target_ptx.rs");
         println!("cargo:rustc-env=ATLAS_PTX_DIR={}", out_dir.display());
         return;
     }

@@ -157,23 +157,22 @@ fn main() -> Result<()> {
     };
 
     let gemv_kernel = backend.kernel("dense_gemv_bf16", "dense_gemv_bf16")?;
-    let launch_gemv =
-        |w: DevicePtr, x_in: DevicePtr, y: DevicePtr, n: u32, k: u32| -> Result<()> {
-            backend.launch_typed(
-                gemv_kernel,
-                [n, 1, 1],
-                [64, 1, 1],
-                0,
-                stream,
-                &[
-                    KernelArg::Bytes(&n.to_le_bytes()),
-                    KernelArg::Bytes(&k.to_le_bytes()),
-                    KernelArg::Buffer(w),
-                    KernelArg::Buffer(x_in),
-                    KernelArg::Buffer(y),
-                ],
-            )
-        };
+    let launch_gemv = |w: DevicePtr, x_in: DevicePtr, y: DevicePtr, n: u32, k: u32| -> Result<()> {
+        backend.launch_typed(
+            gemv_kernel,
+            [n, 1, 1],
+            [64, 1, 1],
+            0,
+            stream,
+            &[
+                KernelArg::Bytes(&n.to_le_bytes()),
+                KernelArg::Bytes(&k.to_le_bytes()),
+                KernelArg::Buffer(w),
+                KernelArg::Buffer(x_in),
+                KernelArg::Buffer(y),
+            ],
+        )
+    };
 
     let add_kernel = backend.kernel("bf16_add", "bf16_add")?;
     let launch_add = |a: DevicePtr, b: DevicePtr, out: DevicePtr, n: u32| -> Result<()> {
@@ -286,7 +285,10 @@ fn main() -> Result<()> {
     );
     println!(
         "  first 8 outputs: {:?}",
-        &final_vals[..8].iter().map(|v| v.to_f32()).collect::<Vec<_>>()
+        &final_vals[..8]
+            .iter()
+            .map(|v| v.to_f32())
+            .collect::<Vec<_>>()
     );
 
     if nan_inf != 0 {
