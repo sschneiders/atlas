@@ -1,6 +1,30 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Shared helpers used by every `metal_backend::tests` submodule —
-//! byte-conversion utilities and a synthetic MLX-int8 fixture builder.
+//! backend construction with graceful skip when no Metal device is
+//! available (CI macOS runners are sometimes headless),
+//! byte-conversion utilities, and a synthetic MLX-int8 fixture builder.
+
+use crate::metal_backend::MetalGpuBackend;
+
+/// Construct a `MetalGpuBackend` for tests, or return `None` if the
+/// host can't open a Metal device. CI runners (especially virtualised
+/// macOS hosts on GitHub Actions) report
+/// `MTLCreateSystemDefaultDevice returned null` — letting every
+/// kernel parity test panic is noise; skipping silently is the
+/// right shape for environment-gated tests.
+///
+/// Callers should `let Some(backend) = maybe_backend() else { return };`
+/// at the top of each test fn.
+pub(super) fn maybe_backend() -> Option<MetalGpuBackend> {
+    let modules = atlas_kernels::metallib_modules();
+    match MetalGpuBackend::new(0, &modules) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            eprintln!("skipping metal_backend test: {e}");
+            None
+        }
+    }
+}
 
 // ── Byte-conversion helpers (bytemuck-free) ──────────────────
 

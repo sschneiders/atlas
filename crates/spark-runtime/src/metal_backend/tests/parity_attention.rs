@@ -15,8 +15,9 @@ use crate::gpu::{DevicePtr, GpuBackend, KernelArg};
 /// inside the kernel.
 #[test]
 fn metal_attention_prefill_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let num_tokens: u32 = 5;
     let seq_len: u32 = 5; // K/V align with Q in this test
@@ -148,8 +149,9 @@ fn metal_attention_prefill_matches_reference() {
 /// parameters, the result has to be the planted index.
 #[test]
 fn metal_softmax_topp_dominant_logit() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let vocab: u32 = 256;
     let mut logits: Vec<half::bf16> = (0..vocab)
@@ -206,8 +208,9 @@ fn metal_softmax_topp_dominant_logit() {
 /// updates exactly there, with neighbouring slots untouched.
 #[test]
 fn metal_kv_cache_append_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let max_seq: u32 = 8;
     let num_kv_heads: u32 = 2;
@@ -306,8 +309,9 @@ fn metal_kv_cache_append_matches_reference() {
 /// surfaces only as BF16 round error.
 #[test]
 fn metal_attention_decode_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let seq_len: u32 = 16;
     let num_heads: u32 = 4;

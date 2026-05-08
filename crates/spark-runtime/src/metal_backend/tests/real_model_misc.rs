@@ -140,8 +140,9 @@ fn metal_real_model_chain_norm_then_qproj() {
     }
 
     // ── Kernel chain: rms_norm → mlx_int8_gemv on real bytes ──
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let x_bytes = bf16_slice_to_bytes(&x);
     let x_ptr = backend.alloc(x_bytes.len()).unwrap();
@@ -333,8 +334,9 @@ fn metal_mlx_int8_dequant_real_model() {
     }
 
     // Run the kernel on the slice.
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let packed_ptr = backend.alloc(packed_slice.len()).expect("alloc packed");
     let scales_ptr = backend.alloc(scales_slice.len()).expect("alloc scales");

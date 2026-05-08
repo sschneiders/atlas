@@ -13,8 +13,9 @@ use crate::gpu::{DevicePtr, GpuBackend, KernelArg};
 /// both the cos/sin math and the index pairing.
 #[test]
 fn metal_rope_apply_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let num_tokens: u32 = 4;
     let num_heads: u32 = 2;
@@ -122,8 +123,9 @@ fn metal_rope_apply_matches_reference() {
 /// math itself.
 #[test]
 fn metal_silu_gate_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     // Cover a representative range: large negatives (where naive
     // exp(-x) grows), zero (sigmoid sharply 1/2), and large
@@ -201,8 +203,9 @@ fn metal_silu_gate_matches_reference() {
 /// rsqrt + weight rescale are wired correctly.
 #[test]
 fn metal_rms_norm_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let num_tokens: u32 = 3;
     let hidden: u32 = 256;
@@ -290,8 +293,9 @@ fn metal_rms_norm_matches_reference() {
 /// an out-of-range one to verify the bounds-check zero-write).
 #[test]
 fn metal_embed_lookup_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let vocab: u32 = 16;
     let hidden: u32 = 8;
@@ -370,8 +374,9 @@ fn metal_embed_lookup_matches_reference() {
 /// simd_shuffle_xor reduction is easy to get subtly wrong.
 #[test]
 fn metal_argmax_bf16_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let n: u32 = 1024;
     let mut values: Vec<half::bf16> = (0..n)

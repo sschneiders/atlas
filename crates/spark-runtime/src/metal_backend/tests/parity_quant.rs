@@ -16,8 +16,9 @@ use crate::gpu::{DevicePtr, GpuBackend, KernelArg};
 /// FP32 then rounds; we tolerate L∞ ≤ 1/256 (BF16 ULP).
 #[test]
 fn metal_mlx_int8_dequant_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     // Small but representative shape — non-trivial vs the group
     // boundary (group_size=64) and the 4-byte packing.
@@ -157,8 +158,9 @@ fn metal_mlx_int8_dequant_matches_reference() {
 /// + simdgroup reduction path that materializes one row of `y`.
 #[test]
 fn metal_mlx_int8_gemv_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     // Pick an N × K shape that exercises real reduction depth.
     // K=256 spans 4 groups per row (group_size=64) and 8 simd
@@ -269,8 +271,9 @@ fn metal_mlx_int8_gemv_matches_reference() {
 /// matches the row-by-row fused-dequant path.
 #[test]
 fn metal_mlx_int8_gemm_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let m: u32 = 2;
     let n: u32 = 8;

@@ -20,8 +20,9 @@ use crate::gpu::{DevicePtr, GpuBackend, KernelArg};
 /// 1000 threshold, so the clamp doesn't fire).
 #[test]
 fn metal_gated_delta_rule_decode_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     // Qwen3.5-style dims (smaller for fast test).
     let batch_size: u32 = 1;
@@ -204,8 +205,9 @@ fn metal_gated_delta_rule_decode_matches_reference() {
 /// FP32 state update, FP32 head-reduction for y.
 #[test]
 fn metal_selective_scan_decode_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let num_heads: u32 = 4;
     let num_channels: u32 = 16;
@@ -346,8 +348,9 @@ fn metal_selective_scan_decode_matches_reference() {
 /// step's output silently).
 #[test]
 fn metal_causal_conv1d_decode_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let num_channels: u32 = 8;
     let kernel_size: u32 = 4;

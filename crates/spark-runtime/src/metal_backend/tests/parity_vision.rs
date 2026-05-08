@@ -15,8 +15,9 @@ use crate::gpu::{DevicePtr, GpuBackend, KernelArg};
 /// any stride / channel-broadcast / dim-order regression.
 #[test]
 fn metal_conv3d_patch_embed_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     // Small but non-trivial: 4 output channels, 3 input channels
     // (RGB), kernel 2×4×4, output spatial 1×3×3 → input spatial
@@ -156,8 +157,9 @@ fn metal_conv3d_patch_embed_matches_reference() {
 /// path can use either kernel without reshaping weights.
 #[test]
 fn metal_dense_gemm_bf16_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let m: u32 = 4;
     let n: u32 = 8;
@@ -243,8 +245,9 @@ fn metal_dense_gemm_bf16_matches_reference() {
 /// the fused dequant.
 #[test]
 fn metal_dense_gemv_bf16_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let n: u32 = 16;
     let k: u32 = 256;
@@ -322,8 +325,9 @@ fn metal_dense_gemv_bf16_matches_reference() {
 /// the FP32 `(x - mean) / std * w + b` reference.
 #[test]
 fn metal_layer_norm_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let num_tokens: u32 = 3;
     let hidden: u32 = 256;
@@ -423,8 +427,9 @@ fn metal_layer_norm_matches_reference() {
 /// the tanh approximation has its largest error near |x| ≈ 1.
 #[test]
 fn metal_gelu_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let n: u32 = 256;
     let x: Vec<half::bf16> = (0..n)

@@ -109,8 +109,9 @@ fn metal_mlx_int8_gemv_real_model_q_proj() {
     }
 
     // Run the kernel on the same subset.
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let n: u32 = n_rows as u32;
     let k: u32 = in_features;

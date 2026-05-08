@@ -71,8 +71,9 @@ fn metal_real_model_full_attention_block_layer3() {
     let kv_dim: u32 = num_kv_heads * head_dim;
 
     let layer = "language_model.model.layers.3";
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     // Plain-BF16 weights (layer norms, per-head norms).
     let load_bf16 = |name: &str| -> DevicePtr {

@@ -15,10 +15,11 @@ use crate::gpu::{DevicePtr, GpuBackend, KernelArg};
 /// of what we initialised the buffer with.
 #[test]
 fn metal_alloc_copy_launch_roundtrip() {
-    // Pull the metallib bytes the build script embedded.
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules)
-        .expect("MetalGpuBackend::new failed — Metal device unavailable?");
+    // Pull the metallib bytes the build script embedded; skip the
+    // test gracefully when no Metal device is available (CI runner).
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     // Round-trip a known byte pattern through alloc/copy_h2d/copy_d2h.
     let bytes = 64;
@@ -70,8 +71,9 @@ fn metal_alloc_copy_launch_roundtrip() {
 /// blow up every layer's output.
 #[test]
 fn metal_bf16_add_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let n: u32 = 257; // odd to verify bounds-check on tail thread
     let a: Vec<half::bf16> = (0..n)
@@ -134,8 +136,9 @@ fn metal_bf16_add_matches_reference() {
 /// Qwen3.5 uses this for `attn_output_gate`.
 #[test]
 fn metal_sigmoid_gate_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let n: u32 = 128;
     let gate: Vec<half::bf16> = (0..n)

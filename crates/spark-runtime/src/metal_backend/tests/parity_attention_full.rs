@@ -11,8 +11,9 @@ use super::helpers::*;
 /// `s >= cutoff` branch.
 #[test]
 fn metal_attention_full_matches_reference() {
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     let num_tokens: u32 = 4;
     let seq_len: u32 = 6; // K/V wider than Q to exercise the non-causal path

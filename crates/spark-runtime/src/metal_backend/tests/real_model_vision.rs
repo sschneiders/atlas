@@ -49,8 +49,9 @@ fn metal_real_model_vision_block_forward() {
     let st = SafeTensors::deserialize(&mmap).expect("parse safetensors");
 
     let block = "vision_tower.blocks.0";
-    let modules = atlas_kernels::metallib_modules();
-    let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
 
     // Vision tower dims (Qwen3.5-VL): hidden=1024, qkv_total=3072,
     // 16 attention heads of 64 dim each, MLP intermediate=4096.
