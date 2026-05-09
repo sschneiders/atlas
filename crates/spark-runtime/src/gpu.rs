@@ -94,6 +94,26 @@ pub trait GpuBackend: Send + Sync {
         self.copy_d2h(src, dst)
     }
 
+    /// Copy device to host on `stream` WITHOUT a trailing sync. The caller
+    /// MUST `synchronize(stream)` before reading `dst` on the host. Used
+    /// by hot-path code (e.g. `high_speed_swap_offload_new_blocks`) that
+    /// issues several D2H copies in a row and only needs one sync at the
+    /// end. The default (with-sync) variant pays a stream sync per call,
+    /// which on the HSS decode path adds 124 host-side syncs/token at
+    /// 62 attention layers — measurable as ~25ms/token of dead time on
+    /// the MiniMax-M2.7-NVFP4 EP=2 GB10 baseline.
+    fn copy_d2h_async_on_stream(
+        &self,
+        src: DevicePtr,
+        dst: &mut [u8],
+        stream: u64,
+    ) -> Result<()> {
+        // Default: just call the syncing version. Backends that can do
+        // a true async-only copy (CUDA via `cuMemcpyDtoHAsync_v2` with
+        // no following sync) override this.
+        self.copy_d2h_on_stream(src, dst, stream)
+    }
+
     /// Copy device to device.
     fn copy_d2d(&self, src: DevicePtr, dst: DevicePtr, bytes: usize) -> Result<()>;
 

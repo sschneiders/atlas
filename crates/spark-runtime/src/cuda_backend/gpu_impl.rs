@@ -154,6 +154,25 @@ impl GpuBackend for AtlasCudaBackend {
         Ok(())
     }
 
+    fn copy_d2h_async_on_stream(
+        &self,
+        src: DevicePtr,
+        dst: &mut [u8],
+        stream: u64,
+    ) -> Result<()> {
+        // Async-only D2H — caller is responsible for syncing the stream
+        // before reading `dst`. Used by HSS offload to coalesce multiple
+        // D2H copies (K + V per layer) under a single trailing sync,
+        // dropping per-call host syncs from 2/layer to 1/layer.
+        let status = unsafe {
+            cuMemcpyDtoHAsync_v2(dst.as_mut_ptr() as *mut c_void, src.0, dst.len(), stream)
+        };
+        if status != 0 {
+            bail!("cuMemcpyDtoHAsync_v2 (async_on_stream) failed: status {status}");
+        }
+        Ok(())
+    }
+
     fn copy_d2d(&self, src: DevicePtr, dst: DevicePtr, bytes: usize) -> Result<()> {
         let status = unsafe { cuMemcpyDtoDAsync_v2(dst.0, src.0, bytes, self.default_stream) };
         if status != 0 {
