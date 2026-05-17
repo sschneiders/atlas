@@ -165,18 +165,34 @@ SCALE is binary **but** CUDA-runtime-compatible (its driver API exposes
    cudarc's `Ptx::from_src`, which is text-only). `cuda_backend.rs` selects
    blob-vs-text by build cfg / a generated flag.
 
-**OPEN QUESTION (must resolve before this is trustworthy — needs the AMD GPU
-runtime up, i.e. ROCm-on-WSL, see §5):** `--cuda-device-only [-c]` emits an
-**ELF relocatable** (`file` → "ELF … relocatable, AMD GPU"). It is unproven
-whether SCALE's `cuModuleLoadData` accepts a *relocatable* directly or needs a
-final **device link** to a loadable code object first. SCALE supports
-`-fgpu-rdc` ("matches the semantics of a cubin") and `cuModuleLoadFatBinary`.
-Likely the build needs a per-module (or whole-program) device-link step
-producing a loadable code object/fatbin that `ScaleTarget` emits instead of a
-bare `.o`. **Determine empirically once an AMD runtime exists**, then finalize
-`ScaleTarget.output_extension` + the load call. Writing the runtime load
-against the wrong artifact format now would be unvalidatable guesswork — hence
-deferred, not coded speculatively.
+**RESOLVED (probed 2026-05-17) — this is a runtime-MODEL fork, not just a
+file-format question:**
+- `--cuda-device-only`, `--cuda-device-only -c`, and `-fgpu-rdc` ALL emit
+  `ELF 64-bit LSB **relocatable**, AMD GPU` — SCALE never produces a
+  directly-loadable code object via the device-only path.
+- A normal full build (`nvcc x.cu -o exe`) embeds the device code into the
+  host binary via clang **offload bundling** (`clang-offload-bundler`,
+  `clang-linker-wrapper` are present) and SCALE's runtime auto-registers it
+  (the `cudaMalloc "no device"` test proved the device code was bundled &
+  the runtime engaged — it failed only at GPU discovery, not at module load).
+- SCALE's CUDA driver API *does* expose `cuModuleLoadData`/`Ex`
+  (`cudaTypedefs.h`), but **what artifact its `cuModuleLoadData` accepts is
+  unproven** without the AMD runtime live.
+
+Atlas's model = embed PTX text, `cuModuleLoadData` at runtime (driver JIT),
+launch by name via the registry. SCALE's native model = offload-bundle device
+code into the binary, auto-registered, launched by C++ symbol. **Two paths:**
+  1. **SCALE-native (lower risk):** AMD build compiles kernels into the
+     binary via SCALE's normal flow; the registry resolves kernels by symbol
+     instead of `cuModuleLoadData`(blob). Bigger atlas-core/spark-runtime
+     change but uses SCALE exactly as designed.
+  2. **Atlas-style:** device-link relocatables → a loadable code object,
+     embed bytes, `cuModuleLoadData` it. Needs SCALE to support loading a
+     hand-produced code object — unproven.
+**Decision deferred until the AMD runtime is live (needs the Windows AMD
+ROCm-on-WSL driver, §5) AND Spectral confirms the intended model for a
+CUDA-driver-API engine that loads modules dynamically.** Not coded
+speculatively (would risk an unvalidatable architectural mis-build).
 
 ---
 

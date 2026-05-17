@@ -54,6 +54,23 @@ pass defines **`__SCALE__`** (and `__AMDGCN__`) but **not**
 `__HIP_PLATFORM_AMD__` — is `#if defined(__SCALE__)` the recommended guard
 for SCALE-specific shims, or do you prefer `__AMDGCN__`?
 
+**Bigger architectural question (the one that gates our runtime):** Atlas
+isn't a normal CUDA app — it has no host-side `<<<>>>` launches. It compiles
+every kernel to PTX at build time, embeds the PTX text, and at runtime does
+`cuModuleLoadData(ptx)` + `cuModuleGetFunction(name)` + `cuLaunchKernel`
+through the driver API (a JIT/registry model, like an inference engine
+loading modules dynamically). On SCALE we see device-only compiles only ever
+produce `ELF relocatable` (no PTX, no loadable code object), and the native
+path is offload-bundling into the host binary. **What is the intended SCALE
+workflow for a driver-API engine that loads modules via `cuModuleLoadData`
+at runtime?** Specifically: (a) is there a way to emit a single loadable AMD
+code object/fatbin per kernel-set that your `cuModuleLoadData`/
+`cuModuleLoadFatBinary` accepts (and the right flags)? or (b) do you
+recommend we switch to offload-bundled device code + resolve kernels by
+symbol? This is the last thing between us and running Atlas on Strix Halo —
+all 92 of our qwen3.6-27b kernels now compile clean for gfx1151 (incl. the
+e4m3 tensor-core path via a bit-exact bf16 decomposition).
+
 We're bridging (1)/(2) with `#if defined(__SCALE__)` dequant→BF16 fallbacks
 on our side so the port can proceed in parallel — but native e4m3 codegen
 would let us delete all of that and is the difference between a
