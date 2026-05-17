@@ -31,7 +31,11 @@ partial_rotary_factor = 0.25
 mrope_interleaved = true
 mrope_section = [11, 11, 10]
 
-mtp_layers = 0
+# Checkpoint Qwen/Qwen3.6-27B-FP8 ships a native MTP head
+# (config.json: mtp_num_hidden_layers = 1, mtp.* tensors present). The
+# qwen35 loader auto-detects mtp.fc.weight and loads the MoE-routed MTP
+# head; was previously stalled at 0 (stale value, MTP silently disabled).
+mtp_layers = 1
 
 # Effective context for agentic tasks. Mirrors Qwen3.5-27B's empirical bound
 # (Atlas's hybrid-GDN long-context behavior is consistent across 27B variants).

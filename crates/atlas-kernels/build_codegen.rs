@@ -208,6 +208,81 @@ pub(super) fn generate_target_ptx_rs(
     g
 }
 
+/// Locate the SCALE (scale-lang.com) install root for the AMD/`scale`
+/// vendor path. A SCALE root is the extracted `scale-<ver>-Linux` dir that
+/// contains `bin/scaleenv` and a `targets/` dir (per-arch toolchains).
+///
+/// Resolution order: `$SCALE_HOME` / `$SCALE_ROOT` (exact root), then a
+/// short list of conventional locations, then a shallow scan of `$HOME`
+/// and `/opt` for a `scale*-Linux` child. Fails fast (PCND) — no silent
+/// default — since an AMD build is meaningless without SCALE.
+pub(super) fn find_scale_dir() -> PathBuf {
+    let is_scale_root = |p: &PathBuf| -> bool {
+        p.join("bin/scaleenv").exists() && p.join("targets").is_dir()
+    };
+
+    for var in ["SCALE_HOME", "SCALE_ROOT"] {
+        if let Ok(v) = env::var(var) {
+            let p = PathBuf::from(&v);
+            if is_scale_root(&p) {
+                return p;
+            }
+            panic!(
+                "${var}={v} is not a SCALE install root \
+                 (expected bin/scaleenv + targets/)."
+            );
+        }
+    }
+
+    let home = env::var("HOME").unwrap_or_default();
+    let mut candidates: Vec<PathBuf> = vec![
+        PathBuf::from(&home).join("scale17/scale-1.7.0-Linux"),
+        PathBuf::from(&home).join("scale/scale-1.7.0-Linux"),
+        PathBuf::from("/opt/scale/scale-1.7.0-Linux"),
+        PathBuf::from("/opt/scale"),
+    ];
+    // Shallow scan: a `scale*-Linux` dir directly under $HOME, ~/scale*,
+    // or /opt (covers version drift without hardcoding the version).
+    for base in [PathBuf::from(&home), PathBuf::from("/opt")] {
+        if let Ok(rd) = std::fs::read_dir(&base) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if name.starts_with("scale") {
+                        candidates.push(p.clone());
+                        // one level down: ~/scaleNN/scale-<ver>-Linux
+                        if let Ok(inner) = std::fs::read_dir(&p) {
+                            for ie in inner.flatten() {
+                                let ip = ie.path();
+                                if ip.is_dir()
+                                    && ip
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .map(|n| n.starts_with("scale"))
+                                        .unwrap_or(false)
+                                {
+                                    candidates.push(ip);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for c in &candidates {
+        if is_scale_root(c) {
+            return c.clone();
+        }
+    }
+    panic!(
+        "SCALE not found. Set $SCALE_HOME to the scale-<ver>-Linux install \
+         root (containing bin/scaleenv + targets/), or install SCALE from \
+         scale-lang.com. Searched: {candidates:?}"
+    );
+}
+
 pub(super) fn find_cuda_dir() -> PathBuf {
     if let Ok(cuda_home) = env::var("CUDA_HOME") {
         return PathBuf::from(cuda_home);

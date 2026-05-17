@@ -44,10 +44,19 @@ __device__ __constant__ float TURBO3_BOUNDS[7] = {
 // ── FP8 E4M3 helpers ──
 
 __device__ __forceinline__ __nv_fp8_storage_t float_to_fp8(float val) {
+#if defined(__SCALE__)
+    // SCALE/gfx1151: the `cvt.rn.satfinite.e4m3x2.f32` inline PTX has no
+    // codegen (no __nv_cvt_floatraw_to_fp8). __nv_cvt_float_to_fp8 is
+    // NVIDIA's own documented intrinsic with identical SATFINITE+E4M3
+    // semantics — numerically exact, not an approximation. (SCALE defines
+    // __SCALE__, not __HIP_PLATFORM_AMD__, in the device pass.)
+    return __nv_cvt_float_to_fp8(val, __NV_SATFINITE, __NV_E4M3);
+#else
     unsigned short pair;
     asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %1;"
                  : "=h"(pair) : "f"(val));
     return (__nv_fp8_storage_t)(pair & 0xFF);  // low byte = first FP8 value
+#endif
 }
 
 // FP8 E4M3 max representable

@@ -147,6 +147,83 @@ impl ComputeTarget for AppleTarget {
     }
 }
 
+/// SCALE (scale-lang.com) compilation target: recompiles the **unmodified
+/// CUDA** `.cu` sources for AMD GPUs. SCALE is a drop-in `nvcc` shim
+/// (clang-19 based) — but it emits an **AMD GPU code object** (ELF
+/// relocatable), not PTX text, and does **not** accept `--ptx`. The device
+/// object is produced via `--cuda-device-only -c`. Target arch (e.g.
+/// `gfx1151`) selects the per-arch toolchain dir `targets/<arch>/bin/nvcc`
+/// (equivalent to `source scaleenv <arch>` without needing a sourced shell).
+struct ScaleTarget {
+    /// SCALE install root (the `scale-<ver>-Linux` dir containing
+    /// `targets/` and `bin/scaleenv`).
+    scale_root: PathBuf,
+}
+
+impl ComputeTarget for ScaleTarget {
+    fn source_extension(&self) -> &str {
+        "cu"
+    }
+    fn output_extension(&self) -> &str {
+        // AMD GPU ELF relocatable produced by `--cuda-device-only -c`.
+        "o"
+    }
+    fn output_is_text(&self) -> bool {
+        false
+    }
+
+    fn compile(
+        &self,
+        source: &std::path::Path,
+        output: &std::path::Path,
+        arch: &str,
+        extra_flags: &[String],
+    ) -> Result<(), String> {
+        // Per-arch SCALE toolchain dir. `targets/<arch>/bin/nvcc` is the
+        // arch-pinned compiler (what `scaleenv <arch>` puts on PATH).
+        let nvcc = self
+            .scale_root
+            .join("targets")
+            .join(arch)
+            .join("bin/nvcc");
+        if !nvcc.exists() {
+            return Err(format!(
+                "SCALE arch toolchain not found: {} — `{}` is not a SCALE \
+                 target (check kernels/<hw>/HARDWARE.toml `arch` and the \
+                 installed SCALE `targets/` dir).",
+                nvcc.display(),
+                arch
+            ));
+        }
+
+        // SCALE emits an AMD GPU code object with `--cuda-device-only -c`.
+        // No `--ptx` (rejected). No host link here, so libnuma/host-stdlib
+        // link deps don't apply to the kernel-compile step.
+        let mut args: Vec<String> = vec![
+            "--cuda-device-only".into(),
+            "-c".into(),
+            "-O3".into(),
+        ];
+        args.extend(extra_flags.iter().cloned());
+        args.push(source.to_str().unwrap().into());
+        args.push("-o".into());
+        args.push(output.to_str().unwrap().into());
+
+        let status = Command::new(&nvcc)
+            .args(&args)
+            .status()
+            .map_err(|e| format!("Failed to run SCALE nvcc ({}): {e}", nvcc.display()))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "SCALE `--cuda-device-only -c` failed for {} (arch {arch})",
+                source.display()
+            ))
+        }
+    }
+}
+
 fn find_xcrun() -> PathBuf {
     // Cargo's macOS hosts always have `/usr/bin/xcrun`; PATH lookup is a
     // safety net for unusual toolchain layouts (CI runners with custom
@@ -181,8 +258,12 @@ pub(super) fn resolve_compute_target(vendor: Option<&str>) -> Box<dyn ComputeTar
             let xcrun = find_xcrun();
             Box::new(AppleTarget { xcrun })
         }
+        "amd" | "rocm" | "scale" => {
+            let scale_root = super::build_codegen::find_scale_dir();
+            Box::new(ScaleTarget { scale_root })
+        }
         other => panic!(
-            "Unsupported compute vendor '{other}'. Supported: nvidia, apple.\n\
+            "Unsupported compute vendor '{other}'. Supported: nvidia, apple, amd.\n\
              To add support for a new vendor, implement the ComputeTarget trait \n\
              in atlas-kernels/build_target.rs and atlas-core/src/compute.rs."
         ),
