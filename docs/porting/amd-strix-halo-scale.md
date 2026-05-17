@@ -139,15 +139,44 @@ kernels/strix/
 `-ffp-contract=off` is the SCALE/clang spelling of nvcc `--fmad=false` (same
 no-FMA-contraction intent, matters for NVFP4/FP8 precision parity).
 
-### 3.1 Pending build-system work
+### 3.1 Pending: binary codegen 3rd mode + runtime load (task #8)
 
-`build_codegen.rs::generate_target_ptx_rs` has only text-PTX vs binary-Metal
-modes; binary mode emits **empty `all_ptx_sets()` stubs**. SCALE is binary but
-exposes the CUDA driver API (runtime = same as NVIDIA, just
-`cuModuleLoadData` of an ELF code object). A **third codegen mode** is needed:
-binary blob (`include_bytes!`) **plus** full `all_ptx_sets()` metadata
-(sampling/dflash/behavior), plus a runtime binary-module load path next to
-`KernelModule::from_ptx_src`.
+`build_codegen.rs::generate_target_ptx_rs` today has only two modes (driven
+by `output_is_text: bool`): text-PTX (NVIDIA — `include_str!` + full
+`all_ptx_sets()`) and binary-Metal (Apple — `include_bytes!` +
+`metallib_modules()` + **empty** `ptx_modules()`/`all_ptx_sets()` stubs).
+SCALE is binary **but** CUDA-runtime-compatible (its driver API exposes
+`cuModuleLoad`/`cuModuleLoadData`/`cuModuleLoadDataEx`/`cuModuleLoadFatBinary`
+— verified in `targets/gfx1151/include`). So neither existing mode fits.
+
+**Design (3rd mode — "binary, CUDA-runtime"):**
+1. `generate_target_ptx_rs`: take an enum `{TextPtx, BinaryCudaRt, BinaryMetal}`
+   instead of `output_is_text: bool`. `BinaryCudaRt` emits `include_bytes!`
+   `&[u8]` consts **and the full `all_ptx_sets()` metadata block** (sampling/
+   dflash/behavior/model_type — identical to the text branch; only the
+   module-blob type differs).
+2. `TargetPtxSet.modules`: today `Vec<(&'static str,&'static str)>`. Add a
+   parallel `module_blobs: Vec<(&'static str,&'static [u8])>` (or make it an
+   enum) so the text path is untouched (NVIDIA zero-risk) and the SCALE path
+   carries bytes. Keep `KernelTarget`/metadata identical.
+3. Runtime: add `KernelModule::from_binary(ctx,&[u8])` beside
+   `from_ptx_src`. `atlas-core/src/registry.rs` already has the raw
+   `cuModuleLoadData(module, image)` FFI — feed it the blob bytes (skip
+   cudarc's `Ptx::from_src`, which is text-only). `cuda_backend.rs` selects
+   blob-vs-text by build cfg / a generated flag.
+
+**OPEN QUESTION (must resolve before this is trustworthy — needs the AMD GPU
+runtime up, i.e. ROCm-on-WSL, see §5):** `--cuda-device-only [-c]` emits an
+**ELF relocatable** (`file` → "ELF … relocatable, AMD GPU"). It is unproven
+whether SCALE's `cuModuleLoadData` accepts a *relocatable* directly or needs a
+final **device link** to a loadable code object first. SCALE supports
+`-fgpu-rdc` ("matches the semantics of a cubin") and `cuModuleLoadFatBinary`.
+Likely the build needs a per-module (or whole-program) device-link step
+producing a loadable code object/fatbin that `ScaleTarget` emits instead of a
+bare `.o`. **Determine empirically once an AMD runtime exists**, then finalize
+`ScaleTarget.output_extension` + the load call. Writing the runtime load
+against the wrong artifact format now would be unvalidatable guesswork — hence
+deferred, not coded speculatively.
 
 ---
 
