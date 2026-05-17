@@ -158,7 +158,14 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else {
-            let use_br64 = n >= 256;
+            // BR64=64 large-chunk prefill kernels overflow RDNA3.5's hard
+            // 64 KB LDS cap; ATLAS_HW_FORCE_BR32 (set by build.rs from the
+            // HW's force_br32_prefill flag) routes all chunk sizes through
+            // the LDS-fixed BR=32 kernel (correct for any n; perf-only
+            // tradeoff). Absent on NVIDIA → unchanged.
+            let use_br64 = n >= 256
+                && !option_env!("ATLAS_HW_FORCE_BR32")
+                    .map_or(false, |v| v == "1" || v == "true");
             let (fp8_k_scale, fp8_v_scale) = self.effective_fp8_scales();
             match (self.kv_dtype, use_br64) {
                 (KvCacheDtype::Nvfp4, true) => ops::prefill_attention_paged_nvfp4_64(

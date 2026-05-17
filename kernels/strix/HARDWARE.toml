@@ -16,3 +16,11 @@ memory_type = "LPDDR5X"
 # sizing for the WSL bring-up must account for that, not this number.
 memory_gb = 64
 use_fp32_residual = false
+# RDNA3.5 has a hard 64 KB/workgroup LDS cap. The BR64=64 large-chunk
+# prefill kernel's __shared__ (smem_Q64[64]) overflows it even after
+# single-buffering K. Force the BR=32 prefill path on this target: the
+# BR=32 kernel is LDS-fixed, correct for all chunk sizes, and the _64
+# kernels become compile-only (never dispatched). Perf-only tradeoff
+# (large prefill chunks tile in 32 rows instead of 64). NVIDIA targets
+# omit this key → option_env! None → unchanged behaviour.
+force_br32_prefill = true

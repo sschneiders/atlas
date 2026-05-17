@@ -403,7 +403,17 @@ extern "C" __global__ void KERNEL_NAME(
 //   m/l: [64][2]   =  0.5 KB
 // ============================================================================
 
+// Under SCALE/gfx1151 the BR64=64 large-chunk prefill kernels are
+// COMPILE-ONLY (force_br32_prefill routes all dispatch to the BR=32
+// kernel — see HARDWARE.toml / paged_attn.rs). BR64=32 here only needs
+// to make them fit RDNA3.5's 64 KB LDS so the binary builds; they are
+// never launched on AMD, so the host grid (still BR64=64) is irrelevant.
+// NVIDIA keeps BR64=64 verbatim.
+#if defined(__SCALE__)
+#define BR64 32
+#else
 #define BR64 64
+#endif
 #define TILE_CHUNKS_Q64 (BR64 * (HDIM / 8))
 
 #define _PAGED_CONCAT(a, b) a##b

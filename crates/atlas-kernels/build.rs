@@ -292,6 +292,17 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
             if fp32_res { "true" } else { "false" }
         );
     }
+    // Force the BR=32 prefill path (skip the BR64=64 large-chunk kernels)
+    // on targets that can't fit the _64 kernel's LDS (e.g. RDNA3.5's hard
+    // 64 KB/workgroup cap). Only emitted when the HW opts in; absent on
+    // NVIDIA → option_env! None → BR64 dispatch unchanged.
+    if hw_toml["hardware"]
+        .get("force_br32_prefill")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        println!("cargo:rustc-env=ATLAS_HW_FORCE_BR32=true");
+    }
 
     // Expand model wildcard (exclude the `common/` shared-kernel dir,
     // which has no MODEL.toml).

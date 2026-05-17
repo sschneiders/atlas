@@ -18,7 +18,19 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+// SCALE/gfx1151: RDNA3.5 hard 64 KB/workgroup LDS cap. This kernel is
+// COMPILE-ONLY on AMD (orphan — no runtime callers; never dispatched).
+// BR64=32 + single-buffer smem_K64 only need to make it fit LDS so the
+// binary builds. NVIDIA #else is verbatim (byte-identical, zero regression).
+#if defined(__SCALE__)
+#define BR64 32
+#define ATLAS_KBUFN 1
+#define ATLAS_KB(x) 0u
+#else
 #define BR64 64
+#define ATLAS_KBUFN 2
+#define ATLAS_KB(x) (x)
+#endif
 #define BC 32
 #ifndef HDIM
 #define HDIM 256
@@ -87,7 +99,7 @@ extern "C" __global__ void inferspark_prefill_fp8kv_64(
     __nv_bfloat16* O_batch = O + batch * seq_len * q_seq_stride;
 
     __shared__ __nv_bfloat16 smem_Q[BR64][HDIM_PAD];
-    __shared__ __nv_bfloat16 smem_K64[2][BC][HDIM_PAD];
+    __shared__ __nv_bfloat16 smem_K64[ATLAS_KBUFN][BC][HDIM_PAD];
     __shared__ __nv_bfloat16 smem_V64[BC][HDIM_PAD];
     __shared__ __nv_bfloat16 smem_P64[BR64][BC + PAD_P];
     __shared__ float smem_ml64[BR64][2];
@@ -197,7 +209,7 @@ extern "C" __global__ void inferspark_prefill_fp8kv_64(
             }
 
             const unsigned short* sQ = (const unsigned short*)smem_Q;
-            const unsigned short* sK = (const unsigned short*)smem_K64[buf];
+            const unsigned short* sK = (const unsigned short*)smem_K64[ATLAS_KB(buf)];
 
             #pragma unroll
             for (unsigned int ks = 0; ks < (HDIM / 16); ks++) {
@@ -355,10 +367,10 @@ extern "C" __global__ void inferspark_prefill_fp8kv_64(
                 unsigned int col = chunk * 8;
                 unsigned int k_row = next_kv_start + row;
                 if (k_row < seq_len) {
-                    LOAD_FP8_CHUNK(smem_K64[1 - buf][row], col,
+                    LOAD_FP8_CHUNK(smem_K64[ATLAS_KB(1 - buf)][row], col,
                         &K_batch[k_row * kv_seq_stride + kv_head * head_dim + col]);
                 } else {
-                    *((uint4*)&smem_K64[1 - buf][row][col]) = make_uint4(0, 0, 0, 0);
+                    *((uint4*)&smem_K64[ATLAS_KB(1 - buf)][row][col]) = make_uint4(0, 0, 0, 0);
                 }
             }
         }
