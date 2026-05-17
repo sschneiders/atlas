@@ -41,6 +41,23 @@ __device__ __forceinline__ float sw_exp(float x) {
 #define N_TILES_PER_WARP ((HDIM / 8) / 2)
 #define TILE_CHUNKS (BR * (HDIM / 8))
 
+// SCALE/gfx1151: RDNA3.5 has a hard 64 KB/workgroup LDS cap. The
+// double-buffered smem_K[2] (33,792 B at HDIM=256) pushes this kernel's
+// __shared__ to 70,400 B > 65,536. Single-buffer smem_K under SCALE
+// (70,400 -> 53,504 B, fits with margin). Correct-by-construction: the
+// existing __syncthreads() before the K prefetch and after the K-wait
+// already bracket the QK^T read and the prefetch write of smem_K, and the
+// PV stage never reads smem_K — so collapsing to one buffer is race-free
+// (it only reduces load/compute overlap). NVIDIA #else keeps the original
+// double buffer verbatim (byte-identical codegen, zero regression).
+#if defined(__SCALE__)
+#define ATLAS_KBUFN 1
+#define ATLAS_KB(x) 0u
+#else
+#define ATLAS_KBUFN 2
+#define ATLAS_KB(x) (x)
+#endif
+
 extern "C" __global__ void KERNEL_NAME(
     const __nv_bfloat16* __restrict__ Q,
     K_CACHE_TYPE K_cache,
@@ -94,7 +111,7 @@ extern "C" __global__ void KERNEL_NAME(
 #endif
 
     __shared__ __nv_bfloat16 smem_Q[BR][HDIM_PAD];
-    __shared__ __nv_bfloat16 smem_K[2][BC][HDIM_PAD];  // double-buffered
+    __shared__ __nv_bfloat16 smem_K[ATLAS_KBUFN][BC][HDIM_PAD];  // double-buffered (single under SCALE)
     __shared__ __nv_bfloat16 smem_V[BC][HDIM_PAD];
     __shared__ __nv_bfloat16 smem_P[BR][BC + PAD_P];
     __shared__ float smem_ml[BR][2];
@@ -164,7 +181,7 @@ extern "C" __global__ void KERNEL_NAME(
             for (int i = 0; i < 4; i++) { acc_s[i][0]=0; acc_s[i][1]=0; acc_s[i][2]=0; acc_s[i][3]=0; }
 
             const unsigned short* sQ = (const unsigned short*)smem_Q;
-            const unsigned short* sK = (const unsigned short*)smem_K[buf];
+            const unsigned short* sK = (const unsigned short*)smem_K[ATLAS_KB(buf)];
 
             #pragma unroll
             for (unsigned int ks = 0; ks < (HDIM/16); ks++) {
@@ -291,7 +308,7 @@ extern "C" __global__ void KERNEL_NAME(
 
         // === Preload K[i+1] (paged, overlaps with PV for BF16 cp.async) ===
         if(kv_block+1<num_kv_blocks){
-            LOAD_KV_TILE(K_cache, block_table, smem_K[1-buf], (kv_block+1)*BC, kv_len, kv_head, tid, blockDim.x);
+            LOAD_KV_TILE(K_cache, block_table, smem_K[ATLAS_KB(1-buf)], (kv_block+1)*BC, kv_len, kv_head, tid, blockDim.x);
             asm volatile("cp.async.commit_group;");
         }
 
@@ -437,7 +454,7 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
 #endif
 
     __shared__ __nv_bfloat16 smem_Q64[BR64][HDIM_PAD];
-    __shared__ __nv_bfloat16 smem_K64[2][BC][HDIM_PAD];
+    __shared__ __nv_bfloat16 smem_K64[ATLAS_KBUFN][BC][HDIM_PAD];
     __shared__ __nv_bfloat16 smem_V64[BC][HDIM_PAD];
     __shared__ __nv_bfloat16 smem_P64[BR64][BC + PAD_P];
     __shared__ float smem_ml64[BR64][2];
@@ -503,7 +520,7 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
             for (int i = 0; i < 4; i++) { acc_s[i][0]=0; acc_s[i][1]=0; acc_s[i][2]=0; acc_s[i][3]=0; }
 
             const unsigned short* sQ = (const unsigned short*)smem_Q64;
-            const unsigned short* sK = (const unsigned short*)smem_K64[buf];
+            const unsigned short* sK = (const unsigned short*)smem_K64[ATLAS_KB(buf)];
 
             #pragma unroll
             for (unsigned int ks = 0; ks < (HDIM/16); ks++) {
@@ -631,7 +648,7 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
 
         // === Preload K[i+1] (256 threads = 2× faster) ===
         if(kv_block+1<num_kv_blocks){
-            LOAD_KV_TILE(K_cache, block_table, smem_K64[1-buf], (kv_block+1)*BC, kv_len, kv_head, tid, blockDim.x);
+            LOAD_KV_TILE(K_cache, block_table, smem_K64[ATLAS_KB(1-buf)], (kv_block+1)*BC, kv_len, kv_head, tid, blockDim.x);
             asm volatile("cp.async.commit_group;");
         }
 
