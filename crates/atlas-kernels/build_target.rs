@@ -181,11 +181,7 @@ impl ComputeTarget for ScaleTarget {
     ) -> Result<(), String> {
         // Per-arch SCALE toolchain dir. `targets/<arch>/bin/nvcc` is the
         // arch-pinned compiler (what `scaleenv <arch>` puts on PATH).
-        let nvcc = self
-            .scale_root
-            .join("targets")
-            .join(arch)
-            .join("bin/nvcc");
+        let nvcc = self.scale_root.join("targets").join(arch).join("bin/nvcc");
         if !nvcc.exists() {
             return Err(format!(
                 "SCALE arch toolchain not found: {} — `{}` is not a SCALE \
@@ -199,11 +195,7 @@ impl ComputeTarget for ScaleTarget {
         // SCALE emits an AMD GPU code object with `--cuda-device-only -c`.
         // No `--ptx` (rejected). No host link here, so libnuma/host-stdlib
         // link deps don't apply to the kernel-compile step.
-        let mut args: Vec<String> = vec![
-            "--cuda-device-only".into(),
-            "-c".into(),
-            "-O3".into(),
-        ];
+        let mut args: Vec<String> = vec!["--cuda-device-only".into(), "-c".into(), "-O3".into()];
         args.extend(extra_flags.iter().cloned());
         args.push(source.to_str().unwrap().into());
         args.push("-o".into());

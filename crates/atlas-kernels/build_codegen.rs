@@ -217,9 +217,8 @@ pub(super) fn generate_target_ptx_rs(
 /// and `/opt` for a `scale*-Linux` child. Fails fast (PCND) — no silent
 /// default — since an AMD build is meaningless without SCALE.
 pub(super) fn find_scale_dir() -> PathBuf {
-    let is_scale_root = |p: &PathBuf| -> bool {
-        p.join("bin/scaleenv").exists() && p.join("targets").is_dir()
-    };
+    let is_scale_root =
+        |p: &PathBuf| -> bool { p.join("bin/scaleenv").exists() && p.join("targets").is_dir() };
 
     for var in ["SCALE_HOME", "SCALE_ROOT"] {
         if let Ok(v) = env::var(var) {
