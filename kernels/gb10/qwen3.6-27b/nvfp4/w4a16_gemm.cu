@@ -12,6 +12,26 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+// SCALE/gfx1151: the `cvt.rn.satfinite.e4m3x2.f32` inline PTX has no codegen
+// (SCALE lacks the internal __nv_cvt_floatraw_to_fp8 lowering helper).
+// __nv_cvt_float_to_fp8 is NVIDIA's own documented intrinsic with identical
+// SATFINITE+E4M3 semantics — numerically exact, not an approximation. The
+// #else branch is the verbatim original PTX, so with __forceinline__ at -O3
+// the NVIDIA codegen is byte-identical (zero NVFP4/FP8 regression). SCALE
+// defines __SCALE__ (not __HIP_PLATFORM_AMD__) in the device pass.
+// PTX `cvt.e4m3x2.f32 d,a,b`: d hi-byte = e4m3(a), lo-byte = e4m3(b).
+__device__ __forceinline__ unsigned short atlas_cvt_e4m3x2_f32(float a_hi, float b_lo) {
+#if defined(__SCALE__)
+    unsigned a8 = (unsigned)__nv_cvt_float_to_fp8(a_hi, __NV_SATFINITE, __NV_E4M3);
+    unsigned b8 = (unsigned)__nv_cvt_float_to_fp8(b_lo, __NV_SATFINITE, __NV_E4M3);
+    return (unsigned short)((a8 << 8) | (b8 & 0xFFu));
+#else
+    unsigned short d;
+    asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(d) : "f"(a_hi), "f"(b_lo));
+    return d;
+#endif
+}
+
 #define M_TILE 64
 #define N_TILE_SM 64
 #define N_TILE_LG 128
@@ -198,8 +218,8 @@ __device__ __forceinline__ unsigned int bf16x4_to_e4m3x4(const unsigned short* s
     asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(f2) : "h"(bf2));
     asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(f3) : "h"(bf3));
     unsigned short h0, h1;
-    asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(h0) : "f"(f1), "f"(f0));
-    asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(h1) : "f"(f3), "f"(f2));
+    h0 = atlas_cvt_e4m3x2_f32(f1, f0);
+    h1 = atlas_cvt_e4m3x2_f32(f3, f2);
     return ((unsigned int)h1 << 16) | (unsigned int)h0;
 }
 
@@ -280,8 +300,7 @@ extern "C" __global__ void w4a16_gemm_t(
             float lo = smem_LUT[packed & 0xF] * sv0; \
             float hi = smem_LUT[packed >> 4] * sv0; \
             unsigned short fp8_pair; \
-            asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" \
-                         : "=h"(fp8_pair) : "f"(hi), "f"(lo)); \
+            fp8_pair = atlas_cvt_e4m3x2_f32(hi, lo); \
             *(unsigned short*)&smem_B_fp8[my_n][kp * 2] = fp8_pair; \
         } \
         _Pragma("unroll") \
@@ -290,8 +309,7 @@ extern "C" __global__ void w4a16_gemm_t(
             float lo = smem_LUT[packed & 0xF] * sv1; \
             float hi = smem_LUT[packed >> 4] * sv1; \
             unsigned short fp8_pair; \
-            asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" \
-                         : "=h"(fp8_pair) : "f"(hi), "f"(lo)); \
+            fp8_pair = atlas_cvt_e4m3x2_f32(hi, lo); \
             *(unsigned short*)&smem_B_fp8[my_n][kp * 2] = fp8_pair; \
         } \
     } while(0)
@@ -514,8 +532,7 @@ extern "C" __global__ void predequant_nvfp4_to_fp8(
     float val_hi = E2M1_LUT[packed >> 4] * sv;
 
     unsigned short fp8_pair;
-    asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
-                 : "=h"(fp8_pair) : "f"(val_hi), "f"(val_lo));
+    fp8_pair = atlas_cvt_e4m3x2_f32(val_hi, val_lo);
 
     *(unsigned short*)&B_fp8[(unsigned long long)n * K + k_even] = fp8_pair;
 }
@@ -541,8 +558,7 @@ extern "C" __global__ void bf16_to_fp8(
     asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(f0) : "h"(bf0));
     asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(f1) : "h"(bf1));
     unsigned short fp8_pair;
-    asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
-                 : "=h"(fp8_pair) : "f"(f1), "f"(f0));
+    fp8_pair = atlas_cvt_e4m3x2_f32(f1, f0);
     *(unsigned short*)&dst[idx] = fp8_pair;
 }
 
@@ -770,8 +786,7 @@ extern "C" __global__ void w4a16_gemm_t_k64(
             float lo = smem_LUT_k64[packed & 0xF] * sv0; \
             float hi = smem_LUT_k64[packed >> 4] * sv0; \
             unsigned short fp8_pair; \
-            asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" \
-                         : "=h"(fp8_pair) : "f"(hi), "f"(lo)); \
+            fp8_pair = atlas_cvt_e4m3x2_f32(hi, lo); \
             *(unsigned short*)&smem_B_fp8_k64[my_n][kp * 2] = fp8_pair; \
         } \
         _Pragma("unroll") \
@@ -780,8 +795,7 @@ extern "C" __global__ void w4a16_gemm_t_k64(
             float lo = smem_LUT_k64[packed & 0xF] * sv1; \
             float hi = smem_LUT_k64[packed >> 4] * sv1; \
             unsigned short fp8_pair; \
-            asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" \
-                         : "=h"(fp8_pair) : "f"(hi), "f"(lo)); \
+            fp8_pair = atlas_cvt_e4m3x2_f32(hi, lo); \
             *(unsigned short*)&smem_B_fp8_k64[my_n][kp * 2] = fp8_pair; \
         } \
         _Pragma("unroll") \
@@ -790,8 +804,7 @@ extern "C" __global__ void w4a16_gemm_t_k64(
             float lo = smem_LUT_k64[packed & 0xF] * sv2; \
             float hi = smem_LUT_k64[packed >> 4] * sv2; \
             unsigned short fp8_pair; \
-            asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" \
-                         : "=h"(fp8_pair) : "f"(hi), "f"(lo)); \
+            fp8_pair = atlas_cvt_e4m3x2_f32(hi, lo); \
             *(unsigned short*)&smem_B_fp8_k64[my_n][kp * 2] = fp8_pair; \
         } \
         _Pragma("unroll") \
@@ -800,8 +813,7 @@ extern "C" __global__ void w4a16_gemm_t_k64(
             float lo = smem_LUT_k64[packed & 0xF] * sv3; \
             float hi = smem_LUT_k64[packed >> 4] * sv3; \
             unsigned short fp8_pair; \
-            asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" \
-                         : "=h"(fp8_pair) : "f"(hi), "f"(lo)); \
+            fp8_pair = atlas_cvt_e4m3x2_f32(hi, lo); \
             *(unsigned short*)&smem_B_fp8_k64[my_n][kp * 2] = fp8_pair; \
         } \
     } while(0)
@@ -984,8 +996,7 @@ void w4a16_gemm_t_m128(
             float lo = smem_LUT[packed & 0xF] * sv0; \
             float hi = smem_LUT[packed >> 4]  * sv0; \
             unsigned short fp8_pair; \
-            asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" \
-                         : "=h"(fp8_pair) : "f"(hi), "f"(lo)); \
+            fp8_pair = atlas_cvt_e4m3x2_f32(hi, lo); \
             *(unsigned short*)&smem_B_fp8[my_n][kp * 2] = fp8_pair; \
         } \
         _Pragma("unroll") \
@@ -994,8 +1005,7 @@ void w4a16_gemm_t_m128(
             float lo = smem_LUT[packed & 0xF] * sv1; \
             float hi = smem_LUT[packed >> 4]  * sv1; \
             unsigned short fp8_pair; \
-            asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" \
-                         : "=h"(fp8_pair) : "f"(hi), "f"(lo)); \
+            fp8_pair = atlas_cvt_e4m3x2_f32(hi, lo); \
             *(unsigned short*)&smem_B_fp8[my_n][kp * 2] = fp8_pair; \
         } \
     } while(0)
