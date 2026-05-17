@@ -33,6 +33,58 @@ __device__ __forceinline__ unsigned short atlas_cvt_e4m3x2_f32(float a_hi, float
 #endif
 }
 
+// SCALE/gfx1151 has no codegen for mma.sync.m16n8k32.e4m3. Proven
+// bit-exact replacement (scripts/scale-probe/e4m3_mma_helper_equiv.cu,
+// GB10: max|ref-cand|=0.0000): intra-warp-group __shfl repack of the
+// e4m3 m16n8k32 fragments -> dequant -> 2x mma.m16n8k16.bf16 (K split
+// 0..15 / 16..31). #else verbatim e4m3 PTX (NVIDIA byte-identical).
+// NOTE: this kernel is COMPILE-ONLY for FP8 serving (FP8 dispatches
+// moe_fp8_grouped_gemm); the proof still guarantees correctness if the
+// NVFP4 grouped path is ever used.
+#if defined(__SCALE__)
+__device__ __forceinline__ float atlas_e4m3_to_f32(unsigned char b) {
+    return __half2float(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)b, __NV_E4M3));
+}
+__device__ __forceinline__ unsigned atlas_bf2(float lo, float hi) {
+    unsigned short l = __bfloat16_as_ushort(__float2bfloat16(lo));
+    unsigned short h = __bfloat16_as_ushort(__float2bfloat16(hi));
+    return ((unsigned)h << 16) | l;
+}
+#endif
+__device__ __forceinline__ void atlas_mma_e4m3(float* acc,
+    unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+    unsigned b0, unsigned b1) {
+#if defined(__SCALE__)
+    unsigned lane = threadIdx.x & 31u, tig = lane & 3u, base = lane & ~3u;
+    #pragma unroll
+    for (int half = 0; half < 2; half++) {
+        unsigned A_g = half ? a2 : a0, A_g8 = half ? a3 : a1, B_g = half ? b1 : b0;
+        #define ATLAS_GA(reg, j) atlas_e4m3_to_f32((unsigned char)( \
+            __shfl_sync(0xffffffffu, (reg), base + ((unsigned)(j) >> 2)) \
+            >> (8 * ((j) & 3))))
+        int j0 = 2 * (int)tig, j1 = 8 + 2 * (int)tig;
+        unsigned A0 = atlas_bf2(ATLAS_GA(A_g, j0),  ATLAS_GA(A_g, j0 + 1));
+        unsigned A1 = atlas_bf2(ATLAS_GA(A_g8, j0), ATLAS_GA(A_g8, j0 + 1));
+        unsigned A2 = atlas_bf2(ATLAS_GA(A_g, j1),  ATLAS_GA(A_g, j1 + 1));
+        unsigned A3 = atlas_bf2(ATLAS_GA(A_g8, j1), ATLAS_GA(A_g8, j1 + 1));
+        unsigned B0 = atlas_bf2(ATLAS_GA(B_g, j0),  ATLAS_GA(B_g, j0 + 1));
+        unsigned B1 = atlas_bf2(ATLAS_GA(B_g, j1),  ATLAS_GA(B_g, j1 + 1));
+        #undef ATLAS_GA
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+            "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+            : "=f"(acc[0]), "=f"(acc[1]), "=f"(acc[2]), "=f"(acc[3])
+            : "r"(A0), "r"(A1), "r"(A2), "r"(A3), "r"(B0), "r"(B1),
+              "f"(acc[0]), "f"(acc[1]), "f"(acc[2]), "f"(acc[3]));
+    }
+#else
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+        : "=f"(acc[0]), "=f"(acc[1]), "=f"(acc[2]), "=f"(acc[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+          "f"(acc[0]), "f"(acc[1]), "f"(acc[2]), "f"(acc[3]));
+#endif
+}
+
 #define M_TILE 64
 #define N_TILE_SM 64
 #define N_TILE_LG 128
@@ -384,15 +436,7 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t(
             unsigned int nc = nt * 8 + group_id; \
             unsigned int b0 = *(const unsigned int*)&smem_B_fp8[nc][4 * tid]; \
             unsigned int b1 = *(const unsigned int*)&smem_B_fp8[nc][16 + 4 * tid]; \
-            asm volatile( \
-                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
-                :"=f"(acc[nt][0]),"=f"(acc[nt][1]), \
-                 "=f"(acc[nt][2]),"=f"(acc[nt][3]) \
-                :"r"(a0),"r"(a1),"r"(a2),"r"(a3), \
-                 "r"(b0),"r"(b1), \
-                 "f"(acc[nt][0]),"f"(acc[nt][1]), \
-                 "f"(acc[nt][2]),"f"(acc[nt][3])); \
+            atlas_mma_e4m3(acc[nt], a0,a1,a2,a3, b0, b1); \
         } \
     } while(0)
 
@@ -635,12 +679,7 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64(
             unsigned int nc = nt * 8 + group_id; \
             unsigned int b0 = *(const unsigned int*)&smem_B_fp8_k64[nc][4 * tid]; \
             unsigned int b1 = *(const unsigned int*)&smem_B_fp8_k64[nc][16 + 4 * tid]; \
-            asm volatile( \
-                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
-                :"=f"(acc[nt][0]),"=f"(acc[nt][1]),"=f"(acc[nt][2]),"=f"(acc[nt][3]) \
-                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
-                 "f"(acc[nt][0]),"f"(acc[nt][1]),"f"(acc[nt][2]),"f"(acc[nt][3])); \
+            atlas_mma_e4m3(acc[nt], a0,a1,a2,a3, b0, b1); \
         } \
         unsigned int a4 = moe_bf16x4_to_e4m3x4(&sA[fr0 * ast64 + 32 + tid * 4]); \
         unsigned int a5 = moe_bf16x4_to_e4m3x4(&sA[fr1 * ast64 + 32 + tid * 4]); \
@@ -651,12 +690,7 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64(
             unsigned int nc = nt * 8 + group_id; \
             unsigned int b0 = *(const unsigned int*)&smem_B_fp8_k64[nc][32 + 4 * tid]; \
             unsigned int b1 = *(const unsigned int*)&smem_B_fp8_k64[nc][48 + 4 * tid]; \
-            asm volatile( \
-                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
-                :"=f"(acc[nt][0]),"=f"(acc[nt][1]),"=f"(acc[nt][2]),"=f"(acc[nt][3]) \
-                :"r"(a4),"r"(a5),"r"(a6),"r"(a7),"r"(b0),"r"(b1), \
-                 "f"(acc[nt][0]),"f"(acc[nt][1]),"f"(acc[nt][2]),"f"(acc[nt][3])); \
+            atlas_mma_e4m3(acc[nt], a4,a5,a6,a7, b0, b1); \
         } \
     } while(0)
 
@@ -886,12 +920,7 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64(
             unsigned int nc = nt * 8 + group_id; \
             unsigned int b0 = *(const unsigned int*)&smem_B_fp8_fgu64[nc][4 * tid]; \
             unsigned int b1 = *(const unsigned int*)&smem_B_fp8_fgu64[nc][16 + 4 * tid]; \
-            asm volatile( \
-                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
-                :"=f"(acc[nt][0]),"=f"(acc[nt][1]),"=f"(acc[nt][2]),"=f"(acc[nt][3]) \
-                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
-                 "f"(acc[nt][0]),"f"(acc[nt][1]),"f"(acc[nt][2]),"f"(acc[nt][3])); \
+            atlas_mma_e4m3(acc[nt], a0,a1,a2,a3, b0, b1); \
         } \
         unsigned int a4 = moe_bf16x4_to_e4m3x4(&sA[fr0 * ast_fgu64 + 32 + tid * 4]); \
         unsigned int a5 = moe_bf16x4_to_e4m3x4(&sA[fr1 * ast_fgu64 + 32 + tid * 4]); \
@@ -902,12 +931,7 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64(
             unsigned int nc = nt * 8 + group_id; \
             unsigned int b0 = *(const unsigned int*)&smem_B_fp8_fgu64[nc][32 + 4 * tid]; \
             unsigned int b1 = *(const unsigned int*)&smem_B_fp8_fgu64[nc][48 + 4 * tid]; \
-            asm volatile( \
-                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
-                :"=f"(acc[nt][0]),"=f"(acc[nt][1]),"=f"(acc[nt][2]),"=f"(acc[nt][3]) \
-                :"r"(a4),"r"(a5),"r"(a6),"r"(a7),"r"(b0),"r"(b1), \
-                 "f"(acc[nt][0]),"f"(acc[nt][1]),"f"(acc[nt][2]),"f"(acc[nt][3])); \
+            atlas_mma_e4m3(acc[nt], a4,a5,a6,a7, b0, b1); \
         } \
     } while(0)
 
@@ -1126,15 +1150,7 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t(
             unsigned int nc = nt * 8 + group_id; \
             unsigned int b0 = *(const unsigned int*)&smem_B_fp8[nc][4 * tid]; \
             unsigned int b1 = *(const unsigned int*)&smem_B_fp8[nc][16 + 4 * tid]; \
-            asm volatile( \
-                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
-                :"=f"(acc[nt][0]),"=f"(acc[nt][1]), \
-                 "=f"(acc[nt][2]),"=f"(acc[nt][3]) \
-                :"r"(a0),"r"(a1),"r"(a2),"r"(a3), \
-                 "r"(b0),"r"(b1), \
-                 "f"(acc[nt][0]),"f"(acc[nt][1]), \
-                 "f"(acc[nt][2]),"f"(acc[nt][3])); \
+            atlas_mma_e4m3(acc[nt], a0,a1,a2,a3, b0, b1); \
         } \
     } while(0)
 
@@ -1322,15 +1338,7 @@ extern "C" __global__ void moe_fp8_grouped_gemm_ptrtable_t(
             unsigned int nc = nt * 8 + group_id; \
             unsigned int b0 = *(const unsigned int*)&smem_B2_fp8[nc][4 * tid]; \
             unsigned int b1 = *(const unsigned int*)&smem_B2_fp8[nc][16 + 4 * tid]; \
-            asm volatile( \
-                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
-                :"=f"(acc[nt][0]),"=f"(acc[nt][1]), \
-                 "=f"(acc[nt][2]),"=f"(acc[nt][3]) \
-                :"r"(a0),"r"(a1),"r"(a2),"r"(a3), \
-                 "r"(b0),"r"(b1), \
-                 "f"(acc[nt][0]),"f"(acc[nt][1]), \
-                 "f"(acc[nt][2]),"f"(acc[nt][3])); \
+            atlas_mma_e4m3(acc[nt], a0,a1,a2,a3, b0, b1); \
         } \
     } while(0)
 
