@@ -167,3 +167,5 @@ When in doubt, copy from a model with similar arch:
 | Pure attention + MoE | `mistral-small-4/`, `minimax-m2-229b/` |
 | Pure attention dense | `gemma-4-31b/` |
 | Vision-language | `qwen3-vl-30b-a3b/` |
+
+<!-- This is a test to verify the CLA bot pipeline -->
