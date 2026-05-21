@@ -38,7 +38,7 @@ use cudarc::driver::LaunchConfig;
 
 use super::{
     AtlasCudaBackend, cuCtxSetCurrent, cuEventCreate, cuEventDestroy_v2, cuEventRecord,
-    cuGraphDestroy, cuGraphExecDestroy, cuGraphInstantiateWithFlags, cuGraphLaunch, cuMemAlloc_v2,
+    cuGraphDestroy, cuGraphExecDestroy, cuGraphLaunch, cuMemAlloc_v2,
     cuMemAllocHost_v2, cuMemAllocManaged, cuMemFree_v2, cuMemFreeHost, cuMemGetInfo_v2,
     cuMemcpyDtoDAsync_v2, cuMemcpyDtoHAsync_v2, cuMemcpyHtoDAsync_v2, cuMemsetD8Async,
     cuStreamBeginCapture, cuStreamCreate, cuStreamEndCapture, cuStreamSynchronize,
@@ -257,12 +257,17 @@ impl GpuBackend for AtlasCudaBackend {
         if status != 0 {
             bail!("cuStreamEndCapture failed: status {status}");
         }
-        // Instantiate the graph into an executable
+        // Instantiate the graph into an executable. NVIDIA exposes
+        // `cuGraphInstantiateWithFlags`; SCALE (gfx1151) exposes the
+        // ABI-identical `cuGraphInstantiate` — see cuda_backend.rs.
         let mut graph_exec: u64 = 0;
-        let status = unsafe { cuGraphInstantiateWithFlags(&mut graph_exec, graph, 0) };
+        #[cfg(not(atlas_scale))]
+        let status = unsafe { super::cuGraphInstantiateWithFlags(&mut graph_exec, graph, 0) };
+        #[cfg(atlas_scale)]
+        let status = unsafe { super::cuGraphInstantiate(&mut graph_exec, graph, 0) };
         if status != 0 {
             unsafe { cuGraphDestroy(graph) };
-            bail!("cuGraphInstantiateWithFlags failed: status {status}");
+            bail!("cuGraphInstantiate failed: status {status}");
         }
         // The graph template is no longer needed after instantiation
         unsafe { cuGraphDestroy(graph) };

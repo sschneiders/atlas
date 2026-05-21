@@ -62,6 +62,7 @@ atlas-kernels = { path = "crates/atlas-kernels" }
 
 [patch.crates-io]
 xgrammar-rs = { path = "vendor/xgrammar-rs" }
+cudarc = { path = "vendor/cudarc" }
 
 # Workspace-wide lint policy. Each crate also adds `#![deny(warnings)]` /
 # `#![deny(clippy::all)]` to its `lib.rs`/`main.rs`; this section extends

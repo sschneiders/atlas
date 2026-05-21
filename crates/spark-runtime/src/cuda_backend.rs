@@ -37,7 +37,19 @@ unsafe extern "C" {
     // CUDA graph capture/replay
     pub(super) fn cuStreamBeginCapture(hStream: u64, mode: u32) -> i32;
     pub(super) fn cuStreamEndCapture(hStream: u64, phGraph: *mut u64) -> i32;
+    // CUDA-graph instantiate. NVIDIA's libcuda exports the 3-arg
+    // `cuGraphInstantiateWithFlags`; SCALE's libcuda (gfx1151) exports
+    // only `cuGraphInstantiate` — same ABI `(CUgraphExec*, CUgraph,
+    // unsigned long long)`, no `WithFlags` alias. `atlas_scale` (set by
+    // build.rs from ATLAS_TARGET_HW) picks the symbol that exists.
+    #[cfg(not(atlas_scale))]
     pub(super) fn cuGraphInstantiateWithFlags(
+        phGraphExec: *mut u64,
+        hGraph: u64,
+        flags: u64,
+    ) -> i32;
+    #[cfg(atlas_scale)]
+    pub(super) fn cuGraphInstantiate(
         phGraphExec: *mut u64,
         hGraph: u64,
         flags: u64,
@@ -78,7 +90,7 @@ impl AtlasCudaBackend {
     /// Use `atlas_kernels::ptx_for_model()` or `ptx_modules()` to
     /// obtain the correct module set for the target model.
     /// Subsequent calls reuse the cached singleton.
-    pub fn new(ordinal: usize, ptx_modules: &[(&'static str, &str)]) -> Result<Self> {
+    pub fn new(ordinal: usize, ptx_modules: &[(&'static str, &'static [u8])]) -> Result<Self> {
         let registry = AtlasRegistry::get_or_init(ordinal, ptx_modules)
             .map_err(|e| anyhow::anyhow!("AtlasRegistry init failed: {e}"))?;
         let default_stream = registry.raw_stream();

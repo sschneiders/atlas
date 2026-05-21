@@ -6,7 +6,7 @@ license.workspace = true
 description = "Atlas Spark — pure Rust LLM inference server"
 
 [features]
-default = ["cuda"]
+default = ["cuda", "nccl"]
 # Forwards through to atlas-core/spark-runtime/spark-model so the default
 # Linux build still activates the cuda backend after atlas-core became
 # default-features = false at the workspace level.
@@ -17,6 +17,11 @@ cuda = [
     "spark-storage/cuda",
     "spark-comm/cuda",
 ]
+# `nccl` pulls in spark-comm's NCCL FFI for real multi-GPU collectives.
+# Separated from `cuda` so SCALE/AMD (gfx1151) builds — which have no
+# NCCL library — build with `--no-default-features --features cuda`.
+# NVIDIA builds get it via `default`. Implies `cuda`.
+nccl = ["cuda", "spark-comm/nccl"]
 metal = [
     "atlas-core/metal",
     "spark-runtime/metal",

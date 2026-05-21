@@ -209,10 +209,14 @@ pub struct DflashConfig {
     pub target_layer_ids: &'static [usize],
 }
 
-/// PTX modules hyperoptimized for a specific (H, M_q) target.
+/// Kernel modules hyperoptimized for a specific (H, M_q) target.
+///
+/// Each module blob is `&[u8]`: NVIDIA PTX is ASCII text (still valid as
+/// bytes), while SCALE/AMD (gfx1151) ships binary code objects. The
+/// runtime (`AtlasRegistry`) detects text-vs-binary per blob.
 pub struct TargetPtxSet {
     pub target: KernelTarget,
-    pub modules: Vec<(&'static str, &'static str)>,
+    pub modules: Vec<(&'static str, &'static [u8])>,
     pub sampling: SamplingPresets,
     pub behavior: ModelBehavior,
     pub model_type_matches: Vec<ModelTypeMatch>,

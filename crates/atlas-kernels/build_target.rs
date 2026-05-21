@@ -19,10 +19,13 @@ use super::build_codegen::find_cuda_dir;
 pub(super) trait ComputeTarget {
     fn source_extension(&self) -> &str;
     fn output_extension(&self) -> &str;
-    /// Whether the compiled output is human-readable text (PTX) or an
-    /// opaque binary blob (metallib / HSACO / SPIR-V). Drives whether
-    /// the codegen emits `include_str!` or `include_bytes!`.
-    fn output_is_text(&self) -> bool;
+    /// Whether this backend exposes the CUDA module API — i.e. the
+    /// runtime loads kernels via `cuModuleLoadData` and the codegen must
+    /// emit the `all_ptx_sets()` registry. True for NVIDIA and for SCALE
+    /// (SCALE is CUDA-compatible; it just emits AMD-GPU binary objects
+    /// instead of PTX text). False for Metal, which has its own module
+    /// API and registry path.
+    fn uses_cuda_module_api(&self) -> bool;
     fn compile(
         &self,
         source: &std::path::Path,
@@ -43,7 +46,7 @@ impl ComputeTarget for NvidiaTarget {
     fn output_extension(&self) -> &str {
         "ptx"
     }
-    fn output_is_text(&self) -> bool {
+    fn uses_cuda_module_api(&self) -> bool {
         true
     }
 
@@ -86,7 +89,7 @@ impl ComputeTarget for AppleTarget {
     fn output_extension(&self) -> &str {
         "metallib"
     }
-    fn output_is_text(&self) -> bool {
+    fn uses_cuda_module_api(&self) -> bool {
         false
     }
 
@@ -168,8 +171,10 @@ impl ComputeTarget for ScaleTarget {
         // AMD GPU ELF relocatable produced by `--cuda-device-only -c`.
         "o"
     }
-    fn output_is_text(&self) -> bool {
-        false
+    fn uses_cuda_module_api(&self) -> bool {
+        // SCALE is a CUDA-compatible toolkit: the runtime loads these
+        // AMD-GPU code objects via `cuModuleLoadData`, same as NVIDIA.
+        true
     }
 
     fn compile(
@@ -192,24 +197,47 @@ impl ComputeTarget for ScaleTarget {
             ));
         }
 
-        // SCALE emits an AMD GPU code object with `--cuda-device-only -c`.
-        // No `--ptx` (rejected). No host link here, so libnuma/host-stdlib
-        // link deps don't apply to the kernel-compile step.
+        // Step 1: SCALE compiles the .cu to a *relocatable* AMD-GPU
+        // object (`--cuda-device-only -c`; `--ptx` is rejected). No host
+        // link, so host-stdlib deps don't apply to this step.
+        let reloc = output.with_extension("reloc.o");
         let mut args: Vec<String> = vec!["--cuda-device-only".into(), "-c".into(), "-O3".into()];
         args.extend(extra_flags.iter().cloned());
         args.push(source.to_str().unwrap().into());
         args.push("-o".into());
-        args.push(output.to_str().unwrap().into());
+        args.push(reloc.to_str().unwrap().into());
 
         let status = Command::new(&nvcc)
             .args(&args)
             .status()
             .map_err(|e| format!("Failed to run SCALE nvcc ({}): {e}", nvcc.display()))?;
-        if status.success() {
+        if !status.success() {
+            return Err(format!(
+                "SCALE `--cuda-device-only -c` failed for {} (arch {arch})",
+                source.display()
+            ));
+        }
+
+        // Step 2: device-link the relocatable into a *loadable* AMD-GPU
+        // code object (ELF DYN). `cuModuleLoadData` (HSA) rejects a bare
+        // relocatable with CUDA_ERROR_INVALID_VALUE; `ld.lld -shared`
+        // resolves it into the shared code object HSA can load.
+        let lld = self.scale_root.join("llvm/bin/ld.lld");
+        let link_status = Command::new(&lld)
+            .args([
+                "-shared",
+                reloc.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+            ])
+            .status()
+            .map_err(|e| format!("Failed to run SCALE ld.lld ({}): {e}", lld.display()))?;
+        let _ = std::fs::remove_file(&reloc);
+        if link_status.success() {
             Ok(())
         } else {
             Err(format!(
-                "SCALE `--cuda-device-only -c` failed for {} (arch {arch})",
+                "SCALE device-link (ld.lld -shared) failed for {} (arch {arch})",
                 source.display()
             ))
         }
