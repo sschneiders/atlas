@@ -73,3 +73,10 @@ Atlas builds and links cleanly on Strix Halo via SCALE 1.7.0 and runs to
 GPU init. It is blocked entirely on SCALE's runtime failing to bring up
 the gfx1151 device — a 5-line CUDA program reproduces it. Needs a SCALE
 build whose ROCr supports gfx1151.
+
+## Native ROCm works — isolates the bug to SCALE
+
+`amdrocm-blas-test-gfx1151` `rocblas-bench -f gemm -r f32_r -m 512 -n 512 -k 512`
+runs a native rocBLAS SGEMM on gfx1151: **1296.7 GFLOPS, 207 us, exit 0.**
+So the GPU, amdkfd driver, and ROCm 7.13 are all healthy for native
+compute — the failure is specific to SCALE 1.7.0's runtime.
