@@ -128,6 +128,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> Response {
             stop_tokens: stop_tokens.clone(),
             enable_thinking,
             thinking_budget,
+            repetition_detection: req.repetition_detection(),
             require_tool_call: tool_choice_required,
             suppress_tool_call,
             disable_mtp: false,

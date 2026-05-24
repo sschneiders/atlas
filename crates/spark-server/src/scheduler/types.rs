@@ -15,6 +15,7 @@ use spark_model::traits::SequenceState;
 
 use crate::api::{InferenceRequest, InferenceResponse, StreamEvent};
 use crate::grammar::GrammarState;
+use crate::openai::RepetitionDetectionParams;
 
 /// Shared queue between receiver thread and scheduler.
 pub(super) struct PendingQueue {
@@ -59,6 +60,10 @@ pub(super) struct PrefillInProgress {
     pub logit_bias: Vec<(u32, f32)>,
     pub enable_thinking: bool,
     pub thinking_budget: Option<u32>,
+    /// Per-request override for the vLLM-anchored token-loop detector.
+    /// Propagated to `ActiveSeq` on promotion. `None` = use the
+    /// boot-global watchdog parameters.
+    pub repetition_detection: Option<RepetitionDetectionParams>,
     /// Per-server spontaneous-thinking budget (from MODEL.toml
     /// `[behavior].max_thinking_budget`). When the model emits a
     /// `<think>` token without the request having explicitly enabled
@@ -118,6 +123,10 @@ pub(super) struct ActiveSeq {
     pub enable_thinking: bool,
     /// Max thinking tokens before forcing `</think>`. None = unlimited.
     pub thinking_budget: Option<u32>,
+    /// Per-request override for the vLLM-anchored token-loop detector
+    /// (content-loop + thinking-loop). `None` = use the boot-global
+    /// watchdog parameters. Mirrors vLLM's `RepetitionDetectionParams`.
+    pub repetition_detection: Option<RepetitionDetectionParams>,
     /// Per-server spontaneous-thinking budget (from MODEL.toml
     /// `[behavior].max_thinking_budget`).
     pub spontaneous_think_budget: u32,
@@ -246,6 +255,9 @@ pub(super) struct SwappedSeq {
     pub inside_thinking: bool,
     pub enable_thinking: bool,
     pub thinking_budget: Option<u32>,
+    /// Per-request override for the vLLM-anchored token-loop detector,
+    /// preserved across snapshot/restore.
+    pub repetition_detection: Option<RepetitionDetectionParams>,
     pub spontaneous_think_budget: u32,
     pub thinking_tokens: u32,
     pub force_end_thinking: bool,

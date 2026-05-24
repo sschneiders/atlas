@@ -43,6 +43,11 @@ pub struct CompletionRequest {
     pub stop: Vec<String>,
     /// Seed for deterministic sampling (same as chat completions).
     pub seed: Option<u64>,
+    /// Per-request override for the vLLM-anchored token-loop detector
+    /// (see `RepetitionDetectionParams` in `chat_request.rs`). None =
+    /// use server default.
+    #[serde(default)]
+    pub repetition_detection: Option<RepetitionDetectionParams>,
 }
 
 /// Accept `prompt` as a string or array of strings (joined).

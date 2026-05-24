@@ -207,6 +207,23 @@ impl InferenceRequest {
         }
     }
 
+    /// Per-request override for the vLLM-anchored token-loop detector.
+    /// `None` = use the boot-global watchdog parameters.
+    pub fn repetition_detection(
+        &self,
+    ) -> Option<crate::openai::RepetitionDetectionParams> {
+        match self {
+            InferenceRequest::Blocking {
+                repetition_detection,
+                ..
+            } => *repetition_detection,
+            InferenceRequest::Streaming {
+                repetition_detection,
+                ..
+            } => *repetition_detection,
+        }
+    }
+
     /// Whether a tool call is required for this request.
     pub fn require_tool_call(&self) -> bool {
         match self {

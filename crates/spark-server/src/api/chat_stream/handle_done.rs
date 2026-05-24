@@ -31,6 +31,85 @@ pub(super) fn handle_done(
 ) -> SseVec {
     let mut sse_events: SseVec = Vec::new();
 
+    // ── Stop-string hold-back flush ─────────────────────────────────
+    // vLLM's `IncrementalDetokenizer` releases any bytes still in the
+    // hold-back window when the stream finalises (see
+    // `vllm/v1/engine/detokenizer.py`). Mirror that here: if a match
+    // never triggered (`stop_string_triggered == false`) the tail
+    // bytes are legitimate output and must be forwarded. Route them
+    // through the active detector / sanitizer so the same envelope
+    // and leak-marker rules apply — without this, a sub-stop-string
+    // suffix that happens to contain a tool-call fragment would
+    // bypass the live pipeline.
+    if !ctx.stop_strings.is_empty()
+        && !state.stop_string_triggered
+        && state.stop_string_emitted_len < state.accumulated_content.len()
+    {
+        let tail = state.accumulated_content[state.stop_string_emitted_len..].to_string();
+        state.stop_string_emitted_len = state.accumulated_content.len();
+        if !tail.is_empty() {
+            if let Some(det) = state.detector.as_mut() {
+                let outputs = det.process(&tail);
+                for output in outputs {
+                    match output {
+                        tool_parser::DetectorOutput::Content(text) => {
+                            let sanitized = sanitize_content_chunk(
+                                &text,
+                                &mut state.tag_scan_buf,
+                                &mut state.suppressing_param_leak,
+                                &mut state.inside_envelope,
+                                &ctx.leak_markers,
+                            );
+                            if !sanitized.is_empty() {
+                                let chunk = ChatCompletionChunk::content_chunk(
+                                    &ctx.model,
+                                    &ctx.id,
+                                    sanitized,
+                                );
+                                sse_events.push(Ok(Event::default()
+                                    .data(serde_json::to_string(&chunk).unwrap_or_default())));
+                            }
+                        }
+                        tool_parser::DetectorOutput::ToolCall(mut tc, tc_idx) => {
+                            handle_complete_tool_call(state, ctx, &mut tc, tc_idx, &mut sse_events);
+                        }
+                        tool_parser::DetectorOutput::ToolCallStart {
+                            id: tc_id,
+                            name,
+                            idx,
+                        } => {
+                            handle_tool_call_start(state, ctx, tc_id, name, idx, &mut sse_events);
+                        }
+                        tool_parser::DetectorOutput::ToolCallDelta { args, idx } => {
+                            handle_tool_call_delta(state, ctx, args, idx, &mut sse_events);
+                        }
+                        tool_parser::DetectorOutput::ToolCallEnd { idx } => {
+                            handle_tool_call_end(state, ctx, idx);
+                        }
+                    }
+                }
+            } else {
+                let sanitized = sanitize_content_chunk(
+                    &tail,
+                    &mut state.tag_scan_buf,
+                    &mut state.suppressing_param_leak,
+                    &mut state.inside_envelope,
+                    &ctx.leak_markers,
+                );
+                if !sanitized.is_empty() {
+                    if state.refusal_scan_buf.len() < 16_384 {
+                        state.refusal_scan_buf.push_str(&sanitized);
+                    }
+                    let chunk =
+                        ChatCompletionChunk::content_chunk(&ctx.model, &ctx.id, sanitized);
+                    sse_events.push(Ok(
+                        Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
+                    ));
+                }
+            }
+        }
+    }
+
     // ── Detector flush ──────────────────────────────────────────────
     if state.detector.is_some() {
         let outputs = {

@@ -66,6 +66,7 @@ pub(crate) async fn chat_completions_stream(
     logit_bias: Vec<(u32, f32)>,
     enable_thinking: bool,
     thinking_budget: Option<u32>,
+    repetition_detection: Option<crate::openai::RepetitionDetectionParams>,
     tools_active: bool,
     tool_choice_required: bool,
     suppress_tool_call: bool,
@@ -130,6 +131,7 @@ pub(crate) async fn chat_completions_stream(
         stop_tokens,
         enable_thinking: scheduler_thinking,
         thinking_budget,
+        repetition_detection,
         require_tool_call: tool_choice_required,
         suppress_tool_call,
         disable_mtp: false,
@@ -170,6 +172,20 @@ pub(crate) async fn chat_completions_stream(
         .and_then(|s| s.parse().ok())
         .unwrap_or(12);
 
+    // Cache the hold-back window length once. vLLM's
+    // `IncrementalDetokenizer.update` uses
+    // `max(len(s) for s in stop_strings) - 1` so a stop string that
+    // straddles two decoded chunks cannot leak its prefix to the
+    // client before the suffix arrives. Zero when no stop strings are
+    // configured (preserves the existing pass-through behaviour for
+    // requests without `stop`).
+    let stop_string_buffer_len: usize = stop_strings
+        .iter()
+        .map(|s| s.len())
+        .max()
+        .map(|m| m.saturating_sub(1))
+        .unwrap_or(0);
+
     let ctx = StreamCtx {
         state: state.clone(),
         model: model_name.clone(),
@@ -179,6 +195,7 @@ pub(crate) async fn chat_completions_stream(
         tool_defs_for_backfill: tool_defs,
         cwd_for_normalize: cwd_hint,
         stop_strings,
+        stop_string_buffer_len,
         leak_markers,
         max_tool_calls_per_response,
         req_stream_include_usage,

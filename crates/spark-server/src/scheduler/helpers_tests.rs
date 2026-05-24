@@ -51,11 +51,16 @@ fn detects_short_period_fence_loop() {
 }
 
 #[test]
-fn detects_fence_body_with_varying_prefixes() {
-    // The real attractor: fence body (tokens 100..110) is stable
-    // but connective prefixes (Running vs Executing) differ
-    // between iterations. A strict contiguous-period detector
-    // misses this; the substring-repeat detector must catch it.
+fn rejects_fence_body_with_varying_prefixes() {
+    // 2026-05-24: this case was previously detected by Atlas's
+    // scan-anywhere substring-repeat detector. After the switch to
+    // vLLM's end-anchored algorithm, the detector intentionally
+    // does NOT fire here — the varying connective prefixes mean
+    // no fixed period repeats at the buffer's END. This case is
+    // now caught one layer up by the rollback-to-boundary +
+    // re-steer machinery once a tighter end-anchored period
+    // forms after the boundary rewind. Keeping the test as a
+    // negative assertion to pin the contract.
     let fence: Vec<u32> = vec![100, 101, 102, 103, 104, 105, 106, 107, 108, 109];
     let prefixes: [&[u32]; 4] = [
         &[200, 201],      // "Running:"
@@ -69,8 +74,8 @@ fn detects_fence_body_with_varying_prefixes() {
         tokens.extend(fence.iter());
     }
     assert!(
-        detect_thinking_token_loop(&tokens),
-        "stable fence body across varying prefixes must be detected"
+        !detect_thinking_token_loop(&tokens),
+        "end-anchored detector intentionally does not fire on varying-prefix patterns"
     );
 }
 
@@ -300,6 +305,86 @@ fn norm_inert_with_empty_mask() {
     assert!(
         !detect_content_token_loop_normalized(&t, &[]),
         "empty mask must make the normalized path inert (fail-open)"
+    );
+}
+
+// ── Per-request RepetitionDetectionParams override tests ─────────────
+
+#[test]
+fn override_loosens_content_loop_threshold() {
+    // Two contiguous copies of a 22-token sentence — passes the
+    // boot-default `CONTENT_LOOP_MIN_REPEATS=2` so the default
+    // detector fires. With a stricter `min_count=4` override, the
+    // detector must NOT fire on the same input. This proves the
+    // override actually wins over the boot default.
+    let sentence: Vec<u32> = (1000..1022).collect();
+    let mut tokens: Vec<u32> = (0..100).collect(); // prior content
+    tokens.extend(sentence.iter()); // r1
+    tokens.extend(sentence.iter()); // r2
+
+    // Default path: 2 repeats at period 22, MIN_REPEATS=2 ⇒ fires.
+    assert!(
+        detect_content_token_loop_with(&tokens, None),
+        "default thresholds must still fire on 22-token × 2 repeat"
+    );
+
+    // Override path: min_count=4 ⇒ 2 repeats are insufficient.
+    let strict = crate::openai::RepetitionDetectionParams {
+        min_pattern_size: 2,
+        max_pattern_size: 64,
+        min_count: 4,
+    };
+    assert!(
+        !detect_content_token_loop_with(&tokens, Some(strict)),
+        "stricter min_count=4 override must suppress 2-repeat firing"
+    );
+}
+
+#[test]
+fn override_tightens_content_loop_threshold() {
+    // Five contiguous copies of a 5-token block. Below the boot-default
+    // CONTENT_LOOP_MIN_TOKENS the detector won't even consider firing,
+    // so pad with prior content first. With period_min=5 .. period_max=5
+    // + min_count=3 the override fires on (5 × 5 = 25) end-anchored
+    // tokens — covered by the 5-repeat tail.
+    let pat: Vec<u32> = vec![42, 43, 44, 45, 46];
+    let mut tokens: Vec<u32> = (0u32..50).collect();
+    for _ in 0..5 {
+        tokens.extend(pat.iter());
+    }
+    let permissive = crate::openai::RepetitionDetectionParams {
+        min_pattern_size: 5,
+        max_pattern_size: 5,
+        min_count: 3,
+    };
+    assert!(
+        detect_content_token_loop_with(&tokens, Some(permissive)),
+        "override (period=5, min_count=3) must catch 5×period-5 tail"
+    );
+}
+
+#[test]
+fn override_applies_to_thinking_loop() {
+    // 4× period-10 fence loop — fires under boot default
+    // THINK_LOOP_MIN_REPEATS=3.
+    let pat: Vec<u32> = vec![7, 6, 5, 4, 3, 2, 1, 0, 9, 8];
+    let mut tokens: Vec<u32> = (100u32..150).collect();
+    for _ in 0..4 {
+        tokens.extend(pat.iter());
+    }
+    assert!(
+        detect_thinking_token_loop_with(&tokens, None),
+        "default thinking-loop thresholds must still fire on 4× period-10"
+    );
+    // Override demanding 6 repeats ⇒ 4 is insufficient ⇒ must not fire.
+    let strict = crate::openai::RepetitionDetectionParams {
+        min_pattern_size: 4,
+        max_pattern_size: 20,
+        min_count: 6,
+    };
+    assert!(
+        !detect_thinking_token_loop_with(&tokens, Some(strict)),
+        "stricter min_count=6 override must suppress 4-repeat firing"
     );
 }
 

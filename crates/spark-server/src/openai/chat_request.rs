@@ -57,6 +57,15 @@ pub struct ChatCompletionRequest {
     /// vLLM PR-style thinking budget (top-level integer).
     #[serde(default)]
     pub thinking_token_budget: Option<u32>,
+    /// Per-request override for the vLLM-anchored token-loop detector
+    /// (content-loop + thinking-loop). Mirrors vLLM's
+    /// `RepetitionDetectionParams` shape (`sampling_params.py:111-144`):
+    /// `{min_pattern_size, max_pattern_size, min_count}`. When `Some`,
+    /// the scheduler uses these values for THIS sequence's anchored
+    /// loop detection instead of the boot-global watchdog defaults
+    /// derived from MODEL.toml. None = use server default.
+    #[serde(default)]
+    pub repetition_detection: Option<RepetitionDetectionParams>,
     /// OpenAI-style reasoning effort: `{"reasoning": {"effort": "low"}}`
     #[serde(default)]
     pub reasoning: Option<ReasoningConfig>,
@@ -175,6 +184,27 @@ pub struct ChatCompletionRequest {
     pub reasoning_effort: Option<String>,
 }
 
+/// Per-request override for the vLLM-anchored token-loop detector.
+///
+/// Mirrors vLLM's `RepetitionDetectionParams`
+/// (`vllm/sampling_params.py:111-144`):
+/// - `min_pattern_size` → smallest pattern length (in tokens) to consider
+/// - `max_pattern_size` → largest pattern length to consider
+/// - `min_count` → number of end-anchored back-to-back repeats that
+///   constitute a "loop"
+///
+/// When attached to a request, these override the boot-global
+/// thresholds (`CONTENT_LOOP_PERIOD_MIN` / `_MAX` /
+/// `CONTENT_LOOP_MIN_REPEATS` and the thinking-loop equivalents) for
+/// that single sequence's content-loop and thinking-loop detectors.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RepetitionDetectionParams {
+    pub min_pattern_size: u32,
+    pub max_pattern_size: u32,
+    pub min_count: u32,
+}
+
 /// Stream options (OpenAI-compatible).
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
 #[serde(default)]
@@ -285,6 +315,12 @@ impl ChatCompletionRequest {
     /// to `model_default`). Callers use this to decide whether a
     /// server-side policy (e.g. `thinking_in_tools=false`) is allowed to
     /// override the model default OR must respect the explicit request.
+    /// Per-request override for the vLLM-anchored token-loop detector.
+    /// `None` = use the boot-global watchdog parameters.
+    pub fn repetition_detection(&self) -> Option<RepetitionDetectionParams> {
+        self.repetition_detection
+    }
+
     pub fn thinking_explicitly_requested(&self) -> bool {
         if self.thinking.is_some() {
             return true;

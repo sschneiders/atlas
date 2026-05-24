@@ -25,6 +25,13 @@ pub(super) struct StreamState {
     pub(super) content_decoder: Option<crate::tokenizer::StreamingDecoder<'static>>,
     /// Buffer used for stop-string matching across delta boundaries.
     pub(super) accumulated_content: String,
+    /// Number of bytes of `accumulated_content` already forwarded to
+    /// the client. The vLLM-style hold-back (see `handle_token`) keeps
+    /// the last `max(stop_string_len) - 1` bytes back until either a
+    /// match completes or the stream finalises, so the emitted prefix
+    /// can lag behind the accumulator. Used to compute the next delta
+    /// slice without re-emitting bytes.
+    pub(super) stop_string_emitted_len: usize,
     /// Mirror of the post-sanitizer content stream; used by the
     /// post-stream refusal classifier and the `--dump` synthesiser.
     pub(super) refusal_scan_buf: String,
@@ -131,6 +138,7 @@ impl StreamState {
             emitted: 0,
             content_decoder: None,
             accumulated_content: String::new(),
+            stop_string_emitted_len: 0,
             refusal_scan_buf: String::new(),
             stop_string_triggered: false,
             suppressing_param_leak: false,

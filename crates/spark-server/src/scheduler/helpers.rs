@@ -394,14 +394,46 @@ pub const MAX_INTER_TOOL_PROSE: u32 = 384;
 /// periodic repeat" detector misses these; a substring-occurrence
 /// counter catches them.
 pub fn detect_thinking_token_loop(tokens: &[u32]) -> bool {
-    let wp = watchdog_params();
+    detect_thinking_token_loop_with(tokens, None)
+}
+
+/// Per-sequence override variant of [`detect_thinking_token_loop`].
+/// When `override_` is `Some(p)`, uses `p.min_pattern_size`,
+/// `p.max_pattern_size`, `p.min_count` as the period and repeat
+/// thresholds — exactly mirroring vLLM's `RepetitionDetectionParams`
+/// (`sampling_params.py:111-144`). When `None`, falls back to the
+/// boot-global `watchdog_params()` constants so existing callers
+/// without per-request configuration are byte-identical to before.
+pub fn detect_thinking_token_loop_with(
+    tokens: &[u32],
+    override_: Option<crate::openai::RepetitionDetectionParams>,
+) -> bool {
+    let (period_min, period_max, min_repeats) = match override_ {
+        Some(p) => (
+            p.min_pattern_size as usize,
+            p.max_pattern_size as usize,
+            p.min_count as usize,
+        ),
+        None => {
+            let wp = watchdog_params();
+            (
+                THINK_LOOP_PERIOD_MIN,
+                THINK_LOOP_PERIOD_MAX,
+                wp.think_loop_min_repeats,
+            )
+        }
+    };
+    let scan_window = match override_ {
+        Some(_) => 0, // vLLM-anchored detector ignores scan_window
+        None => watchdog_params().think_loop_scan_window,
+    };
     detect_token_loop(
         tokens,
         THINK_LOOP_MIN_TOKENS as usize,
-        THINK_LOOP_PERIOD_MIN,
-        THINK_LOOP_PERIOD_MAX,
-        wp.think_loop_min_repeats,
-        wp.think_loop_scan_window,
+        period_min,
+        period_max,
+        min_repeats,
+        scan_window,
     )
 }
 
@@ -409,12 +441,35 @@ pub fn detect_thinking_token_loop(tokens: &[u32]) -> bool {
 /// when the model emits the same sentence over and over after
 /// `</think>` has closed (the Claude-Code 2026-04-26 degeneration).
 pub fn detect_content_token_loop(tokens: &[u32]) -> bool {
+    detect_content_token_loop_with(tokens, None)
+}
+
+/// Per-sequence override variant of [`detect_content_token_loop`].
+/// `Some(p)` uses `p.min_pattern_size`, `p.max_pattern_size`,
+/// `p.min_count`; `None` falls back to the historical content-loop
+/// constants. See [`detect_thinking_token_loop_with`] for rationale.
+pub fn detect_content_token_loop_with(
+    tokens: &[u32],
+    override_: Option<crate::openai::RepetitionDetectionParams>,
+) -> bool {
+    let (period_min, period_max, min_repeats) = match override_ {
+        Some(p) => (
+            p.min_pattern_size as usize,
+            p.max_pattern_size as usize,
+            p.min_count as usize,
+        ),
+        None => (
+            CONTENT_LOOP_PERIOD_MIN,
+            CONTENT_LOOP_PERIOD_MAX,
+            CONTENT_LOOP_MIN_REPEATS,
+        ),
+    };
     detect_token_loop(
         tokens,
         CONTENT_LOOP_MIN_TOKENS as usize,
-        CONTENT_LOOP_PERIOD_MIN,
-        CONTENT_LOOP_PERIOD_MAX,
-        CONTENT_LOOP_MIN_REPEATS,
+        period_min,
+        period_max,
+        min_repeats,
         CONTENT_LOOP_SCAN_WINDOW,
     )
 }
@@ -431,6 +486,19 @@ pub fn detect_content_token_loop(tokens: &[u32]) -> bool {
 /// BOTH a sentinel (numeric) and a non-sentinel (structural) token —
 /// pure-number columns and pure-prose loops are left to the exact path.
 pub fn detect_content_token_loop_normalized(tokens: &[u32], mask: &[bool]) -> bool {
+    detect_content_token_loop_normalized_with(tokens, mask, None)
+}
+
+/// Per-sequence override variant of
+/// [`detect_content_token_loop_normalized`]. `Some(p)` substitutes the
+/// caller's `(min_pattern_size, max_pattern_size, min_count)` for the
+/// historical content-loop normalized constants. `None` preserves the
+/// boot-global thresholds, matching the legacy call-site behaviour.
+pub fn detect_content_token_loop_normalized_with(
+    tokens: &[u32],
+    mask: &[bool],
+    override_: Option<crate::openai::RepetitionDetectionParams>,
+) -> bool {
     let n = tokens.len();
     if n < CONTENT_LOOP_MIN_TOKENS as usize {
         return false;
@@ -460,11 +528,23 @@ pub fn detect_content_token_loop_normalized(tokens: &[u32], mask: &[bool]) -> bo
     if !has_sentinel || !has_struct {
         return false;
     }
+    let (period_min, period_max, min_repeats) = match override_ {
+        Some(p) => (
+            p.min_pattern_size as usize,
+            p.max_pattern_size as usize,
+            p.min_count as usize,
+        ),
+        None => (
+            CONTENT_LOOP_PERIOD_MIN,
+            CONTENT_LOOP_PERIOD_MAX,
+            CONTENT_LOOP_NORM_MIN_REPEATS,
+        ),
+    };
     detect_token_loop_with_period(
         &norm,
-        CONTENT_LOOP_PERIOD_MIN,
-        CONTENT_LOOP_PERIOD_MAX,
-        CONTENT_LOOP_NORM_MIN_REPEATS,
+        period_min,
+        period_max,
+        min_repeats,
         CONTENT_LOOP_SCAN_WINDOW,
     )
 }

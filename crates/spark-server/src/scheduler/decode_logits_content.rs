@@ -103,10 +103,14 @@ pub fn handle_content_token(a: &mut ActiveSeq, model: &dyn Model) {
         && enable_loop_watchdog()
         && a.content_tokens >= CONTENT_LOOP_MIN_TOKENS
         && a.content_tokens.is_multiple_of(CONTENT_LOOP_CHECK_STRIDE)
-        && (detect_content_token_loop(&a.output_tokens)
-            || numeric_token_mask()
-                .as_deref()
-                .is_some_and(|m| detect_content_token_loop_normalized(&a.output_tokens, m)))
+        && (detect_content_token_loop_with(&a.output_tokens, a.repetition_detection)
+            || numeric_token_mask().as_deref().is_some_and(|m| {
+                detect_content_token_loop_normalized_with(
+                    &a.output_tokens,
+                    m,
+                    a.repetition_detection,
+                )
+            }))
     {
         // 2026-05-23 sweep: re-scan to report the matched
         // `(period, repeats)`. Slow path — only runs on fire, not

@@ -70,6 +70,7 @@ pub(super) async fn dispatch_streaming(
     let req_service_tier = req.service_tier.clone();
     let req_metadata = req.metadata.clone();
     let ctx_for_stream = req_ctx.as_ref().map(|e| e.0.clone());
+    let repetition_detection = req.repetition_detection();
     match chat_completions_stream(
         state,
         prompt_tokens,
@@ -92,6 +93,7 @@ pub(super) async fn dispatch_streaming(
         logit_bias,
         enable_thinking,
         thinking_budget,
+        repetition_detection,
         tools_active,
         tool_choice_required,
         suppress_tool_call,
