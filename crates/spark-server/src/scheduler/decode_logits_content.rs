@@ -86,21 +86,24 @@ pub fn handle_content_token(a: &mut ActiveSeq, model: &dyn Model) {
     // FSM for the OUTER envelope (free prose between tool calls),
     // not just the tool body.
     //
-    // 2026-05-24 sweep: REMOVED the `!a.inside_tool_body` gate.
-    // The previous exemption assumed JSON repetition inside the
-    // tool-call body is structural (`":",` `",",` key names) and
-    // legitimate. In practice a degenerate model can also lock
-    // into a tight period-2 attractor *inside* the tool body —
-    // observed 2026-05-24: a 21k-token request stuck emitting
-    // `parameter>\nparameter>\n...` (tokens 15704, 29, 198 in a
-    // 2-step cycle), burning the full max_tokens budget. The
-    // grammar should reject this but doesn't always; the
-    // watchdog is the backstop. Inside-tool-body false positives
-    // are bounded by CONTENT_LOOP_MIN_REPEATS=2 + the
-    // (period-2 to period-64) range — legit JSON has variable
-    // values per key, so repetition rarely reaches that depth.
+    // 2026-05-24 sweep #3: Re-introduced the `!a.inside_tool_body`
+    // gate. The previous removal was based on a real-loop observation
+    // (`parameter>\nparameter>\n...` period-2 attractor) but turned
+    // out to be triggered by a separate MTP-pipeline gap (see
+    // bench/hotfix3-debug/SYNTHESIS.md): the MTP verify path skipped
+    // the entire pre-sample LogitsProcessor pipeline, so the
+    // tool-body false-positives the inside-body fires produced
+    // appeared as massive regressions. With the pipeline correctly
+    // applied to MTP verify, JSON structural repetition is bounded by
+    // the grammar's terminal state — xgrammar already guarantees
+    // structural termination inside the tool body, so the content-
+    // loop watchdog should not fire there. The `parameter>\n`
+    // real-loop case is still caught one tick AFTER the model exits
+    // the tool body: its emission outside the body forms a tight
+    // period-N tail that the outside-body watchdog will detect.
     if !crate::scheduler::helpers::disable_watchdogs()
         && enable_loop_watchdog()
+        && !a.inside_tool_body
         && a.content_tokens >= CONTENT_LOOP_MIN_TOKENS
         && a.content_tokens.is_multiple_of(CONTENT_LOOP_CHECK_STRIDE)
         && (detect_content_token_loop_with(&a.output_tokens, a.repetition_detection)

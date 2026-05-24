@@ -131,3 +131,54 @@ fn defer_override_math_constants() {
     let defer_count: u32 = MAX_SENTENCE_DEFER_TOKENS;
     assert!(defer_count >= MAX_SENTENCE_DEFER_TOKENS);
 }
+
+/// `LogitsContext` carries the four tokenizer-special tokens the
+/// pipeline needs. Wiring it from `process_seq_logits` requires that
+/// the parameter names match the field names (we pass them via field
+/// shorthand). If a future agent renames a field on `LogitsContext`
+/// (e.g. `tool_call_end_token` → `tool_end_token`) but forgets to
+/// update the call site, the shorthand construction breaks. This test
+/// pins the field set and `Copy` / `Clone` semantics so a non-trivial
+/// rename surfaces here loudly.
+#[test]
+fn logits_context_field_set_is_stable() {
+    let ctx = LogitsContext {
+        think_end_token: Some(1),
+        think_start_token: Some(2),
+        tool_call_start_token: Some(3),
+        tool_call_end_token: Some(4),
+    };
+    // Copy semantics — pipeline stages take `&LogitsContext`; a Copy
+    // bound keeps the threading cheap (no Arc, no clone-on-call).
+    let ctx2: LogitsContext = ctx;
+    assert_eq!(ctx2.think_end_token, Some(1));
+    assert_eq!(ctx2.think_start_token, Some(2));
+    assert_eq!(ctx2.tool_call_start_token, Some(3));
+    assert_eq!(ctx2.tool_call_end_token, Some(4));
+    // Original still usable (Copy, not Move).
+    assert_eq!(ctx.tool_call_end_token, Some(4));
+}
+
+/// Integration smoke test for `run_pipeline` without `ActiveSeq`
+/// construction. The `ActiveSeq` struct in `types.rs` has ~60 fields
+/// including `ResponseSink` channels, `cancel_flag` AtomicBool, wall-
+/// clock `Instant`s, `AdaptiveSamplingState`, `SsmDecodeRing`, and an
+/// optional `GrammarState` (which needs an `xgrammar::Tokenizer`). The
+/// file-level docs (top of this module, lines 6-21) explicitly chose
+/// NOT to mock that — drift in the `ActiveSeq` schema would silently
+/// rot the fixtures, and live-runtime scheduler integration tests +
+/// opencode-session.md prose-corpus replay form the actual byte-
+/// identical guard against the pre-refactor monolith.
+///
+/// Instead this test exercises the pipeline's *public surface* shape:
+/// `run_pipeline` must take `(&mut [f32], &mut ActiveSeq, &LogitsContext)`
+/// and return `Option<u32>`. The compile-success of this test is the
+/// guarantee — if the signature drifts, this stops compiling.
+#[test]
+fn run_pipeline_signature_is_stable() {
+    // Type-checks at compile time. The fn pointer alias forces
+    // `run_pipeline`'s signature to match exactly; any drift in the
+    // arg list, mutability, or return type fails to compile here.
+    type RunPipelineFn = fn(&mut [f32], &mut ActiveSeq, &LogitsContext) -> Option<u32>;
+    let _ptr: RunPipelineFn = run_pipeline;
+}

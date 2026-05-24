@@ -107,7 +107,15 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     if !a.inside_thinking
         && let Some(ref mut gs) = a.grammar_state
     {
-        gs.accept_token(tok);
+        let advanced = gs.accept_token(tok);
+        if !advanced {
+            tracing::warn!(
+                tok,
+                output_len = a.output_tokens.len(),
+                "gs.accept_token returned false — xgrammar NPDA refused the emitted token; matcher is now desynced from the stream. Ending response to prevent cascading grammar-mask corruption."
+            );
+            a.finished = true;
+        }
     }
 
     // Accumulate logprobs data for blocking responses.
@@ -166,6 +174,17 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         // `parameter>\n` attractor) with no watchdog fire,
         // finish=length.
         //
+        // 2026-05-24 sweep #3: Re-introduced the `!a.inside_tool_body`
+        // gate (mirrors the handle_content_token policy). The previous
+        // inside-body false-positives turned out to be triggered by a
+        // separate MTP-pipeline gap (see bench/hotfix3-debug/
+        // SYNTHESIS.md). With the pipeline correctly applied to MTP
+        // verify, JSON structural repetition is bounded by the
+        // grammar's terminal state. The `parameter>\n` real-loop case
+        // is still caught one tick AFTER the model exits the tool
+        // body — its emission outside the body forms a tight period-N
+        // tail.
+        //
         // Skip rollback here — `emit_token` doesn't take `&dyn Model`
         // (the SSM rewind requires it) and plumbing it through every
         // call site would balloon the diff. Instead set `a.finished`
@@ -180,6 +199,7 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         a.content_tokens = a.content_tokens.saturating_add(1);
         if !disable_watchdogs()
             && enable_loop_watchdog()
+            && !a.inside_tool_body
             && a.content_tokens >= CONTENT_LOOP_MIN_TOKENS
             && a.content_tokens.is_multiple_of(CONTENT_LOOP_CHECK_STRIDE)
             && (detect_content_token_loop_with(&a.output_tokens, a.repetition_detection)

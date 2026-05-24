@@ -40,6 +40,7 @@ mod verify_dflash_step;
 mod verify_k2_step;
 mod verify_k3_step;
 mod verify_k4_step;
+mod verify_pipeline_helper;
 
 use confidence::*;
 use decode_logits_content::*;
@@ -74,6 +75,9 @@ use verify_dflash_step::*;
 use verify_k2_step::*;
 use verify_k3_step::*;
 use verify_k4_step::*;
+// verify_pipeline_helper is referenced via fully-qualified
+// `crate::scheduler::verify_pipeline_helper::...` from sibling step
+// files (verify_k2/k3/k4/dflash + spec_step), so no `use` import.
 
 // Re-exports threaded through `use super::*;` in sibling step files —
 // keep these imports here even though `run` itself doesn't reference all
@@ -293,15 +297,28 @@ pub fn run(
                 let _ = model.stream_wait_event(model.default_stream(), prefill_event);
             }
 
+            // Build the verify-time LogitsContext once per step: the
+            // tokenizer special-token IDs the verify pipeline needs to
+            // run the same 8-stage logits processors the non-MTP path
+            // applies (mid-word/post-close/tool-during-think/forced-
+            // think-end/pin-tool-call/forced-token/grammar). Without
+            // this context the MTP/spec verify path emits unmasked
+            // GPU-argmax tokens (Phase C-2 root cause, 2026-05-24).
+            let verify_ctx = crate::scheduler::logit_processors::LogitsContext {
+                think_end_token,
+                think_start_token,
+                tool_call_start_token,
+                tool_call_end_token,
+            };
             if use_ngram_speculative && active.len() == 1 && active[0].grammar_state.is_none() {
                 // N-gram speculative: CPU proposer + CUDA-graphed K=2 verify.
                 if let Some(ref mut proposer) = ngram_proposer {
-                    step_ngram(&*model, &mut active, proposer);
+                    step_ngram(&*model, &mut active, proposer, &verify_ctx);
                 }
             } else if use_self_speculative && active.len() == 1 && active[0].grammar_state.is_none()
             {
                 // Self-speculative: draft via layer-skipping, verify with full model.
-                step_self_spec(&*model, &mut active, num_drafts);
+                step_self_spec(&*model, &mut active, num_drafts, &verify_ctx);
             } else if use_mtp
                 && active.len() == 1
                 && !active[0].inside_thinking
@@ -309,7 +326,7 @@ pub fn run(
                 && !active[0].disable_mtp
             {
                 // MTP speculative decode: beneficial at all context lengths.
-                step_mtp(&*model, &mut active, num_drafts);
+                step_mtp(&*model, &mut active, num_drafts, &verify_ctx);
             } else {
                 // Batch decode (no MTP). Clear stale drafts when transitioning out of MTP mode.
                 if use_mtp {

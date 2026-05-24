@@ -117,6 +117,23 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
                     }
                 }
             }
+            // Flush the reasoning sanitizer's tail buffer. Without this, up to
+            // ~18 trailing bytes of the final thinking block (or anything held
+            // back for partial-tag fusion) are silently dropped. Skip when
+            // suppression is active (no close arrived during thinking) — those
+            // bytes are intentionally not surfaced.
+            if !state.reasoning_suppressing_leak && !state.reasoning_tag_scan_buf.is_empty() {
+                let tail = std::mem::take(&mut state.reasoning_tag_scan_buf);
+                if !tail.trim().is_empty() {
+                    let chunk = ChatCompletionChunk::reasoning_chunk(
+                        &ctx.model,
+                        &ctx.id,
+                        tail,
+                    );
+                    let json = serde_json::to_string(&chunk).unwrap_or_default();
+                    sse_events.push(Ok(axum::response::sse::Event::default().data(json)));
+                }
+            }
             // Reset tool detector to clear any thinking-era tag fragments.
             if let Some(ref mut det) = state.detector {
                 det.reset();
