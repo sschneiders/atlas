@@ -26,6 +26,21 @@ use super::tool_handlers::{
 
 type SseVec = Vec<Result<Event, std::convert::Infallible>>;
 
+/// Maximum consecutive tokens the stream may spend with
+/// `state.suppressing_param_leak == true` (sanitizer holding content
+/// because of an orphan `<parameter=` / `<tool_call>` opener without
+/// a matching close). When the model degenerates into a doom-loop of
+/// partial-envelope leakage — observed 2026-05-24 on
+/// opencode-hotfix.jsonl seq=10: 8192 tokens emitted after Atlas
+/// rejected a `write({})` call, all suppressed by the sanitizer, no
+/// content-loop watchdog fire (the period exceeded 64) — this
+/// threshold ends the stream cleanly instead of burning to
+/// `max_tokens=8192`. 256 tokens is enough headroom for legitimately
+/// long tool-call bodies that take many tokens to close (long
+/// `content` field on a `write` call) while bounding worst-case
+/// wasted decode at ~10s @ 30 tok/s.
+const MAX_SUPPRESS_STREAK_TOKENS: u32 = 256;
+
 /// Process one token. Returns the SSE events to forward to the
 /// client (empty `Vec` is valid).
 pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> SseVec {
@@ -352,6 +367,29 @@ pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -
         // process_detector_content does NOT pre-sanitize when called
         // from the no-detector branch — but the sanitizer was already
         // run above, so the helper's branch handling matches.
+    }
+
+    // Orphan-suppression streak watchdog. The sanitizer flips
+    // `suppressing_param_leak=true` when it sees an orphan
+    // `<tool_call>` / `<parameter=` opener without a matching close.
+    // Suppressing forever (until max_tokens) burns the user's
+    // patience and decode budget — observed live as an 8192-token
+    // doom loop. If the streak exceeds the bound, end the stream.
+    if state.suppressing_param_leak && !state.stop_string_triggered {
+        state.suppress_streak_tokens = state.suppress_streak_tokens.saturating_add(1);
+        if state.suppress_streak_tokens > MAX_SUPPRESS_STREAK_TOKENS {
+            tracing::warn!(
+                streak = state.suppress_streak_tokens,
+                "orphan tool-call suppression streak exceeded {MAX_SUPPRESS_STREAK_TOKENS} tokens; ending stream",
+            );
+            state.loop_watchdog_triggered = true;
+            state.stop_string_triggered = true;
+            state
+                .cancel_flag
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    } else if !state.suppressing_param_leak {
+        state.suppress_streak_tokens = 0;
     }
 
     sse_events

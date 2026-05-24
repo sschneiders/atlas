@@ -41,6 +41,15 @@ pub(super) struct StreamState {
     /// Sanitiser state: suppressing content while waiting for a
     /// matching `</parameter>` close after an orphan `<parameter=`.
     pub(super) suppressing_param_leak: bool,
+    /// Consecutive tokens spent in `suppressing_param_leak=true`
+    /// without a matching close arriving. When this exceeds
+    /// `MAX_SUPPRESS_STREAK_TOKENS` (handle_token.rs), the stream is
+    /// killed — the model is in an orphan-tool-call doom loop
+    /// emitting partial envelopes that never close (observed
+    /// opencode-hotfix.jsonl 2026-05-24 seq=10: 8192 tokens of
+    /// suppressed content until max_tokens, no watchdog fire
+    /// because the partial-envelope period exceeded 64).
+    pub(super) suppress_streak_tokens: u32,
     /// Sanitiser state: currently inside a tool-call envelope opener
     /// (e.g. `<minimax:tool_call>`); inner `<invoke ...>` etc. are
     /// legitimate content while this is true.
@@ -142,6 +151,7 @@ impl StreamState {
             refusal_scan_buf: String::new(),
             stop_string_triggered: false,
             suppressing_param_leak: false,
+            suppress_streak_tokens: 0,
             inside_envelope: false,
             reasoning_inside_envelope: false,
             tag_scan_buf: String::new(),
