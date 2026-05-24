@@ -137,24 +137,42 @@ fn content_loop_rejects_legitimate_prose() {
 }
 
 #[test]
-fn content_loop_accepts_two_repeats() {
-    // 2026-05-23 sweep: CONTENT_LOOP_MIN_REPEATS lowered 3 → 2 so
-    // we catch sentence-repeat attractors before they stabilise
-    // (see project_qwen36_drift_moe_smoking_gun.md). Two copies of
-    // a 30-token block with sufficient prior context must NOW
-    // trigger. This is a deliberate sensitivity bump — single
-    // repeats ("the user said X. The user said X again.") were
-    // accepted at the old threshold; the new threshold catches them
-    // too. Other Atlas attractors (LZ + DRY + presence penalties)
-    // remain on for nuisance suppression; the watchdog only fires
-    // when one repeat is byte-exact for ≥ MIN_REPEATS occurrences.
+fn content_loop_accepts_three_repeats() {
+    // 2026-05-24 sweep #2: CONTENT_LOOP_MIN_REPEATS bumped 2 → 3 to
+    // match vLLM's `RepetitionDetectionParams.min_count` default.
+    // The 2-repeat firing was too aggressive — fired on legitimate
+    // JSON tool-body period-2 punctuation (`","`/`":"`) and ended
+    // responses mid-emission (opencode-phaseAB.jsonl 2026-05-24
+    // 18:13:18: watchdog matched period=2 repeats=2 at
+    // content_tokens=48, prematurely ending a bash tool call).
+    // Three byte-exact repeats of a 30-token block remain a
+    // genuine sentence-attractor and MUST trigger.
     let sentence: Vec<u32> = (500..530).collect();
     let mut tokens: Vec<u32> = (0..100).collect();
-    tokens.extend(sentence.iter());
-    tokens.extend(sentence.iter()); // 2 repeats — used to be safe, now trips
+    tokens.extend(sentence.iter()); // r1
+    tokens.extend(sentence.iter()); // r2
+    tokens.extend(sentence.iter()); // r3
     assert!(
         detect_content_token_loop(&tokens),
-        "two byte-exact 30-token repeats must trigger watchdog at MIN_REPEATS={}",
+        "three byte-exact 30-token repeats must trigger watchdog at MIN_REPEATS={}",
+        CONTENT_LOOP_MIN_REPEATS,
+    );
+}
+
+#[test]
+fn content_loop_rejects_two_repeats() {
+    // Companion to `accepts_three_repeats`: at the new MIN_REPEATS=3
+    // default, two byte-exact copies are NOT enough evidence — a
+    // legitimate "I said X. I said X again." pattern (or JSON
+    // structural punctuation tokens repeating once) is below the
+    // firing bar. The fuzzy / DRY / LZ samplers cover that band.
+    let sentence: Vec<u32> = (500..530).collect();
+    let mut tokens: Vec<u32> = (0..100).collect();
+    tokens.extend(sentence.iter()); // r1
+    tokens.extend(sentence.iter()); // r2 only
+    assert!(
+        !detect_content_token_loop(&tokens),
+        "two byte-exact 30-token repeats must NOT trigger at MIN_REPEATS={}",
         CONTENT_LOOP_MIN_REPEATS,
     );
 }
@@ -312,8 +330,8 @@ fn norm_inert_with_empty_mask() {
 
 #[test]
 fn override_loosens_content_loop_threshold() {
-    // Two contiguous copies of a 22-token sentence — passes the
-    // boot-default `CONTENT_LOOP_MIN_REPEATS=2` so the default
+    // Three contiguous copies of a 22-token sentence — passes the
+    // boot-default `CONTENT_LOOP_MIN_REPEATS=3` so the default
     // detector fires. With a stricter `min_count=4` override, the
     // detector must NOT fire on the same input. This proves the
     // override actually wins over the boot default.
@@ -321,14 +339,15 @@ fn override_loosens_content_loop_threshold() {
     let mut tokens: Vec<u32> = (0..100).collect(); // prior content
     tokens.extend(sentence.iter()); // r1
     tokens.extend(sentence.iter()); // r2
+    tokens.extend(sentence.iter()); // r3
 
-    // Default path: 2 repeats at period 22, MIN_REPEATS=2 ⇒ fires.
+    // Default path: 3 repeats at period 22, MIN_REPEATS=3 ⇒ fires.
     assert!(
         detect_content_token_loop_with(&tokens, None),
-        "default thresholds must still fire on 22-token × 2 repeat"
+        "default thresholds must still fire on 22-token × 3 repeat"
     );
 
-    // Override path: min_count=4 ⇒ 2 repeats are insufficient.
+    // Override path: min_count=4 ⇒ 3 repeats are insufficient.
     let strict = crate::openai::RepetitionDetectionParams {
         min_pattern_size: 2,
         max_pattern_size: 64,
@@ -336,7 +355,7 @@ fn override_loosens_content_loop_threshold() {
     };
     assert!(
         !detect_content_token_loop_with(&tokens, Some(strict)),
-        "stricter min_count=4 override must suppress 2-repeat firing"
+        "stricter min_count=4 override must suppress 3-repeat firing"
     );
 }
 

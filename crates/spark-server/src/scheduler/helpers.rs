@@ -117,15 +117,29 @@ pub const THINK_LOOP_SCAN_WINDOW: usize = 160;
 // the attractor before it stabilises.
 pub const CONTENT_LOOP_MIN_TOKENS: u32 = 48;
 pub const CONTENT_LOOP_CHECK_STRIDE: u32 = 16;
-// 2026-05-24 sweep: 8 → 2. Tool-body degeneration (`parameter>\n`
-// period-2 cycle) hung a 21k-token opencode request because the
-// detector's lower bound was 8. Period 2 catches the tight `[A, B]`
-// attractor; CONTENT_LOOP_MIN_REPEATS=2 means we need 4 tokens
-// (2 periods × 2 repeats) before firing, which is fast enough to
-// break the loop within ~100 ms after onset.
+// 2026-05-24 sweep #2: MIN_REPEATS bumped 2 → 3 to match vLLM's
+// `RepetitionDetectionParams.min_count` default. The earlier value of
+// 2 was tuned for Atlas's pre-anchored substring-scan detector, where
+// 4 tokens of matching tail was strong evidence of a loop. After the
+// switch to vLLM's end-anchored algorithm (commit 1bb82ed), 2 repeats
+// of period-2 (= 4 tokens) became a false-positive on legitimate
+// JSON tool-call bodies — the structural `","` / `":"` punctuation
+// tokens form a natural period-2 pattern. Observed live
+// (opencode-phaseAB.jsonl 2026-05-24 18:13:18): watchdog fired at
+// content_tokens=48 inside the bash tool-call body, prematurely
+// ending the response (`reason=NoBoundary`, rollback declined).
+// MIN_REPEATS=3 requires 6 consecutive end-anchored tokens — still
+// fast on real `[A, B]` attractors (~100 ms after onset), but lets
+// `","`-`":"` JSON noise pass.
+//
+// PERIOD_MIN stays at 2 to keep the tight `parameter>\nparameter>\n`
+// real-loop case detectable (see project_qwen36_phase1_shipped note
+// on the 21k-token hang). With MIN_REPEATS=3 that case requires 6
+// matching tokens — still fires within the 64-token detection
+// window the watchdog uses.
 pub const CONTENT_LOOP_PERIOD_MIN: usize = 2;
 pub const CONTENT_LOOP_PERIOD_MAX: usize = 64;
-pub const CONTENT_LOOP_MIN_REPEATS: usize = 2;
+pub const CONTENT_LOOP_MIN_REPEATS: usize = 3;
 pub const CONTENT_LOOP_SCAN_WINDOW: usize = 280;
 /// Min repeats for the digit-normalized content-loop path. Stricter
 /// than `CONTENT_LOOP_MIN_REPEATS` (3) because numeric normalization

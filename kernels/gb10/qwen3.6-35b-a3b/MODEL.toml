@@ -143,16 +143,23 @@ thinking_default = true
 thinking_in_tools = true
 # Maximum thinking budget (tokens). Prevents overthinking.
 # Client-specified budget takes precedence if lower.
-# Bumped 512 → 2048 (2026-05-23) after F1 reflection-penalty removal:
-# without F1 suppressing `wait`/`however`/`actually`/`hmm`, the model
-# reasons naturally and Qwen3.6's agentic chains can genuinely run
-# 600–1500 tokens before the model closes `</think>` on its own. The
-# old 512 cap was force-injecting `</think>` mid-sentence in opencode.
-# Now that step-5/6 of resolve_thinking falls through to this cap (None
-# → max_thinking_budget) instead of the global DEFAULT_THINKING_BUDGET
-# (256), this is the effective budget for opencode-style clients that
-# don't explicitly set one.
-max_thinking_budget = 2048
+#
+# 2026-05-23: 512 → 2048 after F1 reflection-penalty removal — model
+# needed room for ~600-1500 token reasoning chains.
+# 2026-05-24 (phaseAB sweep #2): 2048 → 768. Live opencode session
+# (opencode-phaseAB.jsonl) showed two failure modes traced to the
+# 2048 budget:
+#   - seq=1 (title-gen, 3 msgs, 0 tools): model burned 2068 thinking
+#     tokens to produce a 7-token title. The default-thinking-on
+#     stance is correct, but 2k tokens to title a chat is absurd.
+#   - seq=8 (turn 9 of agentic flow): model thought for the full
+#     2048 budget, was force-closed via `</think>` injection, then
+#     emitted EOS with zero content tokens. 33s of stall for nothing.
+# 768 still lets Qwen3.6 reason through multi-step plans (typical
+# agentic thinking is 200-500 tokens) while bounding the worst-case
+# burn at ~30s. Clients that need more can pass `thinking_token_budget`
+# in the request body (vLLM-PR shape, supported since Phase B-2).
+max_thinking_budget = 768
 # Inter-tool prose budget — max tokens of free CONTENT (not thinking,
 # not tool body) the model can emit between successive tool calls
 # before Atlas truncates with finish_reason=length.
