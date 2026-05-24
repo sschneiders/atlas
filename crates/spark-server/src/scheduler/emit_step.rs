@@ -152,6 +152,54 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         // Clear think_just_ended one-shot now that we've consumed the
         // token after </think>.
         a.think_just_ended = false;
+        // Content-phase loop watchdog. Mirrored from
+        // `handle_content_token` (decode_logits_content.rs) because
+        // that handler is only invoked on the non-MTP decode path
+        // (`process_decode_logits`). MTP speculative decode
+        // (`verify_k2_step`) reaches every token through this
+        // `emit_token` instead — without this mirror, the
+        // content-loop watchdog never fires while MTP is enabled, and
+        // the model can burn the full `max_tokens` budget on a
+        // period-N attractor. Observed live 2026-05-24 on
+        // opencode-hotfix2b.jsonl seq=13: 8193 content tokens of
+        // `[29, 198, 510, 15704, …]` period-4 loop (the
+        // `parameter>\n` attractor) with no watchdog fire,
+        // finish=length.
+        //
+        // Skip rollback here — `emit_token` doesn't take `&dyn Model`
+        // (the SSM rewind requires it) and plumbing it through every
+        // call site would balloon the diff. Instead set `a.finished`
+        // and let the lifecycle close the response. The non-MTP path
+        // retains rollback via `handle_content_token`.
+        use crate::scheduler::helpers::{
+            CONTENT_LOOP_CHECK_STRIDE, CONTENT_LOOP_MIN_TOKENS, CONTENT_LOOP_PERIOD_MAX,
+            CONTENT_LOOP_PERIOD_MIN, detect_content_token_loop_with,
+            detect_content_token_loop_normalized_with, disable_watchdogs, enable_loop_watchdog,
+            numeric_token_mask,
+        };
+        a.content_tokens = a.content_tokens.saturating_add(1);
+        if !disable_watchdogs()
+            && enable_loop_watchdog()
+            && a.content_tokens >= CONTENT_LOOP_MIN_TOKENS
+            && a.content_tokens.is_multiple_of(CONTENT_LOOP_CHECK_STRIDE)
+            && (detect_content_token_loop_with(&a.output_tokens, a.repetition_detection)
+                || numeric_token_mask().as_deref().is_some_and(|m| {
+                    detect_content_token_loop_normalized_with(
+                        &a.output_tokens,
+                        m,
+                        a.repetition_detection,
+                    )
+                }))
+        {
+            tracing::warn!(
+                content_tokens = a.content_tokens,
+                output_len = a.output_tokens.len(),
+                "Content-loop watchdog fired in MTP/emit path (period-{}…{} repeat); ending response",
+                CONTENT_LOOP_PERIOD_MIN,
+                CONTENT_LOOP_PERIOD_MAX,
+            );
+            a.finished = true;
+        }
     }
 
     // EOS handling: grammar-based, legacy, or min_tokens suppression.
