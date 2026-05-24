@@ -43,7 +43,45 @@ const MAX_SUPPRESS_STREAK_TOKENS: u32 = 256;
 
 /// Process one token. Returns the SSE events to forward to the
 /// client (empty `Vec` is valid).
+///
+/// Thin wrapper around [`handle_token_inner`] that runs the
+/// orphan-suppression streak watchdog after every token regardless
+/// of which early-return branch fired in the body. The watchdog
+/// can't live inside `handle_token_inner` because that function has
+/// many early returns (one per emission path) — putting the check
+/// at the end of the body would only fire when the natural fall-
+/// through is taken, leaving the doom-loop case (long suppressed
+/// stream of orphan `<tool_call>` openers) uncaught.
 pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> SseVec {
+    let result = handle_token_inner(state, ctx, tok);
+
+    // Orphan-suppression streak watchdog. The sanitizer flips
+    // `suppressing_param_leak=true` when it sees an orphan
+    // `<tool_call>` / `<parameter=` opener without a matching close.
+    // Suppressing forever (until max_tokens) burns the user's
+    // patience and decode budget — observed live as an 8192-token
+    // doom loop. If the streak exceeds the bound, end the stream.
+    if state.suppressing_param_leak && !state.stop_string_triggered {
+        state.suppress_streak_tokens = state.suppress_streak_tokens.saturating_add(1);
+        if state.suppress_streak_tokens > MAX_SUPPRESS_STREAK_TOKENS {
+            tracing::warn!(
+                streak = state.suppress_streak_tokens,
+                "orphan tool-call suppression streak exceeded {MAX_SUPPRESS_STREAK_TOKENS} tokens; ending stream",
+            );
+            state.loop_watchdog_triggered = true;
+            state.stop_string_triggered = true;
+            state
+                .cancel_flag
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    } else if !state.suppressing_param_leak {
+        state.suppress_streak_tokens = 0;
+    }
+
+    result
+}
+
+fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> SseVec {
     let mut sse_events: SseVec = Vec::new();
     state.all_toks.push(tok);
 
@@ -367,29 +405,6 @@ pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -
         // process_detector_content does NOT pre-sanitize when called
         // from the no-detector branch — but the sanitizer was already
         // run above, so the helper's branch handling matches.
-    }
-
-    // Orphan-suppression streak watchdog. The sanitizer flips
-    // `suppressing_param_leak=true` when it sees an orphan
-    // `<tool_call>` / `<parameter=` opener without a matching close.
-    // Suppressing forever (until max_tokens) burns the user's
-    // patience and decode budget — observed live as an 8192-token
-    // doom loop. If the streak exceeds the bound, end the stream.
-    if state.suppressing_param_leak && !state.stop_string_triggered {
-        state.suppress_streak_tokens = state.suppress_streak_tokens.saturating_add(1);
-        if state.suppress_streak_tokens > MAX_SUPPRESS_STREAK_TOKENS {
-            tracing::warn!(
-                streak = state.suppress_streak_tokens,
-                "orphan tool-call suppression streak exceeded {MAX_SUPPRESS_STREAK_TOKENS} tokens; ending stream",
-            );
-            state.loop_watchdog_triggered = true;
-            state.stop_string_triggered = true;
-            state
-                .cancel_flag
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-    } else if !state.suppressing_param_leak {
-        state.suppress_streak_tokens = 0;
     }
 
     sse_events
