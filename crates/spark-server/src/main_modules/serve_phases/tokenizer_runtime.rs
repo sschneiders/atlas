@@ -20,7 +20,6 @@ pub(crate) struct TokenizerRuntime {
     /// tokenizer has no atomic fence token → guard disabled (fail-open,
     /// F2 keeps its prior behaviour).
     pub(crate) code_fence_token: Option<u32>,
-    pub(crate) reflection_suppress_ids: Vec<u32>,
     pub(crate) tool_call_start_token: Option<u32>,
     pub(crate) tool_call_end_token: Option<u32>,
     pub(crate) grammar_engine: Option<crate::grammar::GrammarEngine>,
@@ -157,6 +156,36 @@ pub(crate) fn resolve_tokenizer_runtime(
         );
     }
 
+    // Mid-word token mask (2026-05-24): `mask[id]` is true iff the
+    // token decodes to text whose last character is alphanumeric — i.e.
+    // emitting `</think>` (or other sentence-end punctuation) right
+    // after this token would split a word. Drives the
+    // `decode_logits_seq::mid_word_</think>_defer` guard. Built once
+    // unconditionally (same one-time decode loop cost as the boundary
+    // mask, cheap and model-agnostic). Fail-open: any decode error
+    // leaves the id `false`, so the suppression simply doesn't fire
+    // for that token.
+    {
+        let vocab_size = tokenizer.inner().get_vocab_size(true);
+        let mut mask: Vec<bool> = vec![false; vocab_size];
+        let mut mid_word_count = 0usize;
+        for (id, slot) in mask.iter_mut().enumerate() {
+            if let Ok(s) = tokenizer.decode_with_special(&[id as u32])
+                && !s.is_empty()
+                && let Some(last_ch) = s.chars().last()
+                && last_ch.is_alphanumeric()
+            {
+                *slot = true;
+                mid_word_count += 1;
+            }
+        }
+        crate::scheduler::set_mid_word_token_mask(std::sync::Arc::from(mask));
+        tracing::info!(
+            "Mid-word token mask: {mid_word_count}/{vocab_size} ids end in alphanumeric \
+             (mid-word </think> defer active during thinking)"
+        );
+    }
+
     if let Some(tid) = think_end_token {
         tracing::info!(
             "Thinking end token: {} ({})",
@@ -178,22 +207,6 @@ pub(crate) fn resolve_tokenizer_runtime(
         }
         crate::scheduler::set_im_start_hard_stop(id);
         tracing::info!("ChatML role-boundary hard stop: <|im_start|> (id {id}) registered");
-    }
-
-    let reflection_words = [
-        "wait", "Wait", "however", "However", "actually", "Actually", "hmm", "Hmm",
-    ];
-    let reflection_suppress_ids: Vec<u32> = reflection_words
-        .iter()
-        .filter_map(|word| tokenizer.encode(word).ok())
-        .filter(|ids| ids.len() == 1)
-        .map(|ids| ids[0])
-        .collect();
-    if !reflection_suppress_ids.is_empty() {
-        tracing::info!(
-            "Reflection suppression tokens: {} IDs resolved",
-            reflection_suppress_ids.len()
-        );
     }
 
     let tool_call_format_name: Option<String> = args.tool_call_parser.clone().or_else(|| {
@@ -254,7 +267,6 @@ pub(crate) fn resolve_tokenizer_runtime(
         think_end_token,
         think_start_token,
         code_fence_token,
-        reflection_suppress_ids,
         tool_call_start_token,
         tool_call_end_token,
         grammar_engine,

@@ -31,7 +31,6 @@ pub(super) fn run_standard_chunk_loop(
     code_fence_token: Option<u32>,
     tool_call_start_token: Option<u32>,
     tool_call_end_token: Option<u32>,
-    reflection_suppress_ids: &[u32],
     adaptive_sampling: bool,
     completed_indices: &mut Vec<(usize, Option<u32>)>,
     did_mixed_step: &mut bool,
@@ -139,7 +138,6 @@ pub(super) fn run_standard_chunk_loop(
                     code_fence_token,
                     tool_call_start_token,
                     tool_call_end_token,
-                    reflection_suppress_ids,
                     adaptive_sampling,
                 );
                 *did_mixed_step = true;

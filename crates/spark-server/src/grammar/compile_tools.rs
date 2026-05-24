@@ -210,10 +210,26 @@ impl GrammarEngine {
         for st in &sanitized_tools {
             let begin = format!("<tool_call>\n<function={}>\n", st.name);
             let end = "\n</function>\n</tool_call>";
+            // 2026-05-23 numerical-drift sweep: switched from
+            // `qwen_xml_parameter` to `json_schema` content type
+            // because xgrammar's qwen_xml_parameter matcher over-prunes
+            // the literal `<parameter=` prefix between consecutive
+            // parameters, producing tool-call arguments like:
+            //   "filePath": "/path/Cargo.toml\n</parametercontent>\n[package]..."
+            // (the `</parameter>` close immediately followed by a bare
+            // `content>` continuation that gets absorbed into the
+            // PRIOR parameter's value). See dump line 108 of
+            // opencode-mtp-rollback.jsonl, 2026-05-23 session
+            // ses_1a97c9241ffecMUu29IF8304TS turn 11. json_schema
+            // matches the upstream Qwen3.5/3.6 reference behavior,
+            // emits XML-shaped tool calls correctly, and avoids the
+            // pruning bug. Slightly looser tool-call grammar but
+            // functional and battle-tested (it was already the
+            // documented fallback at line 287-300 below).
             tag_entries.push(serde_json::json!({
                 "type": "tag",
                 "begin": begin,
-                "content": {"type": "qwen_xml_parameter", "json_schema": st.schema},
+                "content": {"type": "json_schema", "json_schema": st.schema},
                 "end": end,
             }));
         }

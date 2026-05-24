@@ -45,11 +45,16 @@ pub(super) fn resolve_thinking(
     };
     let budget = if et {
         let b = tb.unwrap_or(max_budget);
-        let safety_cap_pct = if tools_active && state.behavior.thinking_in_tools {
-            7
-        } else {
-            9
-        };
+        // 2026-05-23 sweep: dropped the 70% special case for
+        // `tools_active && thinking_in_tools` (previously 7/10, now
+        // 9/10 uniformly). With `thinking_in_tools=true` as the
+        // project-wide default the 70% branch fired on every tool turn
+        // and silently undermined the MODEL.toml `max_thinking_budget`
+        // bump (opencode-style requests at max_tokens=2048 capped to
+        // 1433 instead of 2048). 90% leaves headroom for content +
+        // tool args without crippling reasoning chains that now run
+        // naturally after the F1 reflection-penalty removal.
+        let safety_cap_pct = 9;
         let max = ((mt * safety_cap_pct) / 10).max(1);
         Some(b.min(max))
     } else {

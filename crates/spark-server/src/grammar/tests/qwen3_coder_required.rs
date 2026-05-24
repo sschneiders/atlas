@@ -50,9 +50,14 @@ fn grammar_accepts(compiled: &CompiledGrammar, input: &str) -> bool {
 }
 
 /// Positive baseline: the grammar must accept a properly-populated
-/// `<tool_call>...<parameter=command>...</parameter>...</tool_call>`.
-/// This pins the canonical happy path so a too-aggressive upstream fix
-/// (e.g. one that breaks legitimate empty-string values) gets caught.
+/// `<tool_call>...{...JSON args...}...</tool_call>` envelope. Pins the
+/// canonical happy path so a too-aggressive upstream fix (e.g. one
+/// that breaks legitimate empty-string values) gets caught.
+///
+/// 2026-05-23 sweep: switched from XML `<parameter=NAME>VALUE</parameter>`
+/// to JSON `{"NAME": "VALUE"}` body (json_schema content type in
+/// compile_tools.rs:216). Atlas's `parse_qwen3_coder_call` parser
+/// supports both shapes via the JSON fallback at parse_single_b.rs:137.
 #[test]
 fn qwen3_coder_grammar_accepts_canonical() {
     let vocab = test_vocab();
@@ -63,7 +68,8 @@ fn qwen3_coder_grammar_accepts_canonical() {
         .compile_qwen3_coder_tool_grammar(&tools, true)
         .expect("compile must succeed");
 
-    let canonical = "<tool_call>\n<function=exec>\n<parameter=command>\nls /tmp\n</parameter>\n</function>\n</tool_call>";
+    let canonical =
+        "<tool_call>\n<function=exec>\n{\"command\": \"ls /tmp\"}\n</function>\n</tool_call>";
     assert!(
         grammar_accepts(&compiled, canonical),
         "canonical exec invocation must be accepted; input: {canonical:?}"
@@ -130,8 +136,11 @@ fn qwen3_coder_grammar_rejects_empty_with_optional_fields_present() {
          must STILL reject empty body. Input: {empty_body:?}"
     );
 
-    // Just an optional, no required → still rejected
-    let only_optional = "<tool_call>\n<function=exec>\n<parameter=cwd>\n/tmp\n</parameter>\n</function>\n</tool_call>";
+    // 2026-05-23 sweep: switched from XML <parameter=NAME>VALUE</parameter>
+    // to JSON `{"NAME": "VALUE"}` body. Just an optional, no required →
+    // still rejected.
+    let only_optional =
+        "<tool_call>\n<function=exec>\n{\"cwd\": \"/tmp\"}\n</function>\n</tool_call>";
     assert!(
         !grammar_accepts(&compiled, only_optional),
         "qwen3_coder grammar must reject body with only an OPTIONAL parameter \
@@ -139,14 +148,15 @@ fn qwen3_coder_grammar_rejects_empty_with_optional_fields_present() {
     );
 
     // Required-only is fine
-    let only_required = "<tool_call>\n<function=exec>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>";
+    let only_required =
+        "<tool_call>\n<function=exec>\n{\"command\": \"ls\"}\n</function>\n</tool_call>";
     assert!(
         grammar_accepts(&compiled, only_required),
         "required-only body must be accepted. Input: {only_required:?}"
     );
 
     // Required + optional is fine (any order)
-    let both_in_order = "<tool_call>\n<function=exec>\n<parameter=command>\nls\n</parameter>\n<parameter=cwd>\n/tmp\n</parameter>\n</function>\n</tool_call>";
+    let both_in_order = "<tool_call>\n<function=exec>\n{\"command\": \"ls\", \"cwd\": \"/tmp\"}\n</function>\n</tool_call>";
     assert!(
         grammar_accepts(&compiled, both_in_order),
         "required+optional in declaration order must be accepted. Input: {both_in_order:?}"

@@ -46,9 +46,11 @@ use decode_logits_seq::*;
 use decode_logits_step::*;
 use decode_step::*;
 use emit_step::*;
+pub use helpers::disable_watchdogs;
 pub use helpers::set_boundary_token_mask;
 pub use helpers::set_enable_loop_watchdog;
 pub use helpers::set_im_start_hard_stop;
+pub use helpers::set_mid_word_token_mask;
 pub use helpers::set_numeric_token_mask;
 use helpers::*;
 pub use helpers::{CONTENT_LOOP_PERIOD_MAX, CONTENT_LOOP_PERIOD_MIN};
@@ -113,7 +115,6 @@ pub fn run(
     code_fence_token: Option<u32>,
     tool_call_start_token: Option<u32>,
     tool_call_end_token: Option<u32>,
-    reflection_suppress_ids: Vec<u32>,
     mut grammar_engine: Option<GrammarEngine>,
     adaptive_sampling: bool,
     mut session_manager: crate::session_manager::SessionSsmManager,
@@ -275,7 +276,6 @@ pub fn run(
             code_fence_token,
             tool_call_start_token,
             tool_call_end_token,
-            &reflection_suppress_ids,
             adaptive_sampling,
         );
 
@@ -324,7 +324,6 @@ pub fn run(
                     code_fence_token,
                     tool_call_start_token,
                     tool_call_end_token,
-                    &reflection_suppress_ids,
                     adaptive_sampling,
                 );
             }

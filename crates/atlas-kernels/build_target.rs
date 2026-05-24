@@ -16,7 +16,7 @@ use super::build_codegen::find_cuda_dir;
 /// compiler and output format so the same build.rs works for NVIDIA
 /// (nvcc → PTX text), Apple (xcrun → metallib binary), AMD (hipcc →
 /// HSACO binary), or Intel (icpx → SPIR-V binary).
-pub(super) trait ComputeTarget {
+pub(super) trait ComputeTarget: Send + Sync {
     fn source_extension(&self) -> &str;
     fn output_extension(&self) -> &str;
     /// Whether the compiled output is human-readable text (PTX) or an

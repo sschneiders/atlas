@@ -125,6 +125,15 @@ pub(super) struct ActiveSeq {
     pub thinking_tokens: u32,
     /// When true, the next decode step must produce the `</think>` token.
     pub force_end_thinking: bool,
+    /// Decode-step counter incremented while `force_end_thinking` is
+    /// armed but the injection is deferred (waiting for a sentence-
+    /// boundary token or fence close). Reset to 0 on the false→true
+    /// arm transition and on the true→false reset (`</think>` emitted
+    /// or model exited thinking). Bounded by
+    /// [`crate::scheduler::confidence::MAX_SENTENCE_DEFER_TOKENS`] —
+    /// past that the caller computes `hard_override = true` and
+    /// `should_inject_think_end` fires unconditionally.
+    pub sentence_defer_count: u32,
     /// Consecutive tokens where top-1 softmax prob >= 0.95 (for confidence early stop).
     pub consecutive_confident: u32,
     /// True while the model is inside an unclosed ``` code fence within
@@ -240,6 +249,7 @@ pub(super) struct SwappedSeq {
     pub spontaneous_think_budget: u32,
     pub thinking_tokens: u32,
     pub force_end_thinking: bool,
+    pub sentence_defer_count: u32,
     pub consecutive_confident: u32,
     pub in_code_fence: bool,
     pub think_end_token: Option<u32>,

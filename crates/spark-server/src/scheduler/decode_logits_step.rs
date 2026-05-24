@@ -19,7 +19,6 @@ pub fn process_decode_logits(
     code_fence_token: Option<u32>,
     tool_call_start_token: Option<u32>,
     tool_call_end_token: Option<u32>,
-    reflection_suppress_ids: &[u32],
     adaptive_sampling: bool,
 ) {
     let n = active.len();
@@ -92,7 +91,6 @@ pub fn process_decode_logits(
                         think_start_token,
                         tool_call_start_token,
                         tool_call_end_token,
-                        reflection_suppress_ids,
                         adaptive_sampling,
                     )
                 })
@@ -178,6 +176,7 @@ pub fn process_decode_logits(
             if think_end_token == Some(tok) {
                 a.inside_thinking = false;
                 a.force_end_thinking = false;
+                a.sentence_defer_count = 0;
                 a.consecutive_confident = 0;
                 a.in_code_fence = false;
                 a.think_ended = true;
@@ -204,18 +203,24 @@ pub fn process_decode_logits(
                     && !a.force_end_thinking
                 {
                     a.force_end_thinking = true;
-                    tracing::info!("Thinking budget exhausted ({budget} tokens), forcing </think>");
+                    a.sentence_defer_count = 0;
+                    tracing::info!(
+                        "Thinking budget exhausted ({budget} tokens), arming </think>; \
+                         deferring up to {MAX_SENTENCE_DEFER_TOKENS} tokens for sentence boundary"
+                    );
                 }
                 // Token-level fence-loop detection. Catches the Qwen3.5-35B
                 // phrase attractor (`Running:\`\`\`bash cmd\`\`\`Executing:…`
                 // cycling) within ~24-60 tokens of the loop starting,
                 // instead of waiting for the 256-token thinking budget.
-                if !a.force_end_thinking
+                if !crate::scheduler::helpers::disable_watchdogs()
+                    && !a.force_end_thinking
                     && a.thinking_tokens >= THINK_LOOP_MIN_TOKENS
                     && a.thinking_tokens.is_multiple_of(THINK_LOOP_CHECK_STRIDE)
                     && detect_thinking_token_loop(&a.output_tokens)
                 {
                     a.force_end_thinking = true;
+                    a.sentence_defer_count = 0;
                     a.think_watchdog_fires = a.think_watchdog_fires.saturating_add(1);
                     tracing::warn!(
                         thinking_tokens = a.thinking_tokens,

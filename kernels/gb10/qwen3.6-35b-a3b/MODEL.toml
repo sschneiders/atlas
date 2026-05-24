@@ -50,15 +50,37 @@ vision = true
 # calling despite 256K positional budget.
 effective_context = 24576
 
-# Recommended sampling defaults per category (from Qwen3.5 model card).
-# Used when the client doesn't send explicit values.
-# Categories: thinking_text, thinking_coding, non_thinking, tools
+# Recommended sampling defaults per category.
+#
+# 2026-05-24 EMPIRICAL REVERT: I tried to "correct" these to the Qwen
+# Best Practices block values (temp=1.0, presence_penalty=1.5 for
+# thinking-general). Manual opencode testing showed it materially
+# regressed:
+#   - 2 runs hit max_tokens=8192 (finish_reason=length) — model
+#     wandering endlessly because presence_penalty=1.5 kills logits
+#     for every common reasoning token after a few hundred tokens
+#     ("language mixing and slight decrease in performance" — direct
+#     Qwen card warning).
+#   - Thinking cutoffs returned (high-pres pushes model into rare-token
+#     paths where </think> wins at low margin).
+#   - Tool-call regressions returned (lost the rep_pen=1.1 + dry=0.5
+#     that was breaking JSON-body repetition).
+#
+# So: trust the empirical numbers, not Qwen's general-purpose card.
+# These are the values that produced the clean opencode session
+# (see opencode-p2c-fp16p.jsonl 2026-05-24):
+#   temperature=0.6 (balanced for agentic coding — not too greedy, not too high)
+#   presence_penalty=0.0 (Qwen's 1.5 is a recipe for non-agentic chat)
+#   repetition_penalty=1.1 (industry-norm light penalty)
+#   dry_multiplier=0.5 (SGLang default; catches verbatim loops)
 [sampling.thinking_text]
 temperature = 0.6
 top_p = 0.95
 top_k = 20
 presence_penalty = 0.0
 frequency_penalty = 0.0
+repetition_penalty = 1.1
+dry_multiplier = 0.5
 
 [sampling.thinking_coding]
 temperature = 0.6
@@ -66,6 +88,8 @@ top_p = 0.95
 top_k = 20
 presence_penalty = 0.0
 frequency_penalty = 0.0
+repetition_penalty = 1.1
+dry_multiplier = 0.5
 
 [sampling.non_thinking]
 temperature = 0.7
@@ -73,6 +97,8 @@ top_p = 0.8
 top_k = 20
 presence_penalty = 0.0
 frequency_penalty = 0.0
+repetition_penalty = 1.1
+dry_multiplier = 0.5
 
 # Tool-calling preset: Qwen team recommends temperature=0.6 for coding tasks.
 # Greedy (0.0) causes self-reinforcement repetition loops at long context.
@@ -82,34 +108,68 @@ top_p = 0.95
 top_k = 20
 presence_penalty = 0.0
 frequency_penalty = 0.0
+repetition_penalty = 1.1
+dry_multiplier = 0.5
 
 # Model-specific behavior overrides. These control server-side hacks that
 # compensate for model quirks. Defaults are sane for most models; override
 # here when a model family has known failure modes.
 [behavior]
-# Content-loop watchdog disabled: 2026-05-05 chess-game stress
-# sweep showed this MoE A3B variant finishes cleanly on long-code
-# prompts. Only the dense Qwen 27B variants need it.
-enable_loop_watchdog = false
+# Content-loop watchdog ENABLED (2026-05-23 numerical-drift sweep):
+# the 2026-05-05 chess-game pass was too short to expose the late-
+# layer divergence — 18920-token opencode prompts produce ~7%
+# accumulated cosine drift vs HF BF16 reference (mean cos 0.967, see
+# project_qwen36_numerical_drift_2026_05_23.md). When the late-layer
+# distribution drifts enough to flip MoE expert selection (3/8
+# overlap at L38), the model occasionally lands in sentence-repeat
+# attractors. The watchdog catches and rolls back to a sentence
+# boundary, breaking the loop.
+enable_loop_watchdog = true
 # Thinking on by default — Qwen3.6 35B-A3B is a reasoning-tier MoE; CoT
 # materially improves coherence on multi-step prompts. Per-request override
 # via chat_template_kwargs.enable_thinking still wins; CLI --disable-thinking
 # is the kill-switch.
 thinking_default = true
-# Thinking DISABLED during tool-active turns (2026-05-23): a new failure
-# mode emerged with opencode (9 tool schemas, temp=0.3, large system
-# prompt) — the model emits literal `<tool_call><function=…>…</tool_call>`
-# XML INSIDE its `<think>` block, repeated 6+ times before the thinking
-# budget force-closes `</think>`. The leak reaches opencode's rendered
-# transcript as reasoning_content deltas and visibly contaminates the
-# session. Three-agent investigation pinpointed six root causes; this
-# is the immediate hotfix (Layer D). The stream-side scanner in
-# chat_stream/handle_token.rs (Layer A) closes the underlying gap; once
-# that lands and is validated end-to-end, flip this back to true.
-thinking_in_tools = false
+# Thinking ENABLED during tool-active turns. Earlier (2026-05-23) this was
+# flipped to false as a hotfix for the `<tool_call>`-inside-`<think>` leak;
+# a follow-up Phase-γ ablation pinpointed F1 (the reflection-token penalty
+# at decode_logits_seq.rs) as the actual cause — penalising
+# `wait`/`however`/`actually`/`hmm` by -10 logit during thinking shifted
+# the distribution toward emitting the `<tool_call>` XML scaffolding shown
+# in the system prompt as the next-highest-probability "thinking"
+# continuation. F1 has now been deleted entirely (HF transformers has no
+# analogue and didn't reproduce the leak even on Atlas's exact prompt with
+# 10 literal `<tool_call>` demos), so thinking-in-tools is safe to re-enable.
+thinking_in_tools = true
 # Maximum thinking budget (tokens). Prevents overthinking.
 # Client-specified budget takes precedence if lower.
-max_thinking_budget = 512
+# Bumped 512 → 2048 (2026-05-23) after F1 reflection-penalty removal:
+# without F1 suppressing `wait`/`however`/`actually`/`hmm`, the model
+# reasons naturally and Qwen3.6's agentic chains can genuinely run
+# 600–1500 tokens before the model closes `</think>` on its own. The
+# old 512 cap was force-injecting `</think>` mid-sentence in opencode.
+# Now that step-5/6 of resolve_thinking falls through to this cap (None
+# → max_thinking_budget) instead of the global DEFAULT_THINKING_BUDGET
+# (256), this is the effective budget for opencode-style clients that
+# don't explicitly set one.
+max_thinking_budget = 2048
+# Inter-tool prose budget — max tokens of free CONTENT (not thinking,
+# not tool body) the model can emit between successive tool calls
+# before Atlas truncates with finish_reason=length.
+#
+# 2026-05-24: bumped 384 → 2048. The default 384 was killing
+# opencode-style agentic sessions where the model legitimately needs
+# to write a longer explanation/plan between tool calls (post-Phase-2c
+# precision improvements let it reason for ~1000+ token explanations
+# without degenerating). Observed in opencode-vllm-detect.jsonl:
+# content-loop watchdog correctly rolled back from a real loop, model
+# re-steered cleanly, but then emitted 385 tokens of legitimate
+# explanation prose and was killed by the 384 budget.
+#
+# 2048 gives Qwen3.6 agentic ample room. Real degeneration still
+# tripped by content-loop watchdog (vLLM-anchored, fires within 4
+# tokens of a tight loop) and thinking-loop watchdog.
+max_inter_tool_prose = 2048
 # Default num_drafts for speculative decoding (K = num_drafts + 1).
 # Benchmarked 2026-04-10 on GB10: K=2 (1 draft) yields 117.8 tok/s vs
 # K=3 (2 drafts) at 82.4 tok/s — 43% faster. The MoE verify overhead

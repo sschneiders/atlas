@@ -97,12 +97,23 @@ fn content_loop_detects_sentence_triple_repeat() {
 fn content_loop_rejects_short_responses() {
     // Below CONTENT_LOOP_MIN_TOKENS — must not fire even on a
     // visible repeat. The watchdog should give short responses
-    // breathing room.
+    // breathing room. Constants threshold-tracked via the named
+    // constant so the test stays valid across the 2026-05-23
+    // sweep (MIN_TOKENS 96→48).
     let pat: Vec<u32> = (1..=10).collect();
-    let mut tokens: Vec<u32> = (50..80).collect();
+    // Build a response of (MIN_TOKENS - 4) total so we're below
+    // the floor even after 3× repeats.
+    let prior_len = (CONTENT_LOOP_MIN_TOKENS as usize).saturating_sub(3 * pat.len() + 4);
+    let mut tokens: Vec<u32> = (50u32..50 + prior_len as u32).collect();
     tokens.extend(pat.iter());
     tokens.extend(pat.iter());
     tokens.extend(pat.iter());
+    assert!(
+        tokens.len() < CONTENT_LOOP_MIN_TOKENS as usize,
+        "test setup error: tokens.len()={} exceeds MIN_TOKENS={}",
+        tokens.len(),
+        CONTENT_LOOP_MIN_TOKENS,
+    );
     assert!(
         !detect_content_token_loop(&tokens),
         "responses under {} tokens must not trigger watchdog",
@@ -121,17 +132,39 @@ fn content_loop_rejects_legitimate_prose() {
 }
 
 #[test]
-fn content_loop_rejects_two_repeats() {
-    // Two copies of a 30-token block with prior context — common
-    // in legitimate "the user said X. The user said X again."
-    // exposition. Should NOT fire (need 3+ repeats).
+fn content_loop_accepts_two_repeats() {
+    // 2026-05-23 sweep: CONTENT_LOOP_MIN_REPEATS lowered 3 → 2 so
+    // we catch sentence-repeat attractors before they stabilise
+    // (see project_qwen36_drift_moe_smoking_gun.md). Two copies of
+    // a 30-token block with sufficient prior context must NOW
+    // trigger. This is a deliberate sensitivity bump — single
+    // repeats ("the user said X. The user said X again.") were
+    // accepted at the old threshold; the new threshold catches them
+    // too. Other Atlas attractors (LZ + DRY + presence penalties)
+    // remain on for nuisance suppression; the watchdog only fires
+    // when one repeat is byte-exact for ≥ MIN_REPEATS occurrences.
     let sentence: Vec<u32> = (500..530).collect();
     let mut tokens: Vec<u32> = (0..100).collect();
     tokens.extend(sentence.iter());
-    tokens.extend(sentence.iter()); // r2 only
+    tokens.extend(sentence.iter()); // 2 repeats — used to be safe, now trips
+    assert!(
+        detect_content_token_loop(&tokens),
+        "two byte-exact 30-token repeats must trigger watchdog at MIN_REPEATS={}",
+        CONTENT_LOOP_MIN_REPEATS,
+    );
+}
+
+#[test]
+fn content_loop_rejects_single_occurrence() {
+    // Single occurrence of any pattern (no repeats) must NOT
+    // trigger. Replaces the prior `two_repeats` rejection test
+    // which was invalidated when MIN_REPEATS was lowered to 2.
+    let sentence: Vec<u32> = (500..530).collect();
+    let mut tokens: Vec<u32> = (0..100).collect();
+    tokens.extend(sentence.iter()); // 1 occurrence — must not trigger
     assert!(
         !detect_content_token_loop(&tokens),
-        "two repeats in content must not trigger (need 3)"
+        "single occurrence (no repeat) must not trigger watchdog"
     );
 }
 

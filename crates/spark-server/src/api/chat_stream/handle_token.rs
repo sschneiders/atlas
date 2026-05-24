@@ -17,6 +17,9 @@ use super::super::failures::{bump_f12_tool_call_count, check_loop_watchdog};
 use super::super::sanitizer::sanitize_content_chunk;
 use super::ctx::StreamCtx;
 use super::state::StreamState;
+use super::strip::{
+    maybe_log_decode_trace, strip_all_preserving_boundary, strip_preserving_boundary,
+};
 use super::tool_handlers::{
     handle_complete_tool_call, handle_tool_call_delta, handle_tool_call_end, handle_tool_call_start,
 };
@@ -89,22 +92,26 @@ pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -
                 .unwrap_or_default();
             let stable_end = full.trim_end_matches('\u{FFFD}').len();
             if stable_end > state.emitted {
-                let mut cleaned = full[state.emitted..stable_end].to_string();
+                let raw = full[state.emitted..stable_end].to_string();
+                let mut cleaned = raw.clone();
                 state.emitted = stable_end;
-                // Strip format tokens that shouldn't appear in thinking
+                // Strip format tokens that shouldn't appear in thinking.
+                // `<think>` only fires at the literal opener (always
+                // whitespace-adjacent in the prompt), so a plain replace
+                // is safe here.
                 cleaned = cleaned.replace("<think>", "");
                 if let Some(rest) = cleaned.strip_prefix("assistant\n") {
                     cleaned = rest.to_string();
                 } else if let Some(rest) = cleaned.strip_prefix("assistant") {
                     cleaned = rest.to_string();
                 }
+                // Boundary-preserving strip: see `strip_preserving_boundary`
+                // doc — prevents `the<tool_call>...</tool_call>project`
+                // from collapsing to `theproject`.
                 while let Some(start) = cleaned.find("<tool_call>") {
-                    if let Some(end) = cleaned[start..].find("</tool_call>") {
-                        cleaned = format!(
-                            "{}{}",
-                            &cleaned[..start],
-                            &cleaned[start + end + "</tool_call>".len()..]
-                        );
+                    if let Some(end_rel) = cleaned[start..].find("</tool_call>") {
+                        let end = start + end_rel + "</tool_call>".len();
+                        cleaned = strip_preserving_boundary(&cleaned, start, end);
                     } else {
                         cleaned = cleaned[..start].to_string();
                         break;
@@ -115,27 +122,26 @@ pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -
                 }
                 // Strip leaked tool-call closing tags from reasoning
                 // (observed pattern: `</parameter></function>` right
-                // before a role-word repetition loop — the model
-                // emits them as BPE tokens after the real tool call
-                // has already been structured by the detector).
+                // before a role-word repetition loop). Route through
+                // `strip_all_preserving_boundary` (2026-05-23 sweep)
+                // to avoid gluing words when a closing tag straddles
+                // two reasoning sentences.
                 for tag in &["</parameter>", "</function>", "</tool_call>"] {
-                    cleaned = cleaned.replace(tag, "");
+                    cleaned = strip_all_preserving_boundary(&cleaned, tag);
                 }
-                // Collapse role-word repetition loops in reasoning
-                // (Qwen3.5/3.6 post-tool-call hallucination). Pair-
-                // collapse `userX...userX` → "" until no adjacent
-                // pairs remain; then strip surviving line-bounded
-                // standalones (`\nuser\n` → `\n`).
+                // Collapse role-word repetition loops (Qwen3.5/3.6
+                // post-tool-call hallucination): `userX...userX` →
+                // "" until no adjacent pairs remain, then strip
+                // line-bounded standalones (`\nuser\n` → `\n`).
                 for word in &["user", "assistant", "tool"] {
                     let pair = format!("{word}{word}");
-                    while cleaned.contains(&pair) {
-                        cleaned = cleaned.replace(&pair, "");
-                    }
+                    cleaned = strip_all_preserving_boundary(&cleaned, &pair);
                     let nl_form = format!("\n{word}\n");
                     while cleaned.contains(&nl_form) {
                         cleaned = cleaned.replace(&nl_form, "\n");
                     }
                 }
+                maybe_log_decode_trace(&raw, &cleaned, full.len(), stable_end - raw.len());
                 // Layer-A in-think tool-call leak scanner. The per-
                 // delta strippers above can miss boundary splits
                 // (e.g. `<too` in delta N + `l_call>` in delta N+1)

@@ -173,6 +173,32 @@ fn main() {
     // Per-target: (target_idx, vec of (stem, module_name))
     let mut all_target_modules: Vec<Vec<(String, String)>> = Vec::new();
 
+    // 2026-05-24 dedup+parallel: pre-walk every (target, cu_file) pair
+    // and split into two queues:
+    //   - `compile_jobs`: unique (source, arch, sorted_flags) tuples
+    //     that need nvcc — run in parallel via thread::scope.
+    //   - `copy_jobs`: cache-hits where another target already produced
+    //     this exact binary — run sequentially after compile (microsec
+    //     each, no point parallelising).
+    //
+    // Pre-dedup baseline on 13 model targets × ~85 shared kernels
+    // = ~1100 sequential nvcc invocations. After dedup: ~85 × 2
+    // flag-variants = ~170 compiles, ~930 file copies. After parallel:
+    // 170 / N_CORES nvcc batches. Net ~30-50× wall-clock improvement on
+    // a 16-core build host.
+    struct CompileJob {
+        cu_file: std::path::PathBuf,
+        arch: String,
+        extra_flags: Vec<String>,
+        out_file: std::path::PathBuf,
+    }
+    let mut compile_jobs: Vec<CompileJob> = Vec::new();
+    let mut copy_jobs: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    let mut compile_cache: std::collections::HashMap<
+        (std::path::PathBuf, String, Vec<String>),
+        std::path::PathBuf,
+    > = std::collections::HashMap::new();
+
     let source_ext = compute_target.source_extension();
     for (idx, target) in targets.iter().enumerate() {
         let cu_files = collect_cu_files(
@@ -189,21 +215,29 @@ fn main() {
             target.quant,
         );
 
-        // Compile all kernel source files via the ComputeTarget abstraction.
-        // The NvidiaTarget uses nvcc; future targets (AMD, Apple, Intel) would
-        // use their respective compilers.
-        let mut errors = Vec::new();
+        // Gather work for this target (no compilation yet — that runs
+        // in parallel after the full work plan is built).
         for cu_file in &cu_files {
             let stem = cu_file.file_stem().unwrap().to_str().unwrap().to_string();
             let out_file = out_dir.join(format!("t{idx}__{stem}.{output_ext}"));
-            if let Err(e) =
-                compute_target.compile(cu_file, &out_file, &target.arch, &target.extra_flags)
-            {
-                errors.push(e);
+
+            // Dedup key: same (source, arch, sorted-flags) → identical
+            // binary output. Sort flags so flag-order doesn't bust the cache.
+            let mut sorted_flags = target.extra_flags.clone();
+            sorted_flags.sort();
+            let key = (cu_file.clone(), target.arch.clone(), sorted_flags);
+
+            if let Some(existing) = compile_cache.get(&key) {
+                copy_jobs.push((existing.clone(), out_file));
+            } else {
+                compile_jobs.push(CompileJob {
+                    cu_file: cu_file.clone(),
+                    arch: target.arch.clone(),
+                    extra_flags: target.extra_flags.clone(),
+                    out_file: out_file.clone(),
+                });
+                compile_cache.insert(key, out_file);
             }
-        }
-        if !errors.is_empty() {
-            panic!("Kernel compilation failed:\n{}", errors.join("\n"));
         }
 
         for cu_file in &cu_files {
@@ -247,6 +281,69 @@ fn main() {
             } else {
                 String::new()
             },
+        );
+    }
+
+    // ── Parallel compile of unique jobs ──
+    let nvcc_invocations = compile_jobs.len();
+    let cache_hits = copy_jobs.len();
+    let total = nvcc_invocations + cache_hits;
+
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+        .min(nvcc_invocations.max(1));
+
+    if nvcc_invocations > 0 {
+        let compute = &*compute_target;
+        let errors_mutex: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let next_idx = std::sync::atomic::AtomicUsize::new(0);
+
+        std::thread::scope(|s| {
+            for _ in 0..n_threads {
+                let next_idx = &next_idx;
+                let compile_jobs = &compile_jobs;
+                let errors_mutex = &errors_mutex;
+                s.spawn(move || {
+                    loop {
+                        let i = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= compile_jobs.len() {
+                            break;
+                        }
+                        let job = &compile_jobs[i];
+                        if let Err(e) =
+                            compute.compile(&job.cu_file, &job.out_file, &job.arch, &job.extra_flags)
+                        {
+                            errors_mutex.lock().unwrap().push(e);
+                        }
+                    }
+                });
+            }
+        });
+
+        let errors = errors_mutex.into_inner().unwrap();
+        if !errors.is_empty() {
+            panic!("Kernel compilation failed:\n{}", errors.join("\n"));
+        }
+    }
+
+    // ── Sequential copy for cache-hits (microseconds each, no point parallelising) ──
+    for (src, dst) in &copy_jobs {
+        std::fs::copy(src, dst).unwrap_or_else(|e| {
+            panic!(
+                "Failed to copy cached {} → {}: {e}",
+                src.display(),
+                dst.display(),
+            )
+        });
+    }
+
+    // Dedup+parallel summary.
+    if total > 0 {
+        println!(
+            "cargo:warning=atlas-kernels: dedup+parallel: {nvcc_invocations}/{total} unique nvcc \
+             invocations ({cache_hits} cache hits, {:.1}× dedup), {n_threads} parallel workers",
+            total as f64 / nvcc_invocations.max(1) as f64,
         );
     }
 

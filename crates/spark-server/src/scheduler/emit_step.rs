@@ -123,6 +123,7 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         if a.think_end_token == Some(tok) {
             a.inside_thinking = false;
             a.force_end_thinking = false;
+            a.sentence_defer_count = 0;
             a.think_ended = true;
             // One-shot for the next decode step: pin to
             // tool_call_start_token if require_tool_call (Change 3b).
@@ -139,7 +140,11 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
                 && !a.force_end_thinking
             {
                 a.force_end_thinking = true;
-                tracing::info!("Thinking budget exhausted ({budget} tokens), forcing </think>");
+                a.sentence_defer_count = 0;
+                tracing::info!(
+                    "Thinking budget exhausted ({budget} tokens), arming </think>; \
+                     deferring to next sentence boundary"
+                );
             }
         }
     } else {

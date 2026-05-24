@@ -360,13 +360,20 @@ impl ChatCompletionRequest {
         // serde default when the field is absent) falls through to the
         // MODEL.toml default so clients that don't know about this flag
         // inherit the model's design intent instead of silently opting out.
+        // Returns `None` for the budget so `api/chat/thinking.rs` falls
+        // back to `state.behavior.max_thinking_budget` (the per-model
+        // MODEL.toml cap) instead of the conservative
+        // DEFAULT_THINKING_BUDGET — opencode-style clients otherwise
+        // hit a 256-token mid-sentence cut on thinking-tier models.
         if self.enable_thinking {
-            return (true, Some(DEFAULT_THINKING_BUDGET));
+            return (true, None);
         }
 
         // 6. Model default from MODEL.toml [behavior].thinking_default.
+        // Same `None` rationale as step 5 — defer to the per-model
+        // `max_thinking_budget` rather than the conservative default.
         if model_default {
-            (true, Some(DEFAULT_THINKING_BUDGET))
+            (true, None)
         } else {
             (false, None)
         }

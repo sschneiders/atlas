@@ -18,7 +18,6 @@ pub fn process_seq_logits(
     _think_start_token: Option<u32>,
     tool_call_start_token: Option<u32>,
     _tool_call_end_token: Option<u32>,
-    reflection_suppress_ids: &[u32],
     adaptive_sampling: bool,
 ) -> (u32, Option<crate::api::TokenLogprobs>) {
     let slice = &buf[i * vocab_size * elem_bytes..(i + 1) * vocab_size * elem_bytes];
@@ -41,16 +40,6 @@ pub fn process_seq_logits(
             .collect()
     };
 
-    // F1: Reflection token suppression during thinking.
-    // Penalize "wait", "however", "actually" etc. to prevent circular reasoning.
-    if a.inside_thinking {
-        for &rid in reflection_suppress_ids {
-            if (rid as usize) < f32_logits.len() {
-                f32_logits[rid as usize] -= 10.0;
-            }
-        }
-    }
-
     // F2: Confidence-based early stop during thinking.
     // When top-1 prob >= 0.95 for 30 consecutive tokens, force </think>.
     // Only kicks in after 400 thinking tokens — the model needs room to
@@ -70,7 +59,8 @@ pub fn process_seq_logits(
     // boundary lands cleanly right after the code block instead of
     // splitting a statement. The token-period THINK_LOOP watchdog
     // (decode_logits_step) also stays active in fences.
-    if a.inside_thinking
+    if !crate::scheduler::helpers::disable_watchdogs()
+        && a.inside_thinking
         && !a.force_end_thinking
         && a.thinking_tokens >= 400
         && crate::scheduler::helpers::watchdog_params().confidence_early_stop
@@ -82,6 +72,7 @@ pub fn process_seq_logits(
         a.consecutive_confident = run;
         if force_end {
             a.force_end_thinking = true;
+            a.sentence_defer_count = 0;
             tracing::info!(
                 "Confidence early stop armed: top-1 prob >= 0.95 for {} tokens (after {} thinking tokens){}",
                 crate::scheduler::helpers::watchdog_params().confidence_run_length,
@@ -89,9 +80,40 @@ pub fn process_seq_logits(
                 if a.in_code_fence {
                     " — deferred until ``` fence closes"
                 } else {
-                    ""
+                    " — deferring until next sentence boundary"
                 }
             );
+        }
+    }
+
+    // Mid-word `</think>` defer (2026-05-24): while INSIDE thinking,
+    // suppress `</think>` if the previously emitted token decodes to
+    // text ending in alphanumeric — i.e. the model is mid-word and
+    // closing thinking now would yield "creating thep" / "ping/pong en"
+    // style cuts. Observed in opencode-session.md 2026-05-24: 8/8
+    // thinking blocks ended mid-word on Qwen3.6-FP8.
+    //
+    // FP8 precision drift biases `</think>` logit upward by enough to
+    // flip word-continuation losers at low margin. This guard restores
+    // word boundaries without papering over the model's natural
+    // decision to end thinking (the very next token after the word
+    // closes, the model is free to sample `</think>` again — and the
+    // continuation tokens (space / punctuation / newline) cap the
+    // defer at one extra token most of the time).
+    //
+    // SSOT: the mid-word mask is the same source the tokenizer-runtime
+    // build loop produces, paralleling boundary_token_mask. Fail-open:
+    // mask absent → no suppression.
+    if !crate::scheduler::helpers::disable_watchdogs()
+        && a.inside_thinking
+        && let Some(end_tok) = think_end_token
+        && let Some(prev_tok) = a.output_tokens.last().copied()
+        && let Some(mask) = crate::scheduler::helpers::mid_word_token_mask()
+        && mask.get(prev_tok as usize).copied().unwrap_or(false)
+    {
+        let end_idx = end_tok as usize;
+        if end_idx < f32_logits.len() {
+            f32_logits[end_idx] = f32::NEG_INFINITY;
         }
     }
 
@@ -160,12 +182,44 @@ pub fn process_seq_logits(
     // unbounded defer traps the deliverable in reasoning. Past
     // THINK_DEFER_BUDGET_FACTOR× the budget (or the absolute ceiling
     // when budget is None), inject </think> even mid-fence.
+    // Compute the three deferral inputs for the injection gate.
+    //   1. `defer_hard_override`: legacy budget-overrun ceiling — at
+    //      3× thinking_budget or the absolute 2048 ceiling, inject
+    //      regardless of fence/boundary state. Now ALSO fires when
+    //      the sentence-boundary defer has been ticking for
+    //      MAX_SENTENCE_DEFER_TOKENS steps without finding a period
+    //      (model is dumping unpunctuated content — digits, identifiers,
+    //      code-without-fences).
+    //   2. `at_sentence_boundary`: previously-emitted token decoded to
+    //      text ending in `.`/`!`/`?`/`\n`. The boundary mask is
+    //      built at startup (`scheduler::helpers::boundary_token_mask`)
+    //      and is the same mask Phase-C rollback uses, so the
+    //      boundary semantics stay consistent across the codebase.
+    //      Fail-open: when the mask is absent or the previous-token
+    //      lookup misses, treat as "not at boundary" — the
+    //      MAX_SENTENCE_DEFER_TOKENS ceiling guarantees forward
+    //      progress.
+    let at_sentence_boundary = a
+        .output_tokens
+        .last()
+        .copied()
+        .and_then(|prev_tok| {
+            crate::scheduler::helpers::boundary_token_mask()
+                .as_deref()
+                .and_then(|m| m.get(prev_tok as usize).copied())
+        })
+        .unwrap_or(false);
     let defer_hard_override = match a.thinking_budget {
         Some(b) => a.thinking_tokens >= b.saturating_mul(THINK_DEFER_BUDGET_FACTOR),
         None => a.thinking_tokens >= THINK_DEFER_ABS_CEILING,
-    };
+    } || a.sentence_defer_count >= MAX_SENTENCE_DEFER_TOKENS;
     if a.inside_thinking
-        && should_inject_think_end(a.force_end_thinking, a.in_code_fence, defer_hard_override)
+        && should_inject_think_end(
+            a.force_end_thinking,
+            a.in_code_fence,
+            at_sentence_boundary,
+            defer_hard_override,
+        )
         && let Some(end_tok) = think_end_token
     {
         let end_idx = end_tok as usize;
@@ -175,6 +229,10 @@ pub fn process_seq_logits(
             }
             f32_logits[end_idx] = 0.0;
         }
+    } else if a.inside_thinking && a.force_end_thinking {
+        // Armed but deferring this step — tick the counter so the
+        // MAX_SENTENCE_DEFER_TOKENS ceiling stays bounded.
+        a.sentence_defer_count = a.sentence_defer_count.saturating_add(1);
     }
 
     // Change 3b: one-shot pin-to-tool-call-start.

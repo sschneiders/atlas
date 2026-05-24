@@ -11,6 +11,14 @@
 // FP8 weight format: B[N,K] uint8 with block_scale[N/128, K/128] BF16.
 // Dequant: bf16_val = E4M3_LUT[byte] * block_scale[n/128, k/128]
 //
+// Numerics SSOT (Phase 2b, 2026-05-24): all f32 -> BF16 conversions in
+// this file use `__float2bfloat16(x)`, which on sm_80+ lowers to
+// `cvt.rn.bf16.f32` (round-to-nearest-even). This matches the
+// load-time CPU dequant in `weight_map::fp8_lut::f32_to_bf16` and
+// `atlas_quant::fp8::f32_to_bf16`, so the routed-expert kernel-side
+// dequant agrees byte-exact with the shared-expert load-time dequant
+// AND with PyTorch's `torch.float32 -> torch.bfloat16` reference.
+//
 // Grid: (ceil(N/64), max_m_tiles, num_experts)  Block: (128, 1, 1)
 
 #include <cuda_bf16.h>

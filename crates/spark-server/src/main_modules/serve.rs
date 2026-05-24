@@ -278,14 +278,13 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     )?;
 
     // Tokenizer-derived runtime: vocab cap, reasoning parser, think tokens,
-    // im_start hard-stop, reflection suppression, tool-call open/close tokens,
-    // and the XGrammar engine.
+    // im_start hard-stop, tool-call open/close tokens, and the XGrammar
+    // engine.
     let serve_phases::TokenizerRuntime {
         reasoning_parser_box,
         think_end_token,
         think_start_token,
         code_fence_token,
-        reflection_suppress_ids,
         tool_call_start_token,
         tool_call_end_token,
         grammar_engine,
@@ -415,7 +414,6 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             code_fence_token,
             tool_call_start_token,
             tool_call_end_token,
-            reflection_suppress_ids,
             grammar_engine,
             adaptive_sampling,
             session_manager,

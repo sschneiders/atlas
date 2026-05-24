@@ -104,11 +104,28 @@ pub const THINK_LOOP_SCAN_WINDOW: usize = 160;
 /// sessions) opt in via MODEL.toml `[behavior].enable_loop_watchdog =
 /// true`. The flag is read at boot and stored in
 /// [`set_enable_loop_watchdog`] / [`enable_loop_watchdog`].
-pub const CONTENT_LOOP_MIN_TOKENS: u32 = 96;
+// 2026-05-23 numerical-drift sweep lowered MIN_TOKENS 96→48 and
+// MIN_REPEATS 3→2: opencode session ses_1a97c9241ffecMUu29IF8304TS
+// showed the model entering a sentence-repeat attractor at late
+// layers (MoE expert routing flipped at L38 due to ~7% accumulated
+// drift, see project_qwen36_drift_moe_smoking_gun.md). With the old
+// MIN_TOKENS=96 + MIN_REPEATS=3 thresholds the watchdog only armed
+// AFTER 3 × ~16 tokens = ~48 tokens of identical-sentence repeats,
+// PLUS a 96-token warm-up, so the attractor had already locked in
+// and emitted hundreds of repeats. Halving both lets the watchdog
+// fire within ~32 tokens of the second identical sentence, breaking
+// the attractor before it stabilises.
+pub const CONTENT_LOOP_MIN_TOKENS: u32 = 48;
 pub const CONTENT_LOOP_CHECK_STRIDE: u32 = 16;
-pub const CONTENT_LOOP_PERIOD_MIN: usize = 8;
+// 2026-05-24 sweep: 8 → 2. Tool-body degeneration (`parameter>\n`
+// period-2 cycle) hung a 21k-token opencode request because the
+// detector's lower bound was 8. Period 2 catches the tight `[A, B]`
+// attractor; CONTENT_LOOP_MIN_REPEATS=2 means we need 4 tokens
+// (2 periods × 2 repeats) before firing, which is fast enough to
+// break the loop within ~100 ms after onset.
+pub const CONTENT_LOOP_PERIOD_MIN: usize = 2;
 pub const CONTENT_LOOP_PERIOD_MAX: usize = 64;
-pub const CONTENT_LOOP_MIN_REPEATS: usize = 3;
+pub const CONTENT_LOOP_MIN_REPEATS: usize = 2;
 pub const CONTENT_LOOP_SCAN_WINDOW: usize = 280;
 /// Min repeats for the digit-normalized content-loop path. Stricter
 /// than `CONTENT_LOOP_MIN_REPEATS` (3) because numeric normalization
@@ -122,6 +139,39 @@ pub const CONTENT_LOOP_NORM_MIN_REPEATS: usize = 4;
 /// in the classifier means a stray real `u32::MAX` would degrade to
 /// "structural", never a false numeric — safe either way.
 pub const NUMERIC_SENTINEL: u32 = u32::MAX;
+
+/// Resolved kill-switch for ALL auto-watchdogs (content-loop, inter-tool
+/// prose budget, F2 confidence early-stop, mid-word `</think>` defer,
+/// thinking-loop). Cached once on first read from `ATLAS_DISABLE_WATCHDOGS`.
+///
+/// 2026-05-24: introduced for empirical test of whether Phase 2b
+/// numerical fixes (RNE FP32 → BF16 + `__expf` softmax replacing the
+/// 0.5 % polynomial) eliminated the degeneration that watchdogs catch.
+/// Watchdogs were originally compensating for FP8 token-margin flips
+/// pre-Phase 2b; better precision should reduce or eliminate the need.
+///
+/// `ATLAS_DISABLE_WATCHDOGS=1`/`true` (case-insensitive) → all
+/// auto-watchdogs short-circuit. The user-set `max_thinking_budget` and
+/// safety masks (post-`</think>` re-entry, tool-call-during-thinking)
+/// are NOT touched — those are not watchdogs.
+static DISABLE_WATCHDOGS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn parse_disable_watchdogs(env: Option<&str>) -> bool {
+    match env {
+        Some(v) => {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        }
+        None => false,
+    }
+}
+
+/// Whether all auto-watchdogs are disabled at runtime. `false` by
+/// default; flipped only when `ATLAS_DISABLE_WATCHDOGS=1`/`true`.
+pub fn disable_watchdogs() -> bool {
+    *DISABLE_WATCHDOGS
+        .get_or_init(|| parse_disable_watchdogs(std::env::var("ATLAS_DISABLE_WATCHDOGS").ok().as_deref()))
+}
 
 static ENABLE_LOOP_WATCHDOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
@@ -201,7 +251,7 @@ pub struct WatchdogParams {
     /// heuristic.
     pub confidence_early_stop: bool,
     /// F2 confidence run length before arming forced `</think>`.
-    /// Default 30 (`CONFIDENCE_RUN_LIMIT`).
+    /// Default 60 (`CONFIDENCE_RUN_LIMIT`; 2026-05-23 sweep raised from 30).
     pub confidence_run_length: u32,
     /// Fuzzy-repetition detector Hamming tolerance divisor: a
     /// `pattern_len`-token window tolerates `pattern_len / div`
@@ -288,6 +338,36 @@ pub fn set_boundary_token_mask(mask: std::sync::Arc<[bool]>) {
 /// runs — callers must treat `None` as "no boundary info available".
 pub fn boundary_token_mask() -> Option<std::sync::Arc<[bool]>> {
     BOUNDARY_TOKEN_MASK.get().cloned()
+}
+
+/// Per-token mid-word mask (2026-05-24): `mask[id]` is true iff the
+/// token decodes to text whose LAST character is alphanumeric — i.e.
+/// emitting `</think>` (or any sentence-end punctuation) right after
+/// this token would split a word.
+///
+/// Used by [`super::decode_logits_seq`] to suppress `</think>` when the
+/// previously emitted token ended mid-word. FP8 precision drift on
+/// Qwen3.6-FP8 biases the `</think>` logit upward by enough to flip
+/// against word-continuation tokens at low margin (opencode-session.md
+/// 2026-05-24: 8/8 thinking blocks ended mid-word: "creating thep",
+/// "ping/pong en", "then cr"). The fix is a soft guard rather than a
+/// rewrite of the model.
+///
+/// Fail-open: never set → suppression is skipped and the model
+/// retains full freedom to terminate thinking at any token.
+static MID_WORD_TOKEN_MASK: std::sync::OnceLock<std::sync::Arc<[bool]>> =
+    std::sync::OnceLock::new();
+
+/// Set once at startup from the resolved tokenizer. Idempotent.
+pub fn set_mid_word_token_mask(mask: std::sync::Arc<[bool]>) {
+    let _ = MID_WORD_TOKEN_MASK.set(mask);
+}
+
+/// Read the mid-word token mask. `None` until `set_mid_word_token_mask`
+/// runs — callers must treat `None` as "no mid-word info available"
+/// and skip the suppression.
+pub fn mid_word_token_mask() -> Option<std::sync::Arc<[bool]>> {
+    MID_WORD_TOKEN_MASK.get().cloned()
 }
 
 /// F2 (2026-04-26): cap on free-text tokens between successive
@@ -389,91 +469,110 @@ pub fn detect_content_token_loop_normalized(tokens: &[u32], mask: &[bool]) -> bo
     )
 }
 
-/// Substring-occurrence loop detector used by both the thinking
-/// and content phases. Returns `true` iff some contiguous
-/// subsequence of length `p ∈ [period_min, period_max]` appears
-/// `min_repeats`+ times in the last `scan_window` tokens of `tokens`.
+/// 2026-05-24 v3: ALGORITHM REPLACE. Switched from Atlas's scan-anywhere
+/// substring detector to vLLM's anchored-at-end algorithm (vLLM main
+/// `v1/core/sched/utils.py::_has_repeating_pattern`, GitHub
+/// vllm-project/vllm; verified identical in 0.17.0 + current main).
+///
+/// **Why**: Atlas's scan-anywhere algorithm fires on ANY period match
+/// in the last 280 tokens — including OLD patterns the model has
+/// already moved past. Manifests as false-positive cutoffs on
+/// numbered lists ("Step 1: Step 2: Step 3: Verify Cargo.toml" has
+/// period-2 in the [Step,N] tail BEFORE the prose continuation, so
+/// Atlas would fire even though the model is no longer looping).
+///
+/// **vLLM's algorithm**: take the LAST `pattern_len` tokens as a fixed
+/// anchor; check whether the preceding `(min_repeats - 1)` windows of
+/// the same length are byte-identical to it. If yes, the model is
+/// CURRENTLY in a loop of period `pattern_len`. False positives on
+/// historic patterns disappear because the check is end-anchored.
+///
+/// **`scan_window` kept for signature compat** — unused now, since the
+/// vLLM algorithm only reads the last `pattern_len * min_repeats`
+/// tokens (bounded automatically).
 pub fn detect_token_loop(
     tokens: &[u32],
     min_tokens: usize,
     period_min: usize,
     period_max: usize,
     min_repeats: usize,
-    scan_window: usize,
+    _scan_window: usize,
 ) -> bool {
     let n = tokens.len();
     if n < min_tokens {
         return false;
     }
-    let tail_start = n.saturating_sub(scan_window);
-    let tail = &tokens[tail_start..];
-    for period in period_min..=period_max {
-        if tail.len() < period * min_repeats {
-            continue;
+    if min_repeats < 2 {
+        return false;
+    }
+    let period_min = period_min.max(1);
+    for pattern_len in period_min..=period_max {
+        if pattern_len * min_repeats > n {
+            return false;
         }
-        let needle = &tail[tail.len() - period..];
-        let mut count = 0usize;
-        let mut pos = 0usize;
-        while pos + period <= tail.len() {
-            if &tail[pos..pos + period] == needle {
-                count += 1;
-                if count >= min_repeats {
-                    return true;
-                }
-                pos += period; // non-overlapping
-            } else {
-                pos += 1;
-            }
+        if has_repeating_pattern_anchored(tokens, pattern_len, min_repeats) {
+            return true;
         }
     }
     false
 }
 
-/// Like [`detect_token_loop`] but only accepts a periodic match whose
-/// `needle` (the period-length window) contains BOTH a
-/// [`NUMERIC_SENTINEL`] and a non-sentinel token. Used exclusively by
-/// the digit-normalized path so a pure-number column or a pure-prose
-/// repeat does not trip here (those remain the exact detector's job).
-/// The `< min_tokens` guard is the caller's `CONTENT_LOOP_MIN_TOKENS`
-/// check, so this takes only the tail/period rules.
+/// vLLM-style anchored detector (port of
+/// `vllm/v1/core/sched/utils.py::_has_repeating_pattern`). For each
+/// position `n ∈ [1, pattern_len]` in the LAST `pattern_len` tokens,
+/// verify that position is byte-identical at offsets
+/// `pattern_len * m` (for m = 1..min_repeats) preceding the tail.
 ///
-/// ~20 lines duplicate `detect_token_loop`'s scan: the per-period
-/// needle predicate needs the matched window, which `detect_token_loop`
-/// (`-> bool`) hides. Duplicating is lower-risk than adding a closure
-/// param to a function with 13 existing tests + the exact call site;
-/// the exact detector stays byte-identical (regression-tested).
+/// Caller MUST ensure `len(tokens) >= pattern_len * min_repeats`.
+#[inline]
+fn has_repeating_pattern_anchored(
+    tokens: &[u32],
+    pattern_len: usize,
+    min_repeats: usize,
+) -> bool {
+    let n = tokens.len();
+    for offset_in_window in 1..=pattern_len {
+        let target = tokens[n - offset_in_window];
+        for m in 1..min_repeats {
+            let idx = n - (pattern_len * m + offset_in_window);
+            if tokens[idx] != target {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// 2026-05-24 v3: vLLM-style anchored variant of the digit-normalized
+/// detector. Same end-anchored check as [`detect_token_loop`] PLUS
+/// the digit-normalized predicate: the matched window (last
+/// `pattern_len` tokens) must contain BOTH a [`NUMERIC_SENTINEL`] and
+/// a non-sentinel token. Without that mix, pure-number columns or
+/// pure-prose loops would trip here (the exact detector's job).
 fn detect_token_loop_with_period(
     tokens: &[u32],
     period_min: usize,
     period_max: usize,
     min_repeats: usize,
-    scan_window: usize,
+    _scan_window: usize,
 ) -> bool {
     let n = tokens.len();
-    let tail_start = n.saturating_sub(scan_window);
-    let tail = &tokens[tail_start..];
-    for period in period_min..=period_max {
-        if tail.len() < period * min_repeats {
+    if min_repeats < 2 {
+        return false;
+    }
+    let period_min = period_min.max(1);
+    for pattern_len in period_min..=period_max {
+        if pattern_len * min_repeats > n {
+            return false;
+        }
+        let window = &tokens[n - pattern_len..];
+        let has_numeric = window.contains(&NUMERIC_SENTINEL);
+        let has_structural = window.iter().any(|&t| t != NUMERIC_SENTINEL);
+        if !(has_numeric && has_structural) {
             continue;
         }
-        let needle = &tail[tail.len() - period..];
-        let needle_ok =
-            needle.contains(&NUMERIC_SENTINEL) && needle.iter().any(|&t| t != NUMERIC_SENTINEL);
-        if !needle_ok {
-            continue;
-        }
-        let mut count = 0usize;
-        let mut pos = 0usize;
-        while pos + period <= tail.len() {
-            if &tail[pos..pos + period] == needle {
-                count += 1;
-                if count >= min_repeats {
-                    return true;
-                }
-                pos += period; // non-overlapping
-            } else {
-                pos += 1;
-            }
+        if has_repeating_pattern_anchored(tokens, pattern_len, min_repeats) {
+            return true;
         }
     }
     false

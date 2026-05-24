@@ -24,6 +24,7 @@ mod handle_done;
 mod handle_error;
 mod handle_token;
 mod state;
+mod strip;
 mod tool_handlers;
 
 use axum::http::StatusCode;
