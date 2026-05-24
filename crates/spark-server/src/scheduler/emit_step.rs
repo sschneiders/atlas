@@ -93,11 +93,30 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     // scoping: when true, the main decode path zeroes
     // repetition/presence/frequency/DRY so legitimate JSON
     // micro-repetition (`":"`, `","`, key names) is not penalised.
+    //
+    // Stuck-in-tool-body watchdog (2026-05-24, NVFP4 doom-loop fix):
+    // some models emit `<tool_call>` opener and never reach the close
+    // — burns to max_tokens with the sanitizer suppressing as orphan.
+    // `tool_body_streak_tokens` counts consecutive tokens spent inside
+    // a tool body; when it exceeds `MAX_TOOL_BODY_TOKENS` (1024) we
+    // end the response cleanly. Resets to 0 on close.
+    const MAX_TOOL_BODY_TOKENS: u32 = 1024;
     if !a.inside_thinking {
         if a.tool_call_start_token == Some(tok) {
             a.inside_tool_body = true;
+            a.tool_body_streak_tokens = 0;
         } else if a.tool_call_end_token == Some(tok) {
             a.inside_tool_body = false;
+            a.tool_body_streak_tokens = 0;
+        } else if a.inside_tool_body {
+            a.tool_body_streak_tokens = a.tool_body_streak_tokens.saturating_add(1);
+            if a.tool_body_streak_tokens > MAX_TOOL_BODY_TOKENS {
+                tracing::warn!(
+                    streak = a.tool_body_streak_tokens,
+                    "Stuck in tool body for {MAX_TOOL_BODY_TOKENS}+ tokens with no </tool_call>; ending response (model never closed the envelope — would otherwise burn to max_tokens). Sanitizer will salvage what it can."
+                );
+                a.finished = true;
+            }
         }
     }
 

@@ -304,6 +304,7 @@ pub fn resume_swapped_seq(
         // the snapshot was mid-tool-call, the sample path needs a
         // safe default. Cleared at next emit if we re-cross a marker.
         inside_tool_body: false,
+        tool_body_streak_tokens: 0,
         tool_call_end_token: s.tool_call_end_token,
         // Grammar state is not serializable; resumed sequences use legacy fallback.
         grammar_state: None,

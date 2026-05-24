@@ -175,6 +175,17 @@ pub(super) struct ActiveSeq {
     /// True between emission of `<tool_call>`/`<function=…>` (open) and
     /// `</tool_call>`/`</function>` (close).
     pub inside_tool_body: bool,
+    /// Consecutive tokens emitted while `inside_tool_body=true`. When
+    /// this exceeds `MAX_TOOL_BODY_TOKENS` (emit_step.rs), the response
+    /// is force-ended: the model has emitted a `<tool_call>` opener but
+    /// never reached a matching close — observed live 2026-05-24 on
+    /// NVFP4 Qwen3.6 (opencode-nvfp4.jsonl seq=15: 8221 tokens, all
+    /// suppressed by sanitizer as unclosed tool-call envelope, hit
+    /// max_tokens=8192). 1024 tokens is enough headroom for legitimate
+    /// long tool-call bodies (large `content` field on a `write` call)
+    /// while bounding worst-case wasted decode at ~15s @ 65 tok/s.
+    /// Resets to 0 on tool_call_end emission.
+    pub tool_body_streak_tokens: u32,
     /// When true, `<tool_call>` token logit is set to -inf during decode.
     pub suppress_tool_call: bool,
     /// F60 (2026-04-27): when true, MTP speculative decoding is bypassed.
