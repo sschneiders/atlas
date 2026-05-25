@@ -55,12 +55,19 @@ pub fn load_fp8_block_scaled_as_fp8weight(
         s.shape[1],
     );
 
-    // Pass block scales directly — the w8a16_gemv kernel handles 2D indexing
+    // Pass block scales directly — `scale_format = Fp8BlockScaled` tells
+    // downstream call sites this is `[N/BS, K/BS]` BF16, NOT `[N]` F32.
+    // Atlas's existing `w8a16_gemv` handles the 2D-indexed lookup for
+    // matrix paths; the SSM `fp8_gemm_n128` path takes no scale arg and
+    // is INCOMPATIBLE with block-scaled FP8 (would silently produce
+    // unscaled output). Use `WeightQuantFormat::expect(...)` at every
+    // kernel call to enforce.
     Ok(Fp8Weight {
         weight: weight_ptr,
         row_scale: s.ptr, // BF16 [N/BS, K/BS] block scales on GPU
         n: n as u32,
         k: k as u32,
+        scale_format: WeightQuantFormat::Fp8BlockScaled,
     })
 }
 

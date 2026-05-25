@@ -73,6 +73,14 @@ effective_context = 24576
 #   presence_penalty=0.0 (Qwen's 1.5 is a recipe for non-agentic chat)
 #   repetition_penalty=1.1 (industry-norm light penalty)
 #   dry_multiplier=0.5 (SGLang default; catches verbatim loops)
+# 2026-05-25 evening: REVERTED removal of rep_penalty / dry_multiplier
+# from prose categories. The Phase-2c day-4 removal was based on a
+# synthetic short-prompt A/B (T3 axum endpoint) that doesn't match the
+# live opencode workload. With rep_pen=0 the model emits filename
+# garbage like `Cargo.toml.new.tmp.bak1.tmp.newnewnew.tmp.oldoldold` in
+# tool arguments — runaway repetition attractor that DRY catches.
+# Phase-1's MODEL.toml had these penalties across the board and shipped
+# clean opencode sessions; matching that exactly.
 [sampling.thinking_text]
 temperature = 0.6
 top_p = 0.95
@@ -130,17 +138,53 @@ enable_loop_watchdog = true
 # via chat_template_kwargs.enable_thinking still wins; CLI --disable-thinking
 # is the kill-switch.
 thinking_default = true
-# Thinking ENABLED during tool-active turns. Earlier (2026-05-23) this was
-# flipped to false as a hotfix for the `<tool_call>`-inside-`<think>` leak;
-# a follow-up Phase-γ ablation pinpointed F1 (the reflection-token penalty
-# at decode_logits_seq.rs) as the actual cause — penalising
-# `wait`/`however`/`actually`/`hmm` by -10 logit during thinking shifted
-# the distribution toward emitting the `<tool_call>` XML scaffolding shown
-# in the system prompt as the next-highest-probability "thinking"
-# continuation. F1 has now been deleted entirely (HF transformers has no
-# analogue and didn't reproduce the leak even on Atlas's exact prompt with
-# 10 literal `<tool_call>` demos), so thinking-in-tools is safe to re-enable.
+# Thinking DURING TOOL-ACTIVE turns — toggle history:
+#
+# 2026-05-23: false (initial hotfix for `<tool_call>`-inside-`<think>` leak)
+# 2026-05-23 evening: true (F1 reflection-penalty deleted; Phase-1 test
+#   suite 13/14 paths clean with thinking-in-tools=true)
+# 2026-05-25 morning: false (live opencode A/B against Phase-1 image
+#   showed thinking-in-tools=true produced chat-template artefacts in
+#   reasoning + single tool call; false produced clean reasoning +
+#   2 parallel tool calls in the synthetic test)
+# 2026-05-25 noon: true (REVERTED back. opencode session
+#   `ses_1a0e59bc7ffeFKSvtvWqoswsll` with thinking=false produced
+#   CATASTROPHIC tool-body repetition: filename garbage extending
+#   5000+ tokens with dictionary-dump content, after the model
+#   couldn't pre-plan the tool args. The synthetic A/B was misleading
+#   — short prompts work fine without thinking, but real agentic
+#   coding tool args degenerate. Pair this with the native FP8 SSM
+#   dispatch revert (load_layers.rs LinearAttention arm) to restore
+#   the Phase-1 path that empirically generated clean opencode
+#   sessions. The chat-template `<|im_start|>assistant\n<think>\n`
+#   prefix isn't free, but the cost of unplanned tool-arg emission
+#   on FP8 is worse than the cost of a CoT preamble.)
+# 2026-05-25 afternoon: false (kept). Phase-1's clean opencode runs used
+#   `thinking_in_tools=false` AND the NVFP4-SSM detour. My broken sessions
+#   used `thinking_in_tools=false` AND the native FP8 SSM dispatch. The
+#   variable that actually matters is the SSM dispatch, not thinking.
+#   Reverting SSM to NVFP4 (load_layers.rs LinearAttention arm) restores
+#   the Phase-1 path. Keep thinking_in_tools=false to match Phase-1
+#   exactly — adding thinking pre-planning was a workaround for a SSM
+#   issue that's now fixed at the root.
+# 2026-05-25 evening: true. User observation: with thinking_in_tools=false,
+#   opencode shows ZERO thinking blocks — chat template skips `<think>\n`
+#   prefix on tool-active turns so the model goes straight to content. With
+#   complex agentic tasks (write file content) the model needs planning
+#   room. Combined with PR 73's qwen3_xml parser, the model can think then
+#   emit clean typed args.
 thinking_in_tools = true
+# PR 73 qwen3_xml REVERTED 2026-05-25 PM. Live opencode v40 test:
+# under thinking_in_tools=true + qwen3_xml, the model emitted COMPLETELY
+# garbled tool args — `command: '/tmp/test-rust-axum-v40'` (path as
+# command), `command: 'description'` (field name as value),
+# `command: ': No such file or directory'` (error message echoed back as
+# command). The qwen3_xml type-coercion path interacted poorly with
+# the FP8 model's reasoning under the long opencode system prompt.
+# Default qwen3_coder is the proven path for our "MUCH better" state
+# (the user's recall: thinking + tool-calling working nicely, didn't
+# completely finish the job).
+# tool_call_parser = "qwen3_xml"  # disabled
 # Maximum thinking budget (tokens). Prevents overthinking.
 # Client-specified budget takes precedence if lower.
 #

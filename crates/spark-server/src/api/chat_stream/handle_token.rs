@@ -106,7 +106,10 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
                 let stable = full.trim_end_matches('\u{FFFD}');
                 if stable.len() > state.emitted {
                     let residual = &stable[state.emitted..];
-                    if !residual.trim().is_empty() {
+                    // Same fix as the in-loop emit: whitespace-only residuals
+                    // are legitimate `\n   ` indents that the model emitted;
+                    // dropping them would lose chars permanently.
+                    if !residual.is_empty() {
                         let chunk = ChatCompletionChunk::reasoning_chunk(
                             &ctx.model,
                             &ctx.id,
@@ -124,7 +127,9 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
             // bytes are intentionally not surfaced.
             if !state.reasoning_suppressing_leak && !state.reasoning_tag_scan_buf.is_empty() {
                 let tail = std::mem::take(&mut state.reasoning_tag_scan_buf);
-                if !tail.trim().is_empty() {
+                // Whitespace-only tail can be a real trailing `\n   ` indent
+                // — emit anything non-empty so byte boundaries align.
+                if !tail.is_empty() {
                     let chunk = ChatCompletionChunk::reasoning_chunk(
                         &ctx.model,
                         &ctx.id,
@@ -275,7 +280,17 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
                     &mut state.reasoning_inside_envelope,
                     &ctx.leak_markers,
                 );
-                if !cleaned.trim().is_empty() {
+                // Emit whitespace-only chunks too. The `sanitize_content_chunk`
+                // holdback can roll out runs of `\n   ` (newline + indent) as
+                // a single committed chunk when the suffix exceeds tag_max
+                // chars; dropping those via `trim().is_empty()` permanently
+                // loses byte boundaries because `state.emitted` already
+                // advanced past them. Symptom: streamed reasoning has
+                // `**\n -Calculate` where the model actually emitted
+                // `**\n   - Calculate` — verified byte-for-byte against the
+                // non-streaming response on temp=0 seed=42 (live A/B
+                // 2026-05-25). Drop only TRULY empty chunks.
+                if !cleaned.is_empty() {
                     let chunk = ChatCompletionChunk::reasoning_chunk(&ctx.model, &ctx.id, cleaned);
                     let json = serde_json::to_string(&chunk).unwrap_or_default();
                     sse_events.push(Ok(Event::default().data(json)));
@@ -285,25 +300,45 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
         return sse_events;
     }
 
-    // ── Content phase: incremental decode via DecodeStream ───────────
-    let decoder = state.content_decoder.get_or_insert_with(|| {
-        // SAFETY: ctx.state (Arc<AppState>) is owned by the closure
-        // and lives for its entire duration. The DecodeStream borrows
-        // &Tokenizer from it. We extend the lifetime because the Arc
-        // guarantees the tokenizer outlives the closure (and thus
-        // the DecodeStream).
-        let tokenizer_ref: &'static crate::tokenizer::ChatTokenizer =
-            unsafe { &*(&ctx.state.tokenizer as *const crate::tokenizer::ChatTokenizer) };
-        tokenizer_ref.streaming_decoder(true)
-    });
-    let mut delta = match decoder.step(tok) {
-        Ok(Some(chunk)) => chunk,
-        Ok(None) => return sse_events,
-        Err(e) => {
-            tracing::warn!("Streaming decoder error: {e:?}");
-            return sse_events;
-        }
+    // ── Content phase: full-decode + slice (matches reasoning path) ──
+    //
+    // Previously this path used the HF `tokenizers` crate's
+    // `DecodeStream` (`decoder.step(tok)`). That incremental decoder
+    // drops the leading metaspace byte at certain BPE-token boundaries
+    // for byte-level tokenizers like Qwen's GPT-2-style BPE — verified
+    // live 2026-05-25 against the FP8 Qwen3.6 model, opencode session
+    // `ses_1a0e59bc7ffeFKSvtvWqoswsll`: tool-call `<parameter=content>`
+    // for a Cargo.toml emitted `name = test-rust-axum-v32version =
+    // 0.1.0edition = 2021` (no newlines between fields, no quotes
+    // around values). Non-streaming `tokenizer.decode(&all_toks)`
+    // for the same tokens produces the correct multi-line TOML.
+    //
+    // The fix: mirror the reasoning path — keep `state.all_toks`
+    // populated with content tokens (already done at line 86), decode
+    // the cumulative list, and emit the byte slice that's stable past
+    // `state.emitted`. `trim_end_matches('\u{FFFD}')` defers any
+    // incomplete UTF-8 multi-byte sequence at the tail until the next
+    // token completes it. `state.all_toks` and `state.emitted` are
+    // reset at `</think>` (line 147), so this slice references the
+    // post-thinking content only.
+    let full = ctx
+        .state
+        .tokenizer
+        .decode(&state.all_toks)
+        .unwrap_or_default();
+    let stable_end = full.trim_end_matches('\u{FFFD}').len();
+    let _ = tok; // tok already in state.all_toks via line 86
+    let mut delta = if stable_end > state.emitted {
+        let raw = full[state.emitted..stable_end].to_string();
+        state.emitted = stable_end;
+        raw
+    } else {
+        return sse_events;
     };
+    // Retire the lazy `content_decoder` field — kept in StreamState
+    // only to avoid a wider state-struct migration. The HF decoder is
+    // no longer the source of truth.
+    let _ = &state.content_decoder;
 
     // Strip residual think tags from content after thinking is done.
     if state.thinking_done {

@@ -197,6 +197,10 @@ pub(crate) async fn chat_completions_stream(
         stop_strings,
         stop_string_buffer_len,
         leak_markers,
+        wants_typed_arguments: state
+            .tool_call_parser
+            .as_ref()
+            .is_some_and(|p| p.wants_typed_arguments()),
         max_tool_calls_per_response,
         req_stream_include_usage,
         req_ctx,

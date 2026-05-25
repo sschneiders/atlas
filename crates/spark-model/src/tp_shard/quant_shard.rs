@@ -202,6 +202,7 @@ pub fn shard_fp8_block_scaled(
                 row_scale: s_dst,
                 n: local_n as u32,
                 k: src.k,
+                scale_format: src.scale_format,
             })
         }
         TpShardKind::RowParallel => {
@@ -246,6 +247,7 @@ pub fn shard_fp8_block_scaled(
                 row_scale: s_dst,
                 n: src.n,
                 k: local_k as u32,
+                scale_format: src.scale_format,
             })
         }
     }

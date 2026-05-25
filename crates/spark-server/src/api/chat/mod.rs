@@ -98,6 +98,26 @@ pub(crate) async fn chat_completions_inner(
         && req.tools.as_ref().is_some_and(|t| !t.is_empty())
         && !req.tool_choice.as_ref().is_some_and(|tc| tc.is_none());
 
+    // Tool-parser behavioral system prompt REMOVED again (2026-05-25 PM).
+    //
+    // Re-injecting the qwen3_coder `system_prompt` (with its
+    // `<parameter=content>[package]\nname = "x"</parameter>` example
+    // and `For 'Write'/'Edit' tools specifically: ...` guidance) was a
+    // mid-day attempt to give the model better multi-line content
+    // hints. Live opencode v39 session showed the opposite effect:
+    // the model emitted LITERAL `<tool_call><bash><command>` XML as
+    // CONTENT (with HTML-entity escaping like `&amp;`) because TWO
+    // tool-format guidances were competing — the chat template's
+    // `tools` argument AND my injected prompt — combined with PR 73's
+    // `qwen3_xml` parser. The model got confused which format to use
+    // and emitted free-form XML that the parser couldn't recognise.
+    //
+    // Per user's recall: the "MUCH better" state had `thinking_in_tools=true`
+    // and the chat template alone (no injection). Reverting matches
+    // that state. PR 73's qwen3_xml + native FP8 SSM + streaming
+    // byte-exact + gate-BF16 + thinking_in_tools=true is the live
+    // combination.
+
     tracing::info!(
         "Request: model={}, messages={}, tools={}, tools_active={}, tool_choice={:?}, stream={}, temp={:?}, max_tokens={}, freq_pen={:?}, rep_pen={:?}",
         req.model,

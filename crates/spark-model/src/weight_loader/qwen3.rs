@@ -144,6 +144,12 @@ impl ModelWeightLoader for Qwen3WeightLoader {
                     row_scale: DevicePtr::NULL,
                     n: 0,
                     k: 0,
+                    // Placeholder for absent shared-expert tensor: the
+                    // calling site checks `weight == NULL` before
+                    // launching any kernel, so the tag is conventional.
+                    // Match the block-scaled FP8 loader the other
+                    // arms use so the format is consistent.
+                    scale_format: crate::weight_map::WeightQuantFormat::Fp8BlockScaled,
                 };
                 let sh_gate =
                     load_fp8_block_scaled_as_fp8weight(store, &format!("{sp}.gate_proj"), gpu);

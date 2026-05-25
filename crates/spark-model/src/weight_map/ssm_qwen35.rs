@@ -235,25 +235,22 @@ pub(crate) fn load_moe_qwen35_fp8_experts(
                 )?,
             });
         } else {
+            // Remote-expert placeholder: NULL pointers never dereferenced.
+            // `Fp8BlockScaled` chosen as the format tag because that's the
+            // dominant disk format for Qwen FP8 checkpoints — keeps the
+            // tag consistent with what the routed expert would carry if
+            // it weren't remote.
+            let null_block = Fp8Weight {
+                weight: DevicePtr::NULL,
+                row_scale: DevicePtr::NULL,
+                n: 0,
+                k: 0,
+                scale_format: WeightQuantFormat::Fp8BlockScaled,
+            };
             fp8_experts.push(Fp8ExpertWeight {
-                gate_proj: Fp8Weight {
-                    weight: DevicePtr::NULL,
-                    row_scale: DevicePtr::NULL,
-                    n: 0,
-                    k: 0,
-                },
-                up_proj: Fp8Weight {
-                    weight: DevicePtr::NULL,
-                    row_scale: DevicePtr::NULL,
-                    n: 0,
-                    k: 0,
-                },
-                down_proj: Fp8Weight {
-                    weight: DevicePtr::NULL,
-                    row_scale: DevicePtr::NULL,
-                    n: 0,
-                    k: 0,
-                },
+                gate_proj: null_block,
+                up_proj: null_block,
+                down_proj: null_block,
             });
         }
     }

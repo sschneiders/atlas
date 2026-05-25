@@ -148,19 +148,42 @@ pub(super) fn load_layers(
             stream,
             skip_nvfp4_experts,
         )?;
-        let gate_nvfp4 = quantize_to_nvfp4(
-            &moe_weights.gate,
-            config.num_experts,
-            h,
-            gpu,
-            absmax_k,
-            quantize_k,
-            stream,
-        )?;
+        // 2026-05-25 (final): gate stays in BF16 for `native_fp8` —
+        // routes through `dense_gemm` BF16 fallback path.
+        //
+        // The MoE gate is a `[num_experts=512, h=2048]` BF16 matrix on
+        // disk (explicitly `ignored_layers` in the FP8 release's
+        // quantization_config). Runtime-quantizing it to NVFP4 (4-bit
+        // E2M1) destroys the precision the router needs at late layers
+        // where the top-8 weights cluster in `[0.105, 0.168]` — the
+        // 4-bit ULP is wider than that range, so the router can't
+        // distinguish them. The dense-code-output regression we see
+        // on opencode multi-turn (`\n` collapsed to ` ` in tool-call
+        // `content` args, `</br>` substituted for newlines, all on
+        // first emission with the native FP8 SSM dispatch active)
+        // is the visible symptom — the model wants to emit a
+        // structure token but the post-MoE residual has drifted
+        // toward a nearby-but-wrong attractor. Memory cost: 2 MB ×
+        // 40 layers ≈ 80 MB. Non-FP8 variants keep the runtime
+        // NVFP4 quantize (matched-shape self-compensation with
+        // the on-disk NVFP4 experts).
+        let gate_nvfp4 = if native_fp8 {
+            None
+        } else {
+            Some(quantize_to_nvfp4(
+                &moe_weights.gate,
+                config.num_experts,
+                h,
+                gpu,
+                absmax_k,
+                quantize_k,
+                stream,
+            )?)
+        };
         let mut moe_layer = MoeLayer::new(
             moe_weights,
             config.num_experts,
-            Some(gate_nvfp4),
+            gate_nvfp4,
             gpu,
             config,
         )?;
@@ -193,6 +216,12 @@ pub(super) fn load_layers(
                 row_scale: DevicePtr::NULL,
                 n: 0,
                 k: 0,
+                // Placeholder for absent shared-expert tensor: the
+                // calling site checks `weight == NULL` before
+                // launching any kernel, so the tag is conventional.
+                // Match the block-scaled FP8 loader the other arms
+                // use so the format is consistent.
+                scale_format: crate::weight_map::WeightQuantFormat::Fp8BlockScaled,
             };
             let sh_gate =
                 load_fp8_block_scaled_as_fp8weight(store, &format!("{sp}.gate_proj"), gpu);
@@ -333,37 +362,63 @@ pub(super) fn load_layers(
             }
             // LinearAttention dispatch.
             //
-            // The native-FP8 LinearAttention arm `build_linear_attention_fp8`
-            // (linear_attn_arms.rs:24) cannot be enabled without further
-            // kernel work: it relies on per-row F32 scales in
-            // `Fp8Weight::row_scale`, but Qwen3.6's FP8 checkpoint ships
-            // per-BLOCK BF16 scales (shape `[N/BS, K/BS]`).
-            // `load_fp8_block_scaled_as_fp8weight` stuffs those block scales
-            // into `row_scale` and downstream code reads them as per-row F32,
-            // causing a `cuMemcpyDtoDAsync_v2 INVALID_VALUE` at layer 0 the
-            // moment a concat tries to copy `N * 4` bytes from a `(N/BS) *
-            // (K/BS) * 2`-byte buffer (verified live 2026-05-24).
+            // For `Fp8Dequanted` checkpoints (Qwen3.6-A3B-FP8), route
+            // through the native-FP8 build that keeps decode in
+            // block-scaled FP8 via `w8a16_gemv` (no 4-bit NVFP4 detour).
+            // Prior to 2026-05-24 this branch was dead-coded because the
+            // scale-concat in `build_linear_attention_fp8` did per-row
+            // F32 byte math against a per-BLOCK BF16 buffer; that's now
+            // fixed to copy block rows at the correct stride.
+            // CAUSAL-PATHWAY-AUDIT Bug #1 closed.
             //
-            // Until the SSM FP8 kernel chain (`fp8_gemm_n128`) is rewritten
-            // to consume block scales, this arm stays on the NVFP4 path even
-            // for `Fp8Dequanted`. The CAUSAL-PATHWAY-AUDIT Bug #1 remains
-            // open; switching to the NVFP4 checkpoint (RedHatAI/...-NVFP4)
-            // is the production workaround.
+            // All other variants (NVFP4 native, BF16, etc.) keep the
+            // existing NVFP4-quantized decode path.
+            // LinearAttention dispatch.
+            //
+            // Native FP8 SSM path lit for `Fp8Dequanted` checkpoints
+            // (Qwen3.6-35B-A3B-FP8). Decode runs `w8a16_gemv` with
+            // block-scaled FP8 weights + `[N/BS,K/BS] BF16` scales
+            // directly off disk — no BF16→NVFP4 detour. Prefill stays
+            // on single-scale FP8 via `bf16_to_fp8` + `fp8_gemm_n128`.
+            // See `linear_attn_arms::build_linear_attention_fp8` for
+            // the byte-exact concat math (qkv + z along the N-block
+            // axis at `(K/BS) * 2` bytes per scale row, BS=128). The
+            // 2026-05-25 revert to the NVFP4 detour was a debugging
+            // workaround — re-enabled now since downgrading hides the
+            // real progress signal on the FP8 implementation.
+            //
+            // All non-FP8 variants (NVFP4 native, BF16, etc.) take the
+            // existing NVFP4-quantized decode path.
             LayerType::LinearAttention => {
-                let layer = linear_attn_arms::build_linear_attention_nvfp4(
-                    store,
-                    &lp,
-                    gpu,
-                    variant,
-                    config,
-                    h,
-                    absmax_k,
-                    quantize_k,
-                    stream,
-                    input_norm,
-                    post_attn_norm,
-                    ffn,
-                )?;
+                let layer = match variant {
+                    Nvfp4Variant::Fp8Dequanted => linear_attn_arms::build_linear_attention_fp8(
+                        i,
+                        store,
+                        &lp,
+                        gpu,
+                        variant,
+                        config,
+                        h,
+                        stream,
+                        input_norm,
+                        post_attn_norm,
+                        ffn,
+                    )?,
+                    _ => linear_attn_arms::build_linear_attention_nvfp4(
+                        store,
+                        &lp,
+                        gpu,
+                        variant,
+                        config,
+                        h,
+                        absmax_k,
+                        quantize_k,
+                        stream,
+                        input_norm,
+                        post_attn_norm,
+                        ffn,
+                    )?,
+                };
                 layers.push(layer);
             }
             LayerType::Moe => unreachable!("Qwen3.5 has no standalone MoE layers"),

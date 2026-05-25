@@ -197,13 +197,34 @@ impl Qwen3SsmLayer {
         Ok(layer)
     }
 
-    /// Set native FP8 checkpoint weights for w8a16_gemv decode path.
-    /// Also sets the raw FP8 DevicePtr fields for prefill GEMM (fp8_gemm_t).
-    pub fn set_fp8_weights(&mut self, qkvz: Option<Fp8Weight>, out_proj: Option<Fp8Weight>) {
-        // Set raw FP8 DevicePtr for prefill GEMM (fp8_gemm_t, no per-row scale needed)
-        self.qkvz_fp8 = qkvz.as_ref().map(|w| w.weight);
-        self.out_proj_fp8 = out_proj.as_ref().map(|w| w.weight);
-        // Set Fp8Weight for decode GEMV (w8a16_gemv, needs per-row scale)
+    /// Install native FP8 block-scaled weights for the decode GEMV path.
+    ///
+    /// Inputs MUST be tagged `WeightQuantFormat::Fp8BlockScaled` — that is
+    /// the canonical input format for the `w8a16_gemv` kernel
+    /// (`out[n] = sum_k A[k] * E4M3_LUT[B[n,k]] * block_scale[n/BS, k/BS]`,
+    /// see `kernels/gb10/common/w8a16_gemv.cu`). The kernel reads the
+    /// scale buffer at `[N/BS, K/BS]` BF16 — exactly the shape produced
+    /// by `load_fp8_block_scaled_as_fp8weight`.
+    ///
+    /// This setter does NOT install the raw FP8 DevicePtr fields used by
+    /// the prefill `fp8_gemm_n128` kernel — that kernel takes no scale
+    /// argument and assumes single-scale FP8 (baked-in scale) produced
+    /// by `bf16_to_fp8`. Block-scaled bytes would silently produce wrong
+    /// outputs there. For prefill, call `set_fp8_prefill_only_weights`
+    /// separately with single-scale FP8 derived from a BF16 dequant.
+    pub fn set_fp8_decode_weights(&mut self, qkvz: Option<Fp8Weight>, out_proj: Option<Fp8Weight>) {
+        if let Some(ref w) = qkvz {
+            w.scale_format.expect(
+                crate::weight_map::WeightQuantFormat::Fp8BlockScaled,
+                "set_fp8_decode_weights::qkvz (w8a16_gemv expects [N/BS,K/BS] BF16 block scales)",
+            );
+        }
+        if let Some(ref w) = out_proj {
+            w.scale_format.expect(
+                crate::weight_map::WeightQuantFormat::Fp8BlockScaled,
+                "set_fp8_decode_weights::out_proj (w8a16_gemv expects [N/BS,K/BS] BF16 block scales)",
+            );
+        }
         self.qkvz_fp8w = qkvz;
         self.out_proj_fp8w = out_proj;
     }

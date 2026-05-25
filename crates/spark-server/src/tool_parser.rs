@@ -250,6 +250,17 @@ pub trait ToolCallParser: Send + Sync {
     fn has_tool_grammar(&self) -> bool {
         false
     }
+
+    /// F71 (2026-04-29): "broken opener" stop strings.
+    fn broken_opener_stop_strings(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Whether this parser wants schema-driven type coercion applied to
+    /// parsed arguments (string → integer/boolean/array/object).
+    fn wants_typed_arguments(&self) -> bool {
+        false
+    }
 }
 
 impl std::fmt::Display for dyn ToolCallParser {
@@ -265,6 +276,7 @@ impl std::fmt::Display for dyn ToolCallParser {
 pub enum ToolCallFormat {
     Hermes,
     Qwen3Coder,
+    Qwen3Xml,
     Gemma4,
     Mistral,
     MinimaxXml,
@@ -277,12 +289,13 @@ impl std::str::FromStr for ToolCallFormat {
         match s {
             "hermes" => Ok(Self::Hermes),
             "qwen3_coder" => Ok(Self::Qwen3Coder),
+            "qwen3_xml" => Ok(Self::Qwen3Xml),
             "gemma4" => Ok(Self::Gemma4),
             "mistral" => Ok(Self::Mistral),
             "minimax_xml" => Ok(Self::MinimaxXml),
             "bare_json" => Ok(Self::BareJson),
             other => Err(format!(
-                "Unknown tool call parser '{other}'. Supported: hermes, qwen3_coder, gemma4, mistral, minimax_xml, bare_json",
+                "Unknown tool call parser '{other}'. Supported: hermes, qwen3_coder, qwen3_xml, gemma4, mistral, minimax_xml, bare_json",
             )),
         }
     }
@@ -294,6 +307,7 @@ impl ToolCallFormat {
         match self {
             Self::Hermes => Box::new(HermesParser),
             Self::Qwen3Coder => Box::new(Qwen3CoderParser),
+            Self::Qwen3Xml => Box::new(Qwen3XmlParser),
             Self::Gemma4 => Box::new(Gemma4Parser),
             Self::Mistral => Box::new(MistralNativeParser),
             Self::MinimaxXml => Box::new(MinimaxXmlParser),
@@ -319,6 +333,7 @@ impl ToolCallFormat {
         match self {
             Self::Hermes => "hermes",
             Self::Qwen3Coder => "qwen3_coder",
+            Self::Qwen3Xml => "qwen3_xml",
             Self::Gemma4 => "gemma4",
             Self::Mistral => "mistral",
             Self::MinimaxXml => "minimax_xml",
@@ -345,8 +360,10 @@ mod parse_tools_tag;
 mod pipeline;
 mod pipeline_helpers;
 mod qwen3_coder;
+mod qwen3_xml;
 mod streaming;
 mod streaming_impl;
+mod type_coerce;
 mod validation;
 
 pub use bare_json::*;
@@ -363,6 +380,8 @@ use parse_tools_tag::*;
 pub use pipeline::*;
 use pipeline_helpers::*;
 pub use qwen3_coder::*;
+pub use qwen3_xml::*;
+pub use type_coerce::coerce_all;
 pub use streaming::*;
 pub use validation::*;
 

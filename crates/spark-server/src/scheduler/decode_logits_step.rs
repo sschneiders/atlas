@@ -351,14 +351,24 @@ pub fn process_decode_logits(
         // emerge into content mode briefly (often emitting a bare
         // `<write>\n\n` opener) and immediately sample EOS — the
         // session ends with a partial tool-call shell but no real
-        // call. We require at least POST_THINK_MIN_CONTENT non-thinking
-        // tokens after `think_ended` before EOS is allowed, giving the
-        // model the room to actually open a `<tool_call>` block. Same
-        // shape as the existing `min_tokens` guard, but counted from
-        // the `</think>` boundary so it doesn't penalise turns that
-        // never entered thinking. 16 tokens is enough to start
-        // `<tool_call>\n<function=NAME>\n<parameter=…` and is well
-        // below typical real tool-call output sizes (>100 tokens).
+        // call. POST_THINK_MIN_CONTENT requires N non-thinking tokens
+        // after `think_ended` before EOS is allowed, giving the model
+        // room to actually open a `<tool_call>` block.
+        //
+        // 2026-05-24 narrowing (verified live against Qwen3.6-35B-A3B-FP8
+        // T1-T6 battery): the guard was firing UNCONDITIONALLY for every
+        // post-`</think>` response under 16 content tokens, including
+        // genuine short-answer turns ("2+2"→"4", "first 5 primes"
+        // →"2,3,5,7,11", "haiku featuring blue"→single line). The model
+        // had emitted a perfectly valid short answer + `<|im_end|>` —
+        // the guard then forced the model to keep generating, and it
+        // collapsed into chat-template artefacts (`\nuser\nassistant\n`)
+        // because there's no natural continuation. Scope the guard to
+        // tool-call-eligible turns: when tools are armed (require_tool_call
+        // OR `tools_active` per-seq) we keep the suppression; otherwise
+        // a short post-thinking answer is the expected output and EOS
+        // should fire normally. `min_tokens_suppresses` still enforces
+        // any explicit caller-set floor.
         const POST_THINK_MIN_CONTENT: u32 = 16;
         let post_think_content_tokens =
             (a.output_tokens.len() as u32).saturating_sub(a.thinking_tokens);
