@@ -393,14 +393,30 @@ pub fn validate_single_tool_call(call: &ToolCall, tools: &[ToolDefinition]) -> R
     ];
     if WRITE_FAMILY.contains(&name.as_str()) {
         for key in PATH_KEYS {
-            if let Some(serde_json::Value::String(path)) = args.get(*key)
-                && path.trim().is_empty()
-            {
-                return Err(format!(
-                    "Error: {name} requires a non-empty '{key}'. \
-                         Got empty string — provide an absolute path \
-                         like '/tmp/calc-test75/Cargo.toml'."
-                ));
+            if let Some(serde_json::Value::String(path)) = args.get(*key) {
+                let trimmed = path.trim();
+                if trimmed.is_empty() {
+                    return Err(format!(
+                        "Error: {name} requires a non-empty '{key}'. \
+                             Got empty string — provide an absolute path \
+                             like '/tmp/calc-test75/Cargo.toml'."
+                    ));
+                }
+                // Epoch 4 (Tier-2): paths must look like paths. EBNF
+                // grammar enforces ≥1 non-WS non-`<` byte but the model
+                // sometimes satisfies with a single backslash (`\`) or
+                // other 1-char garbage. Real filesystem paths under
+                // opencode always have either an absolute leading `/`
+                // OR a relative `.` / `..`, AND are ≥2 chars long.
+                let starts_ok = trimmed.starts_with('/')
+                    || trimmed.starts_with("./")
+                    || trimmed.starts_with("../");
+                if !starts_ok || trimmed.len() < 3 {
+                    return Err(format!(
+                        "Error: {name} '{key}' must be a path starting with '/', './' or '../' \
+                         and at least 3 chars long. Got {path:?}."
+                    ));
+                }
             }
         }
     }
@@ -423,7 +439,7 @@ pub fn validate_single_tool_call(call: &ToolCall, tools: &[ToolDefinition]) -> R
     if SHELL_FAMILY.contains(&name.as_str()) {
         for key in CMD_KEYS {
             if let Some(serde_json::Value::String(cmd)) = args.get(*key)
-                && cmd.trim().is_empty()
+                && (cmd.trim().is_empty() || cmd.trim().len() < 2)
             {
                 return Err(format!(
                     "Error: {name} requires a non-empty '{key}'. \
