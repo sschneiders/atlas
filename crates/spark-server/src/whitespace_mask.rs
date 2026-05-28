@@ -70,6 +70,12 @@ pub fn init(tokenizer: &Tokenizer) {
     let vocab_size = tokenizer.get_vocab_size(true) as u32;
     let mut set: HashSet<u32> = HashSet::new();
     let mut digit_mask: Vec<bool> = vec![false; vocab_size as usize];
+    // ATLAS_WS_MASK_OFF=1 leaves the whitespace set EMPTY → WS1/WS2 become
+    // no-ops, matching vLLM (which applies no whitespace bias at all). Used
+    // to A/B whether the horizontal-whitespace mask is still needed now that
+    // the o_proj N/K fix removed the FP8 drift it was patching. The
+    // digit_mask is still computed (cheap, only read by the now-inert WS2).
+    let mask_off = std::env::var("ATLAS_WS_MASK_OFF").ok().as_deref() == Some("1");
     for id in 0..vocab_size {
         let Ok(decoded) = tokenizer.decode(&[id], false) else {
             continue;
@@ -77,7 +83,23 @@ pub fn init(tokenizer: &Tokenizer) {
         if decoded.is_empty() {
             continue;
         }
-        if decoded.chars().all(char::is_whitespace) {
+        // Mask HORIZONTAL whitespace only (space, tab, multi-space BPEs).
+        // Line-break tokens (`\n`, `\r`, `\n\n`, ` \n`, …) are EXCLUDED:
+        // #222 (2026-05-28) caught the WS mask demoting the model's
+        // legitimate top-1 newline (id 198) inside tool-param bodies,
+        // forcing the next-best non-whitespace token — `;`, ` &&`, ` ||` —
+        // which produced both the shell-fragment dir names (`created && ls`)
+        // and the collapsed-newline TOML (`[package] name = …`). The mask
+        // is meant to fix horizontal-whitespace FP8 drift (`0.1.0`→`0.1 .0`,
+        // leading spaces), NEVER to suppress line breaks, which are
+        // structurally required in multi-line content (bash, file content,
+        // TOML). vLLM has no such mask. Verified mechanism: see
+        // bench/fp8_dgx2_drift WS_MASK_DIAG.
+        if !mask_off
+            && decoded.chars().all(char::is_whitespace)
+            && !decoded.contains('\n')
+            && !decoded.contains('\r')
+        {
             set.insert(id);
         }
         // WS2 (2026-05-26): pre-compute the per-token "last char is

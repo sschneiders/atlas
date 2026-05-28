@@ -254,6 +254,10 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else {
+            // BF16 dense fallback. For native-FP8 models with
+            // ATLAS_FP8_DEQUANT_ATTN_TO_BF16=1, `dense` (= attn.{q,k,v}_proj)
+            // holds the FP8→BF16 dequanted weight; otherwise it is the
+            // model's native dense weight.
             ops::dense_gemm(
                 ctx.gpu,
                 self.dense_gemm_k,

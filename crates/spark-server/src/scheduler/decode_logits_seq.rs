@@ -672,6 +672,54 @@ pub fn process_seq_logits(
         }
     }
 
+    // WS-mask diagnostic (#222): when ATLAS_WS_MASK_DIAG=1 and we're inside
+    // a tool-param body, measure whether our whitespace/attractor logit_bias
+    // DEMOTES a token the model actually wanted. Compares pre-mask argmax
+    // (raw f32_logits) vs post-mask argmax (raw + logit_bias_local). If the
+    // model's top-1 was a whitespace token and the bias flips it away, that
+    // is the mechanism collapsing newlines inside TOML/code content. vLLM
+    // never masks whitespace, so any flip here is a pure Atlas-vs-vLLM
+    // divergence. Observe-only; does not change sampling.
+    if a.inside_parameter_body
+        && std::env::var("ATLAS_WS_MASK_DIAG").ok().as_deref() == Some("1")
+        && !logit_bias_local.is_empty()
+    {
+        let pre_argmax = f32_logits
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                if v > bv { (i, v) } else { (bi, bv) }
+            })
+            .0;
+        // Apply the local bias into a scratch copy to find post-mask argmax.
+        let mut biased = f32_logits.clone();
+        for &(tok, b) in &logit_bias_local {
+            if let Some(slot) = biased.get_mut(tok as usize) {
+                *slot += b;
+            }
+        }
+        let post_argmax = biased
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                if v > bv { (i, v) } else { (bi, bv) }
+            })
+            .0;
+        if pre_argmax != post_argmax
+            && crate::whitespace_mask::is_whitespace(pre_argmax as u32)
+        {
+            tracing::info!(
+                "WS_MASK_DIAG: param-body flip — model wanted ws tok {} (logit {:.3}) \
+                 but mask demoted it to tok {} (logit {:.3}); chars_emitted={}",
+                pre_argmax,
+                f32_logits[pre_argmax],
+                post_argmax,
+                f32_logits[post_argmax],
+                a.param_body_chars_emitted,
+            );
+        }
+    }
+
     let sampled = sample_with_params_history(
         f32_bytes,
         &SamplingParams {

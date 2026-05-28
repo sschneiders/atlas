@@ -439,13 +439,25 @@ pub fn validate_single_tool_call(call: &ToolCall, tools: &[ToolDefinition]) -> R
                 // double-quotes before the path-shape check so these
                 // drifted-but-recoverable calls still resolve. vLLM's
                 // tool_parser does similar leniency.
-                let starts_ok = trimmed.starts_with('/')
-                    || trimmed.starts_with("./")
-                    || trimmed.starts_with("../");
-                if !starts_ok || trimmed.len() < 3 {
+                // opencode resolves write paths against the agent cwd
+                // (`--dir`), so bare RELATIVE filenames like `Cargo.toml`
+                // or `src/main.rs` are legitimate — vLLM accepts them and
+                // the model emits them constantly. The previous rule
+                // required a `/`, `./`, or `../` prefix and rejected
+                // `Cargo.toml`, which made opencode loop on rejections and
+                // abandon the task. Accept any non-empty path EXCEPT ones
+                // carrying shell metacharacters / whitespace, which signal
+                // a leaked command (e.g. `created && ls -R`) rather than a
+                // real path — those we still reject (also closes CWE-78
+                // command-leak-as-path).
+                const SHELL_META: &[char] =
+                    &[' ', '\t', '\n', '\r', '&', '|', ';', '`', '$', '<', '>', '(', ')', '*', '?'];
+                let looks_like_command = trimmed.contains(SHELL_META);
+                if looks_like_command || trimmed.len() < 3 {
                     return Err(format!(
-                        "Error: {name} '{key}' must be a path starting with '/', './' or '../' \
-                         and at least 3 chars long. Got {path:?}."
+                        "Error: {name} '{key}' must be a filesystem path (absolute or relative \
+                         to the working directory), at least 3 chars, with no shell \
+                         metacharacters or whitespace. Got {path:?}."
                     ));
                 }
             }

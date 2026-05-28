@@ -208,6 +208,11 @@ pub(super) fn load_layers(
         // ~2× expert weights vs native FP8.
         let dequant_moe_to_bf16 = native_fp8
             && std::env::var("ATLAS_FP8_DEQUANT_MOE_TO_BF16").ok().as_deref() == Some("1");
+        // Diagnostic: dequant attention Q/K/V/O FP8→BF16 at load and run them
+        // through dense BF16 GEMM (isolates the FP8-attention contribution to
+        // the Atlas↔vLLM cosine floor). TP=1 only.
+        let dequant_attn_to_bf16 = native_fp8
+            && std::env::var("ATLAS_FP8_DEQUANT_ATTN_TO_BF16").ok().as_deref() == Some("1");
 
         if dequant_moe_to_bf16 {
             use crate::weight_map::dequant_fp8_blockscaled_to_bf16;
@@ -352,6 +357,60 @@ pub(super) fn load_layers(
         let ffn = FfnComponent::Moe(moe_layer);
 
         match lt {
+            LayerType::FullAttention if native_fp8 && dequant_attn_to_bf16 => {
+                // ── BF16-dequant attention (diagnostic, TP=1) ──
+                // Dequant FP8 Q/K/V/O → BF16 on GPU, store as dense weights,
+                // and leave q/k/v/o quant-weights None so both prefill and
+                // decode fall through to the dense GEMM/GEMV paths.
+                use crate::weight_map::dequant_fp8_blockscaled_to_bf16;
+                if config.tp_world_size.max(1) != 1 {
+                    anyhow::bail!(
+                        "ATLAS_FP8_DEQUANT_ATTN_TO_BF16 supports TP=1 only (got tp={})",
+                        config.tp_world_size,
+                    );
+                }
+                let p = format!("{lp}.self_attn");
+                tracing::info!("Layer {i}: dequanting attention Q/K/V/O FP8→BF16 (dense)");
+                let q_bf16 = dequant_fp8_blockscaled_to_bf16(store, &format!("{p}.q_proj"), gpu)?;
+                let k_bf16 = dequant_fp8_blockscaled_to_bf16(store, &format!("{p}.k_proj"), gpu)?;
+                let v_bf16 = dequant_fp8_blockscaled_to_bf16(store, &format!("{p}.v_proj"), gpu)?;
+                let o_bf16 = dequant_fp8_blockscaled_to_bf16(store, &format!("{p}.o_proj"), gpu)?;
+
+                let (k_scale, v_scale) = load_kv_scales(store, &p, gpu);
+                let dummy_qw = QuantizedWeight::null();
+                let attn = AttentionWeights {
+                    q_proj: q_bf16,
+                    k_proj: k_bf16,
+                    v_proj: v_bf16,
+                    o_proj: dummy_qw,
+                    q_norm: dense(store, &format!("{p}.q_norm.weight"))?,
+                    k_norm: dense(store, &format!("{p}.k_norm.weight"))?,
+                    q_norm_full: None,
+                    k_norm_full: None,
+                    k_scale,
+                    v_scale,
+                };
+                let layer_kv_dtype = layer_kv_dtypes[attn_idx];
+                let mut layer = Qwen3AttentionLayer::new(
+                    input_norm,
+                    attn,
+                    post_attn_norm,
+                    ffn,
+                    attn_idx,
+                    None,
+                    None,
+                    None,
+                    gpu,
+                    layer_kv_dtype,
+                    config.fp8_kv_calibration_tokens,
+                    config,
+                )?;
+                // O-proj BF16 dense (decode + prefill both check this first).
+                layer.set_o_dense_bf16(o_bf16);
+                // Leave q/k/v/o quant-weights unset → dense fallback fires.
+                layers.push(Box::new(layer));
+                attn_idx += 1;
+            }
             LayerType::FullAttention if native_fp8 => {
                 // ── Native FP8 path: FP8 for both decode AND prefill ──
                 // NO NVFP4 dequant — saves ~30 GB peak memory on 122B EP=2.

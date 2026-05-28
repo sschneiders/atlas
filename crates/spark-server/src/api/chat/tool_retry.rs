@@ -277,6 +277,13 @@ pub(crate) fn apply_fuzzy_repair_inplace(
     calls: &mut [tool_parser::ToolCall],
     prompt_vocab: &std::collections::HashSet<String>,
 ) {
+    // Kill-switch: ATLAS_DISABLE_FUZZY_REPAIR=1 makes this a no-op so the
+    // model's raw tool-call arguments pass through unmodified (matching
+    // vLLM, which never mutates generated text). Used to A/B whether
+    // fuzzy repair is the source of tool-arg corruption.
+    if std::env::var("ATLAS_DISABLE_FUZZY_REPAIR").ok().as_deref() == Some("1") {
+        return;
+    }
     let mut repairs_made = 0usize;
     for tc in calls.iter_mut() {
         let Ok(serde_json::Value::Object(map)) =
