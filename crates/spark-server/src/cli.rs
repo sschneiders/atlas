@@ -95,6 +95,14 @@ pub struct ServeArgs {
     #[arg(long)]
     pub max_thinking_budget: Option<u32>,
 
+    /// Override MODEL.toml's `[behavior].disable_tool_grammar`.
+    /// When true, the server skips XGrammar structural-tag enforcement on
+    /// `tool_choice="auto"` requests; tools are still parsed from output
+    /// post-hoc by the tool_call_parser. Matches vLLM's default behaviour
+    /// in auto mode (vLLM only grammar-constrains when tool_choice="required").
+    #[arg(long)]
+    pub disable_tool_grammar: Option<bool>,
+
     /// Default chat template kwargs applied when the client sends no
     /// thinking parameters (no `reasoning.effort`, `chat_template_kwargs`,
     /// or `enable_thinking` in the request body). A JSON object with
@@ -318,7 +326,16 @@ pub struct ServeArgs {
 
     /// Default min-p for sampling (keep tokens with prob >= min_p * max_prob).
     /// 0.0 = disabled. Recommended: 0.05-0.1.
-    #[arg(long, default_value_t = 0.0)]
+    ///
+    /// A5 (2026-05-26): default raised from 0.0 → 0.08 per the
+    /// `research3_quantization_sampler.md` recommendation #3. On FP8
+    /// models the long noisy tail of the logit distribution gets
+    /// truncated, preventing low-probability tokens from winning under
+    /// FP8 quantization noise. BF16 models pay essentially nothing for
+    /// the floor (their distributions are already concentrated).
+    /// Override via `--default-min-p 0.0` if a deployment specifically
+    /// needs to disable.
+    #[arg(long, default_value_t = 0.08)]
     pub default_min_p: f32,
 
     /// Swap space in GB for KV cache overflow to disk. When GPU blocks are

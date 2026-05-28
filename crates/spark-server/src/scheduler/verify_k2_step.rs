@@ -25,9 +25,26 @@ fn k2_record_outcome(accepted: bool, seq_len: usize) {
         let rejects = K2_REJECTS.swap(0, std::sync::atomic::Ordering::Relaxed);
         let total = (accepts + rejects).max(1);
         let pct = 100.0 * (accepts as f64) / (total as f64);
-        tracing::info!(
-            "K2 summary: {accepts} accept / {rejects} reject in last {total} steps ({pct:.1}% accept) seq_len={seq_len}"
-        );
+        // A6 (2026-05-26): MTP K=2 acceptance rate as a free drift
+        // gauge. The HF z-lab/Qwen3.6-27B-DFlash#2 report and our own
+        // research3_spec_verify finding show that FP8 Qwen3.6 with
+        // sustained <30% MTP accept indicates the target model's
+        // logits have entered the "confidently wrong" attractor — the
+        // exact failure mode driving the opencode multi-turn drift.
+        // For now we just WARN to surface the signal in production
+        // logs; a future Tier-B refinement adds per-sequence state +
+        // `finish_reason="drift_detected"` to actually terminate the
+        // response when the gauge trips.
+        const DRIFT_THRESHOLD_PCT: f64 = 30.0;
+        if pct < DRIFT_THRESHOLD_PCT && total >= K2_SUMMARY_PERIOD {
+            tracing::warn!(
+                "K2 drift gauge: accept rate {pct:.1}% < {DRIFT_THRESHOLD_PCT}% over last {total} steps (seq_len={seq_len}). Model logits likely in 'confidently wrong' attractor."
+            );
+        } else {
+            tracing::info!(
+                "K2 summary: {accepts} accept / {rejects} reject in last {total} steps ({pct:.1}% accept) seq_len={seq_len}"
+            );
+        }
     }
 }
 

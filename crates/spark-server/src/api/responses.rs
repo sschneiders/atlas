@@ -188,5 +188,6 @@ pub(super) fn conversation_item_to_message(
         tool_calls: None,
         tool_call_id: None,
         name: None,
+        reasoning_content: None,
     })
 }

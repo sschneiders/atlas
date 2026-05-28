@@ -210,6 +210,18 @@ pub struct ModelBehavior {
     /// itself is intentionally NOT implemented (no per-model trained head
     /// is available); only the optional hook is wired.
     pub rom_head: &'static str,
+    /// Tier 5c (2026-05-26): one-shot tool-call re-roll on hard
+    /// validation failure. When `true`, `validate_tool_calls` errors on
+    /// the chat path fire a single retry inference with the same
+    /// grammar spec + a correction nudge appended to the prompt. If the
+    /// retry produces valid tool calls, they replace the failed call
+    /// before the response leaves the server. Default `true` — the
+    /// blocking-path canonical-probe trace shows a write-→bash recovery
+    /// path that's strictly better than the previous "[atlas] Tool call
+    /// rejected" content fallback. Set `false` per-model when a
+    /// specific model is known to ALWAYS get tool args right on the
+    /// first attempt (extra inference round-trip cost is wasted there).
+    pub tool_retry: bool,
 }
 
 /// Phase-C: maximum number of watchdog-triggered rollbacks a single
@@ -240,6 +252,7 @@ impl Default for ModelBehavior {
             disable_tool_grammar: false,
             rollback_resteer: true,
             rom_head: "",
+            tool_retry: true,
         }
     }
 }

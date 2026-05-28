@@ -68,6 +68,11 @@ pub(super) fn extract_assistant_incoming_message(
         tool_calls,
         tool_call_id: None,
         name: None,
+        reasoning_content: msg
+            .get("reasoning_content")
+            .or_else(|| msg.get("reasoning"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
     })
 }
 

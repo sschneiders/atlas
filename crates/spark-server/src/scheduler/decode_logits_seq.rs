@@ -4,8 +4,50 @@
 
 use super::*;
 
+/// B1 (2026-05-26): periodic summary of low-margin drift events.
+///
+/// Same shape as `verify_k2_step::k2_record_outcome`: an atomic counter
+/// of low-margin firings since the last summary, plus a total. Every
+/// `B1_SUMMARY_PERIOD` events we emit a single WARN line and reset.
+/// Production observability for the FP8 low-margin argmax-flip regime
+/// without spamming per-position trace.
+const B1_SUMMARY_PERIOD: u64 = 100;
+static B1_LOW_MARGIN_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn b1_record_low_margin(margin: f32, top1: u32, top2: u32) {
+    let n = B1_LOW_MARGIN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    // Per-event trace — TRACE level by design (23.7% of long-ctx
+    // positions trip this; INFO would spam). Power-user diagnostic:
+    // `RUST_LOG=spark::scheduler::decode_logits_seq=trace`.
+    tracing::trace!(
+        "B1 low margin: gap={margin:.3} top1={top1} top2={top2}"
+    );
+    if n.is_multiple_of(B1_SUMMARY_PERIOD) {
+        tracing::warn!(
+            "B1 drift gauge: {n} low-margin (<1.5 logprobs) decode positions \
+             observed inside parameter bodies. \
+             FP8 numerical noise is in the argmax-flip regime — consider \
+             reviewing tool-arg outputs for whitespace / digit-collapse drift."
+        );
+    }
+}
+
 /// Process logits for a single active sequence: dequant, adjust, sample, return token + optional logprobs.
 #[allow(clippy::too_many_arguments)]
+/// ATLAS_FORCE_TEMP_ZERO=1 — diagnostic mode that bypasses all drift
+/// mitigation (WS1/AM1/WS2/A4/B1/C4) and just returns argmax of raw
+/// logits. Used together with VLLM_FORCE_TEMP_ZERO on vLLM for
+/// apples-to-apples layer-cosine comparison.
+fn force_temp_zero_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("ATLAS_FORCE_TEMP_ZERO")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 pub fn process_seq_logits(
     _model: &dyn Model,
     a: &mut ActiveSeq,
@@ -39,6 +81,24 @@ pub fn process_seq_logits(
             })
             .collect()
     };
+
+    // ATLAS_FORCE_TEMP_ZERO short-circuit: pure argmax on raw logits,
+    // no drift patches, no penalties, no biases. Matches vLLM at
+    // temperature=0 (and VLLM_FORCE_TEMP_ZERO=1).
+    if force_temp_zero_enabled() {
+        let mut best_idx: u32 = 0;
+        let mut best_val: f32 = f32::NEG_INFINITY;
+        for (j, &v) in f32_logits.iter().enumerate() {
+            if v > best_val {
+                best_val = v;
+                best_idx = j as u32;
+            }
+        }
+        let logprobs = a
+            .top_logprobs
+            .map(|k| extract_logprobs_from_f32(&f32_logits, best_idx, k as usize));
+        return (best_idx, logprobs);
+    }
 
     // F2: Confidence-based early stop during thinking.
     // When top-1 prob >= 0.95 for 30 consecutive tokens, force </think>.
@@ -340,6 +400,17 @@ pub fn process_seq_logits(
         gs.apply_bitmask_to_logits(&mut f32_logits);
     }
 
+    // AdaDec Phase 1 diagnostic (no-op when ATLAS_ADADEC_DIAGNOSTIC unset).
+    // Observes Shannon entropy of the post-grammar-bitmask distribution
+    // from the MAIN decode path — pairs with the matching call in
+    // `run_pipeline` (verify path) so we get coverage across both code
+    // paths.
+    crate::scheduler::logit_processors::adadec_diag::log_step(
+        &f32_logits,
+        a,
+        "decode",
+    );
+
     // F72 (byte-level partial-trigger anchor) was removed — see
     // F73 / fix42. The sampler-side anchor hung the server in
     // production despite passing isolated unit tests; the
@@ -392,16 +463,28 @@ pub fn process_seq_logits(
     let sampling_temp = if greedy_gate { 0.0 } else { effective_temp };
     // Advance seed per token for deterministic but varying randomness.
     let step_seed = a.seed.map(|s| s.wrapping_add(a.output_tokens.len() as u64));
-    // Phase-gated sampler scoping (P3.1, 2026-04-25):
-    // inside the tool-call body (between `<tool_call>` and
-    // `</tool_call>`) the JSON we emit is dense with
-    // legitimate short repetitions — `":"`, `","`, key
-    // tokens — that DRY/presence_penalty/frequency_penalty
-    // would otherwise penalise, breaking schema validity.
-    // XGrammar already guarantees structural correctness
-    // here; penalties only add noise. Outside the tool
-    // body (free text + `<think>`) the full preset
-    // applies: this is where prose loops actually live.
+    // A1 (2026-05-26): the prior Phase-3.1 logic (2026-04-25) zeroed
+    // ALL penalties inside the tool-call body to avoid penalising
+    // legitimate JSON structural repetition (`":"`, `","`, key
+    // tokens). Live Wave-1+3 traces showed this was the dominant
+    // root cause of the worst opencode attractors: runaway bash
+    // commands with mismatched parens (`...) > ~/dir_setup.txt) >>
+    // dir_done=true...` accumulating ~MB strings), `lean://` prefix
+    // loops, and same-tool-call repetition. Without rep_penalty
+    // inside the body, the model can emit the same degenerate
+    // token cluster indefinitely.
+    //
+    // Per `research3_drift_catalog.md` top-3 attack: restore
+    // penalties inside tool body at full strength. The original
+    // JSON-structure concern is theoretically real but empirically
+    // a non-issue at rep_pen=1.10 / window=256 — JSON tokens have
+    // strong logit margins from XGrammar and the model's training,
+    // so a 9% soft downweight does not flip their selection. The
+    // runaway-attractor failure mode is the dominant cost.
+    //
+    // DRY stays zeroed inside the body: DRY's n-gram heuristic
+    // (window 2-4 tokens) does meaningfully fight short JSON
+    // repetitions and the win-to-cost trade-off is closer there.
     let in_tool = a.inside_tool_body && !a.inside_thinking;
 
     // Tier-1 (Epoch 1+2) parameter-body byte-counter mask: when the
@@ -431,13 +514,164 @@ pub fn process_seq_logits(
     if a.inside_parameter_body && a.param_body_chars_emitted == 0 {
         // Close-tag opener `</`
         logit_bias_local.push((510u32, -8.0f32));
-        // Common whitespace tokens
-        logit_bias_local.push((220u32, -8.0f32)); // ` `
-        logit_bias_local.push((198u32, -8.0f32)); // `\n`
-        logit_bias_local.push((197u32, -8.0f32)); // `\t`
-        logit_bias_local.push((256u32, -8.0f32)); // `  `
-        logit_bias_local.push((271u32, -8.0f32)); // `\n\n`
+        // WS1 (2026-05-26): full vocab-scanned whitespace set. Was a
+        // 5-token literal `[220, 198, 197, 256, 271]`; the Qwen3.6 vocab
+        // has ~440 whitespace-only tokens, so the historical mask let
+        // ~98% of whitespace BPEs through. crate::whitespace_mask::init
+        // runs once at boot and populates a process-global HashSet via
+        // OnceLock; the read here is lock-free. Empty set if init
+        // didn't run (e.g. unit tests) — preserves fail-open semantics.
+        // Model-agnostic: any tokenizer's whitespace-only tokens land
+        // in the set; non-Qwen models scan their own vocab.
+        for &ws_tok in crate::whitespace_mask::whitespace_tokens() {
+            logit_bias_local.push((ws_tok, -8.0f32));
+        }
+        // AM1 (2026-05-26): drift #7 "`lean://` prefix attractor"
+        // suppression. At position 0 of a tool-param body, FP8 noise
+        // routinely flips the first-content token to `lean` (id 2588)
+        // or ` lean` (id 15192) on Qwen3.6. Same -8.0 firmness as the
+        // close-tag opener; only triggers at position 0 so legitimate
+        // mid-content `lean` survives.
+        for &att_tok in crate::attractor_mask::attractor_tokens() {
+            logit_bias_local.push((att_tok, -8.0f32));
+        }
+        // Diagnostic: log when the position-0 mask is active. INFO
+        // level so it shows up under default RUST_LOG. One line per
+        // tool-param body entry — not spammy. Helps verify the gate
+        // fires when we expect.
+        tracing::info!(
+            "ws1/am1 mask active at param_body pos=0: {} ws + {} attractor + close-`</`",
+            crate::whitespace_mask::whitespace_tokens().len(),
+            crate::attractor_mask::attractor_tokens().len(),
+        );
+    } else if a.inside_parameter_body
+        && a.param_body_chars_emitted > 0
+        && a.output_tokens
+            .last()
+            .copied()
+            .is_some_and(crate::whitespace_mask::is_digit_ending)
+    {
+        // WS2 (2026-05-26): mid-content whitespace gate.
+        //
+        // The Tier A drift mode (`0.1.0`→`0.1 .0`, `2024`→`2 024`) fires
+        // mid-content where the position-0 WS1 mask never triggers. FP8
+        // long-context noise (~23.7% of decode positions have top-1↔top-2
+        // gap < 1.5 logprobs in long agentic context — see
+        // bench/fp8_dgx2_drift/research_C1_results.md) lets a whitespace
+        // continuation flip a low-margin number-continuation argmax.
+        //
+        // We trigger ONLY when the model just emitted a digit-ending token
+        // (precomputed `is_digit_ending` bit per token id, built from
+        // tokenizer at boot — model-agnostic). The bias is `-3.0`, much
+        // lighter than the WS1 `-8.0` close-mask, because legitimate
+        // whitespace-after-digit happens in math/code ("3 + 5", "10 items").
+        // -3.0 is enough to flip an FP8-noise-driven low-margin selection
+        // back to the higher-confidence digit/punct continuation but does
+        // NOT override a genuinely-high-margin whitespace choice.
+        for &ws_tok in crate::whitespace_mask::whitespace_tokens() {
+            logit_bias_local.push((ws_tok, -3.0f32));
+        }
     }
+    // A4 (2026-05-26) POST_THINK_MIN_REASONING floor: suppress the
+    // `</think>` token until at least MIN_REASONING_TOKENS thinking
+    // tokens have been emitted. Closes the reasoning-collapse cascade
+    // documented in research2_probe_forensics.md (reasoning_content
+    // length decays 233→0 chars over 14 assistant turns). When the
+    // model emits a vanishingly short `<think>` block, the downstream
+    // tool emission lacks the planning context and drifts to phantom
+    // paths / leaked control characters.
+    //
+    // Bias is -8.0 (firm but not infinite — same magnitude as the
+    // empty-parameter mask above). If reasoning_budget is explicitly
+    // set very small (e.g. <16) the request opted out of meaningful
+    // thinking and the floor doesn't apply.
+    const MIN_REASONING_TOKENS: u32 = 16;
+    if a.inside_thinking
+        && a.thinking_tokens < MIN_REASONING_TOKENS
+        && a.thinking_budget.unwrap_or(MIN_REASONING_TOKENS) >= MIN_REASONING_TOKENS
+        && let Some(end_tok) = think_end_token
+    {
+        logit_bias_local.push((end_tok, -8.0f32));
+    }
+
+    // B1 (2026-05-26): margin-ratio drift detector.
+    //
+    // We scan `f32_logits` for top-1 and top-2 (pre-internal-penalty,
+    // pre-bias) and record the gap. In long-context FP8 decode
+    // 23.7% of decode positions have gap<1.5 logprobs (see
+    // bench/fp8_dgx2_drift/research_C1_results.md) — exactly the
+    // regime where FP8 numerical noise flips a low-margin argmax.
+    //
+    // The detector is always-on (cost: one O(V) scan per token,
+    // ~250k cmps ≈ 50µs on host f32 buffer). Output: optional
+    // per-position TRACE event + periodic summary WARN when the
+    // low-margin RATE exceeds threshold over a window (mirrors the
+    // K2 drift gauge pattern in `verify_k2_step::k2_record_outcome`).
+    //
+    // Top-2 is also used by the C4v1 fallback below: when both
+    // - we're inside a parameter body content position (mid-decode),
+    // - and the margin is below `LOW_MARGIN_THRESHOLD`,
+    // C4v1 weakens the natural top-1 bias so the sampler can land
+    // on top-2 instead — breaking the deterministic FP8-flip
+    // attractor without an expensive BF16 reverify forward pass.
+    let (margin_top1_idx, margin_top1_val, margin_top2_idx, margin_top2_val) = {
+        let mut t1_idx = 0u32;
+        let mut t1_val = f32::NEG_INFINITY;
+        let mut t2_idx = 0u32;
+        let mut t2_val = f32::NEG_INFINITY;
+        for (idx, &v) in f32_logits.iter().enumerate() {
+            if v > t1_val {
+                t2_val = t1_val;
+                t2_idx = t1_idx;
+                t1_val = v;
+                t1_idx = idx as u32;
+            } else if v > t2_val {
+                t2_val = v;
+                t2_idx = idx as u32;
+            }
+        }
+        (t1_idx, t1_val, t2_idx, t2_val)
+    };
+    let margin = margin_top1_val - margin_top2_val;
+    const LOW_MARGIN_THRESHOLD: f32 = 1.5;
+    let low_margin_in_body =
+        a.inside_parameter_body && a.param_body_chars_emitted > 0 && margin < LOW_MARGIN_THRESHOLD;
+    if low_margin_in_body {
+        b1_record_low_margin(margin, margin_top1_idx, margin_top2_idx);
+    }
+
+    // C4v1 (2026-05-26): DISABLED 2026-05-26 PM after the first live
+    // probe showed the top-2 lift introduced a new drift mode
+    // (reasoning text emitted inside `<parameter=content>` body
+    // instead of legitimate TOML/code).
+    //
+    // Hypothesis: the C1 inference that "at low margin, top-1 and
+    // top-2 are FP8 vs BF16 candidates" was based on a KL-symmetry
+    // argument, not a direct measurement. In practice the top-2 is
+    // often a SEMANTICALLY-different continuation that BF16 would
+    // also have rejected; lifting it adds noise instead of correcting
+    // FP8 drift. Need a per-token BF16 forward to verify which side
+    // of the boundary is "right" before re-enabling.
+    //
+    // B1 (the detector above) stays active for visibility — it logs
+    // low-margin positions without taking action. The C4v1 lift will
+    // come back once we have a BF16 reference signal to gate it (the
+    // real QSpec design from agent 2's research).
+    //
+    // Code retained below as a `false &&` block so the diff is easy
+    // to revert.
+    #[allow(clippy::overly_complex_bool_expr)]
+    if false && low_margin_in_body {
+        const C4_LIFT_FRACTION: f32 = 0.5;
+        let lift = (LOW_MARGIN_THRESHOLD - margin) * C4_LIFT_FRACTION;
+        if lift > 0.0 {
+            logit_bias_local.push((margin_top2_idx, lift));
+            tracing::trace!(
+                "C4v1: lifting top2={margin_top2_idx} by +{lift:.3} (margin={margin:.3})"
+            );
+        }
+    }
+
     let sampled = sample_with_params_history(
         f32_bytes,
         &SamplingParams {
@@ -447,19 +681,23 @@ pub fn process_seq_logits(
             top_n_sigma: a.top_n_sigma,
             min_p: a.min_p,
             logit_bias: logit_bias_local,
-            repetition_penalty: if in_tool { 1.0 } else { a.repetition_penalty },
+            // A1 (2026-05-26): full penalty INSIDE tool body too.
+            // Stops attractor patterns (mismatched parens runaway,
+            // `lean://` prefix loop, same-tool-call repetition).
+            repetition_penalty: a.repetition_penalty,
             repetition_penalty_window: a.repetition_penalty_window,
-            presence_penalty: if in_tool { 0.0 } else { a.presence_penalty },
-            frequency_penalty: if in_tool { 0.0 } else { a.frequency_penalty },
+            presence_penalty: a.presence_penalty,
+            frequency_penalty: a.frequency_penalty,
             lz_penalty: if a.grammar_state.is_some() {
                 0.0
             } else {
                 a.lz_penalty
             },
-            // DRY: same logic. Outside the tool body it
-            // remains active to dampen `<think>` fence-narration
-            // attractors. Inside the body, disabled — JSON
-            // patterns repeat and that's correct.
+            // DRY stays disabled inside tool body. DRY's n-gram
+            // heuristic (window 2-4 tokens) DOES meaningfully
+            // fight short JSON repetitions (`","`, `":"`), and
+            // unlike rep_penalty's 9% soft downweight, DRY's
+            // exponential schedule can flip token selection.
             dry_multiplier: if in_tool { 0.0 } else { a.dry_multiplier },
             dry_base: a.dry_base,
             dry_allowed_length: a.dry_allowed_length,

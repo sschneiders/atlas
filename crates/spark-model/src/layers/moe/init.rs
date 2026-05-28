@@ -98,6 +98,36 @@ impl MoeLayer {
                 "moe_fp8_grouped_gemm",
                 "moe_fp8_grouped_gemm_v2",
             ),
+            moe_w8a8_grouped_gemm_k: super::super::try_kernel(
+                gpu,
+                "moe_w8a8_grouped_gemm",
+                "moe_w8a8_grouped_gemm",
+            ),
+            per_token_group_quant_fp8_k: super::super::try_kernel(
+                gpu,
+                "per_token_group_quant_fp8",
+                "per_token_group_quant_fp8",
+            ),
+            fp8_gemm_t_blockscaled_k: super::super::try_kernel(
+                gpu,
+                "fp8_gemm_t_blockscaled",
+                "fp8_gemm_t_blockscaled",
+            ),
+            moe_bf16_grouped_gemm_k: super::super::try_kernel(
+                gpu,
+                "moe_bf16_grouped_gemm",
+                "moe_bf16_grouped_gemm",
+            ),
+            moe_expert_gate_up_shared_bf16_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_bf16",
+                "moe_expert_gate_up_shared_bf16",
+            ),
+            moe_expert_silu_down_shared_bf16_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_bf16",
+                "moe_expert_silu_down_shared_bf16",
+            ),
             // 2026-05-20: default-ON. v1 had documented coalescing-perf bug;
             // verified that v1 also has *numerical* bug for some
             // (token, expert) tile combinations — chunk-4 last-token
@@ -233,6 +263,12 @@ impl MoeLayer {
             fp8_gate_weight_ptrs: None,
             fp8_up_weight_ptrs: None,
             fp8_down_weight_ptrs: None,
+            bf16_gate_weight_ptrs: None,
+            bf16_up_weight_ptrs: None,
+            bf16_down_weight_ptrs: None,
+            bf16_shared_gate: None,
+            bf16_shared_up: None,
+            bf16_shared_down: None,
             fp8_shared_expert: None,
             // Phase 2.7 Tier C — set by loader after construction (qwen35.rs).
             is_dflash_capture_layer: false,

@@ -178,6 +178,7 @@ pub(super) fn generate_target_ptx_rs(
              \x20               disable_tool_grammar: {},\n\
              \x20               rollback_resteer: {},\n\
              \x20               rom_head: \"{}\",\n\
+             \x20               tool_retry: {},\n\
              \x20           }},\n\
              \x20           model_type_matches: vec![{}],\n\
              \x20           dflash: {},\n\
@@ -206,6 +207,7 @@ pub(super) fn generate_target_ptx_rs(
             target.behavior_disable_tool_grammar,
             target.behavior_rollback_resteer,
             target.behavior_rom_head,
+            target.behavior_tool_retry,
             target.model_type_matches.iter().map(|m| {
                 let hs = match m.hidden_size {
                     Some(v) => format!("Some({v})"),

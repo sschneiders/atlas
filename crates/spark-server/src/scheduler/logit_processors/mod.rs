@@ -39,6 +39,7 @@
 
 use crate::scheduler::ActiveSeq;
 
+pub mod adadec_diag;
 pub mod f2_confidence;
 pub mod forced_think_end;
 pub mod forced_token;
@@ -106,7 +107,7 @@ pub fn run_pipeline(
     seq: &mut ActiveSeq,
     ctx: &LogitsContext,
 ) -> Option<u32> {
-    let stages: [&dyn LogitsProcessor; 8] = [
+    let stages: [&dyn LogitsProcessor; 9] = [
         &f2_confidence::F2ConfidenceEarlyStop,
         &mid_word::MidWordThinkEndMask,
         &post_close::PostCloseThinkMask,
@@ -115,6 +116,10 @@ pub fn run_pipeline(
         &pin_tool_call::PinToToolCallStart,
         &forced_token::ForcedTokenFastPath,
         &grammar_bitmask::GrammarBitmaskApply,
+        // AdaDec Phase 1 diagnostic — observes the post-grammar-bitmask
+        // distribution, never mutates. No-op when ATLAS_ADADEC_DIAGNOSTIC
+        // env var is unset.
+        &adadec_diag::AdaDecDiagnostic,
     ];
     for stage in stages.iter() {
         match stage.apply(logits, seq, ctx) {

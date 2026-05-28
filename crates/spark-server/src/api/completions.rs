@@ -118,7 +118,7 @@ pub async fn completions(
     let (tx, rx) = tokio::sync::oneshot::channel();
     let session_hash = crate::session_manager::compute_session_hash(&prompt_tokens);
     let request = InferenceRequest::Blocking {
-        prompt_tokens,
+        prompt_tokens: std::sync::Arc::new(prompt_tokens),
         session_hash,
         image_pixels: Vec::new(),
         max_tokens: req.max_tokens,
@@ -252,7 +252,7 @@ pub(super) async fn completions_stream(
 
     let session_hash = crate::session_manager::compute_session_hash(&prompt_tokens);
     let request = InferenceRequest::Streaming {
-        prompt_tokens,
+        prompt_tokens: std::sync::Arc::new(prompt_tokens),
         session_hash,
         image_pixels: Vec::new(),
         max_tokens,

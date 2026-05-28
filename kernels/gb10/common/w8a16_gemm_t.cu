@@ -167,14 +167,24 @@ extern "C" __global__ void w8a16_gemm_t(
     __shared__ __nv_bfloat16 smem_A[M_TILE][16 + PAD];
     __shared__ __nv_bfloat16 smem_B[16][64 + PAD];
 
-    float acc[8][4];
+    // Two-level FP32 accumulation (vLLM W8A8 / DeepGEMM pattern). See
+    // w8a16_gemm.cu for the design rationale. n_block constant per CTA
+    // because N_TILE=64 ≤ FP8_BLOCK=128 and cta_n is N_TILE-aligned.
+    float inner_acc[8][4];
+    float outer_acc[8][4];
     #pragma unroll
     for (int i = 0; i < 8; i++) {
-        acc[i][0] = 0.0f; acc[i][1] = 0.0f;
-        acc[i][2] = 0.0f; acc[i][3] = 0.0f;
+        inner_acc[i][0] = 0.0f; inner_acc[i][1] = 0.0f;
+        inner_acc[i][2] = 0.0f; inner_acc[i][3] = 0.0f;
+        outer_acc[i][0] = 0.0f; outer_acc[i][1] = 0.0f;
+        outer_acc[i][2] = 0.0f; outer_acc[i][3] = 0.0f;
     }
 
     const unsigned int n_scale_blocks = (N + FP8_BLOCK - 1) / FP8_BLOCK;
+    const unsigned int k_step_inner = 16;
+    const unsigned int k_steps_per_block = FP8_BLOCK / k_step_inner;
+    const unsigned int n_block = cta_n / FP8_BLOCK;
+    unsigned int k_step_in_block = 0;
 
     for (unsigned int k_base = 0; k_base < K; k_base += 16) {
         // === Load A tile: [M_TILE, 16] BF16 from global → smem ===
@@ -193,8 +203,8 @@ extern "C" __global__ void w8a16_gemm_t(
 
         // === Dequant B: transposed [K, N] layout — coalesced N reads ===
         // B_t tile: [16, 64] = 1024 elements, 128 threads → 8 per thread.
-        // Layout: each thread reads from B_t[gk * N + gn] where gn varies
-        // within a warp → adjacent threads access adjacent N addresses.
+        // Store LUT[byte] as BF16 (lossless cast); apply block scale on the
+        // FP32 outer accumulator at each K_BLOCK boundary below.
         {
             #pragma unroll
             for (unsigned int i = 0; i < 8; i++) {
@@ -207,14 +217,7 @@ extern "C" __global__ void w8a16_gemm_t(
                 if (gk < K && gn < N) {
                     // Coalesced read: adjacent threads read adjacent N addresses
                     unsigned char weight_byte = B_t[(unsigned long long)gk * N + gn];
-
-                    // Block scale: transposed layout [K/128, N/128]
-                    unsigned int k_block = gk / FP8_BLOCK;
-                    unsigned int n_block = gn / FP8_BLOCK;
-                    float scale = __bfloat162float(block_scale_t[k_block * n_scale_blocks + n_block]);
-
-                    float dequant_val = E4M3_LUT_T[weight_byte] * scale;
-                    smem_B[k][n] = __float2bfloat16(dequant_val);
+                    smem_B[k][n] = __float2bfloat16(E4M3_LUT_T[weight_byte]);
                 } else {
                     smem_B[k][n] = __float2bfloat16(0.0f);
                 }
@@ -222,11 +225,45 @@ extern "C" __global__ void w8a16_gemm_t(
         }
 
         __syncthreads();
-        w8a16_mma_and_store_t(smem_A, smem_B, acc, warp_m_offset, group_id, tid);
+        w8a16_mma_and_store_t(smem_A, smem_B, inner_acc, warp_m_offset, group_id, tid);
         __syncthreads();
+
+        // K_BLOCK boundary: fold scaled inner into outer, reset inner.
+        k_step_in_block++;
+        if (k_step_in_block == k_steps_per_block) {
+            const unsigned int k_block = k_base / FP8_BLOCK;
+            // Transposed scale layout: [K/128, N/128]
+            const float scale = __bfloat162float(
+                block_scale_t[k_block * n_scale_blocks + n_block]);
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                outer_acc[i][0] += inner_acc[i][0] * scale;
+                outer_acc[i][1] += inner_acc[i][1] * scale;
+                outer_acc[i][2] += inner_acc[i][2] * scale;
+                outer_acc[i][3] += inner_acc[i][3] * scale;
+                inner_acc[i][0] = 0.0f; inner_acc[i][1] = 0.0f;
+                inner_acc[i][2] = 0.0f; inner_acc[i][3] = 0.0f;
+            }
+            k_step_in_block = 0;
+        }
     }
 
-    // === Store C tile: f32 accumulators → BF16 output ===
+    // Fold any incomplete trailing K_BLOCK (K % FP8_BLOCK != 0; dead code
+    // for Qwen3.6 hidden=2048 but keeps the kernel general).
+    if (k_step_in_block != 0) {
+        const unsigned int k_block = (K - 1) / FP8_BLOCK;
+        const float scale = __bfloat162float(
+            block_scale_t[k_block * n_scale_blocks + n_block]);
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            outer_acc[i][0] += inner_acc[i][0] * scale;
+            outer_acc[i][1] += inner_acc[i][1] * scale;
+            outer_acc[i][2] += inner_acc[i][2] * scale;
+            outer_acc[i][3] += inner_acc[i][3] * scale;
+        }
+    }
+
+    // === Store C tile: f32 outer accumulators → BF16 output ===
     #pragma unroll
     for (int n_tile = 0; n_tile < 8; n_tile++) {
         unsigned int base_n = cta_n + n_tile * 8;
@@ -235,10 +272,10 @@ extern "C" __global__ void w8a16_gemm_t(
         unsigned int row0 = cta_m + warp_m_offset + group_id;
         unsigned int row1 = row0 + 8;
 
-        if (row0 < M && col0 < N) C[row0 * N + col0] = __float2bfloat16(acc[n_tile][0]);
-        if (row0 < M && col1 < N) C[row0 * N + col1] = __float2bfloat16(acc[n_tile][1]);
-        if (row1 < M && col0 < N) C[row1 * N + col0] = __float2bfloat16(acc[n_tile][2]);
-        if (row1 < M && col1 < N) C[row1 * N + col1] = __float2bfloat16(acc[n_tile][3]);
+        if (row0 < M && col0 < N) C[row0 * N + col0] = __float2bfloat16(outer_acc[n_tile][0]);
+        if (row0 < M && col1 < N) C[row0 * N + col1] = __float2bfloat16(outer_acc[n_tile][1]);
+        if (row1 < M && col0 < N) C[row1 * N + col0] = __float2bfloat16(outer_acc[n_tile][2]);
+        if (row1 < M && col1 < N) C[row1 * N + col1] = __float2bfloat16(outer_acc[n_tile][3]);
     }
 }
 

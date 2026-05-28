@@ -88,127 +88,20 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         a.tool_call_opened = true;
     }
 
-    // Track CURRENT tool-body phase (P3.1, 2026-04-25). Set on the
-    // open token, clear on the close. The flag drives sampler
-    // scoping: when true, the main decode path zeroes
-    // repetition/presence/frequency/DRY so legitimate JSON
-    // micro-repetition (`":"`, `","`, key names) is not penalised.
+    // Tool-body / parameter-body state machine.
     //
-    // Stuck-in-tool-body watchdog (2026-05-24, NVFP4 doom-loop fix):
-    // some models emit `<tool_call>` opener and never reach the close
-    // — burns to max_tokens with the sanitizer suppressing as orphan.
-    // `tool_body_streak_tokens` counts consecutive tokens spent inside
-    // a tool body; when it exceeds `MAX_TOOL_BODY_TOKENS` (1024) we
-    // end the response cleanly. Resets to 0 on close.
-    const MAX_TOOL_BODY_TOKENS: u32 = 1024;
-    if !a.inside_thinking {
-        if a.tool_call_start_token == Some(tok) {
-            a.inside_tool_body = true;
-            a.tool_body_streak_tokens = 0;
-        } else if a.tool_call_end_token == Some(tok) {
-            a.inside_tool_body = false;
-            a.tool_body_streak_tokens = 0;
-            a.inside_parameter_body = false;
-            a.param_body_chars_emitted = 0;
-        } else if a.inside_tool_body {
-            a.tool_body_streak_tokens = a.tool_body_streak_tokens.saturating_add(1);
-            if a.tool_body_streak_tokens > MAX_TOOL_BODY_TOKENS {
-                tracing::warn!(
-                    streak = a.tool_body_streak_tokens,
-                    "Stuck in tool body for {MAX_TOOL_BODY_TOKENS}+ tokens with no </tool_call>; ending response (model never closed the envelope — would otherwise burn to max_tokens). Sanitizer will salvage what it can."
-                );
-                a.finished = true;
-            }
-
-            // Tier-1 (Epoch 1) parameter-body state tracking. Token IDs
-            // for Qwen3.6 byte-level BPE tokenizer (verified live via
-            // /tokenize endpoint 2026-05-25):
-            //   `<`         = 27
-            //   `parameter` = 15704
-            //   `=`         = 28
-            //   `>`         = 29
-            //   `</`        = 510  ← masked while body is empty
-            // Opener `<parameter=KEY>` ends at `>` (29). The KEY span
-            // between `=` and `>` is variable (typically 1-3 tokens
-            // like `command`, `filePath`, `content`). To robustly
-            // detect the opener, look back through the last 8 tokens
-            // when `>` is emitted and check for the `<parameter=`
-            // signature [27, 15704, 28] without an intervening
-            // `</parameter>` close.
-            //
-            // Closer `</parameter>` starts at `</` (510). When emitted
-            // inside the body, clear the flag.
-            //
-            // While `inside_parameter_body && param_body_chars_emitted
-            // == 0`, decode_logits_seq.rs masks token 510 with bias
-            // -8.0 — forcing the model to emit at least one non-close
-            // token before the close-tag's first byte can be sampled.
-            const TOK_LT: u32 = 27;
-            const TOK_PARAMETER: u32 = 15704;
-            const TOK_EQ: u32 = 28;
-            const TOK_GT: u32 = 29;
-            const TOK_LT_SLASH: u32 = 510;
-            if a.inside_parameter_body {
-                if tok == TOK_LT_SLASH {
-                    // Start of `</parameter>` close-tag — exit body.
-                    a.inside_parameter_body = false;
-                    a.param_body_chars_emitted = 0;
-                } else {
-                    // Epoch-2 fix: don't count whitespace-only tokens
-                    // toward the chars counter (otherwise the model
-                    // can emit ` `/`\n`/etc to satisfy the gate while
-                    // the parser's `.trim()` strips it to empty).
-                    // Common Qwen3.6 whitespace tokens (verified via
-                    // /tokenize endpoint): 220, 198, 197, 256, 271.
-                    let is_whitespace_token = matches!(
-                        tok,
-                        220 | 198 | 197 | 256 | 271
-                    );
-                    if !is_whitespace_token {
-                        a.param_body_chars_emitted =
-                            a.param_body_chars_emitted.saturating_add(1);
-                    }
-                }
-            } else if tok == TOK_GT {
-                // Possible end of `<parameter=KEY>` opener. Look back
-                // through last 8 tokens for the [27, 15704, 28]
-                // signature WITHOUT an intervening 510 (`</`) or 29
-                // (`>` — would be a previous param close).
-                let n = a.output_tokens.len();
-                if n >= 4 {
-                    let start = n.saturating_sub(8);
-                    let window = &a.output_tokens[start..n];
-                    // Find the signature; skip if 510 appears between
-                    // the signature and the current `>` (would mean
-                    // the parameter already closed before this `>`).
-                    let mut sig_idx: Option<usize> = None;
-                    for i in 0..window.len().saturating_sub(2) {
-                        if window[i] == TOK_LT
-                            && window[i + 1] == TOK_PARAMETER
-                            && window[i + 2] == TOK_EQ
-                        {
-                            sig_idx = Some(i + 3);
-                        }
-                    }
-                    if let Some(after_eq) = sig_idx {
-                        // Check no 510 / 29 between after_eq and the
-                        // end of the window (the `>` is the LAST
-                        // emitted token, but it's already in
-                        // output_tokens at this point? Actually emit
-                        // happens here so check window[after_eq..]).
-                        let body_segment = &window[after_eq..];
-                        let intervening_close = body_segment.iter().any(|&t| {
-                            t == TOK_LT_SLASH || t == TOK_GT
-                        });
-                        if !intervening_close {
-                            a.inside_parameter_body = true;
-                            a.param_body_chars_emitted = 0;
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // SM1 (2026-05-26): extracted from inline-in-emit_token to the free
+    // function `update_tool_param_state` so the regular non-MTP decode
+    // path (`decode_logits_step.rs`) can call it too. Previously the
+    // state was ONLY updated when `emit_token` ran — which happens from
+    // spec/verify paths but NOT from `process_decode_logits`. With
+    // mtp=false (Qwen3.6 baseline), the state machine never ran and
+    // every dependent gate (close-tag mask, WS1 position-0 mask, A1
+    // penalty toggle, AM1 attractor suppression, WS2 digit-context
+    // gate, B1 margin detector) was silently dead code. Live-confirmed
+    // 2026-05-26: the `ws1/am1 mask active` info log NEVER fired across
+    // a clean `write({"content":"hello world","filePath":"…"})` probe.
+    update_tool_param_state(a, tok);
 
     // Advance grammar state with the emitted token — skip while the
     // sequence is inside `<think>`…`</think>` so the matcher only
@@ -472,3 +365,138 @@ pub enum StartPrefillResult {
     /// Completed during first chunk (EOS on first token).
     Finished,
 }
+
+/// Tool-body / parameter-body state machine, hoisted out of
+/// `emit_token` (SM1, 2026-05-26).
+///
+/// Both speculative-decoding paths (`verify_k2_step`, `verify_k4_step`,
+/// `verify_dflash_step`, `spec_step`) and the regular non-spec decode
+/// path (`decode_logits_step::process_decode_logits`) call this on
+/// every emitted token so the state machine stays in sync with
+/// `a.output_tokens`. The previous inline version was unreachable
+/// from the non-spec path, leaving the close-tag mask, WS1 position-0
+/// mask, AM1 attractor suppression, WS2 digit-context gate, B1 margin
+/// detector, and A1 penalty toggle all silently dead.
+///
+/// **Slice semantics**: this function does NOT assume `tok` has been
+/// pushed onto `a.output_tokens` or that it has not. It auto-detects
+/// from `a.output_tokens.last()` and slices accordingly:
+///  - `emit_token` calls this BEFORE pushing → `last()` is the prior
+///    token, lookback uses the full slice.
+///  - `decode_logits_step::process_decode_logits` calls this AFTER
+///    pushing → `last()` is `tok`, lookback excludes the trailing
+///    entry so the search for `<parameter=KEY>` ending at the current
+///    `>` is correct in both cases.
+///
+/// State mutations:
+///  - `a.inside_tool_body`         set on `<tool_call>`, cleared on `</tool_call>`
+///  - `a.tool_body_streak_tokens`  ++ per body token, reset on enter/exit
+///  - `a.inside_parameter_body`    set on `<parameter=KEY>` close `>`, cleared on `</`
+///  - `a.param_body_chars_emitted` ++ per non-whitespace body token
+///  - `a.finished`                 forced when stuck >MAX_TOOL_BODY_TOKENS
+///
+/// Token IDs are Qwen3.6 byte-level BPE (verified via /tokenize 2026-05-25):
+///   27 = `<`, 28 = `=`, 29 = `>`, 510 = `</`, 15704 = `parameter`.
+pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
+    const MAX_TOOL_BODY_TOKENS: u32 = 1024;
+    if a.inside_thinking {
+        return;
+    }
+    if a.tool_call_start_token == Some(tok) {
+        a.inside_tool_body = true;
+        a.tool_body_streak_tokens = 0;
+        return;
+    }
+    if a.tool_call_end_token == Some(tok) {
+        a.inside_tool_body = false;
+        a.tool_body_streak_tokens = 0;
+        a.inside_parameter_body = false;
+        a.param_body_chars_emitted = 0;
+        return;
+    }
+    if !a.inside_tool_body {
+        return;
+    }
+    a.tool_body_streak_tokens = a.tool_body_streak_tokens.saturating_add(1);
+    if a.tool_body_streak_tokens > MAX_TOOL_BODY_TOKENS {
+        tracing::warn!(
+            streak = a.tool_body_streak_tokens,
+            "Stuck in tool body for {MAX_TOOL_BODY_TOKENS}+ tokens with no </tool_call>; ending response (model never closed the envelope — would otherwise burn to max_tokens). Sanitizer will salvage what it can."
+        );
+        a.finished = true;
+    }
+
+    const TOK_LT: u32 = 27;
+    const TOK_PARAMETER: u32 = 15704;
+    const TOK_EQ: u32 = 28;
+    const TOK_GT: u32 = 29;
+    const TOK_LT_SLASH: u32 = 510;
+
+    if a.inside_parameter_body {
+        if tok == TOK_LT_SLASH {
+            // Start of `</parameter>` close-tag — exit body.
+            a.inside_parameter_body = false;
+            a.param_body_chars_emitted = 0;
+        } else {
+            // WS1 (2026-05-26): vocab-scanned whitespace check. Must
+            // stay synchronized with the position-0 mask in
+            // `decode_logits_seq.rs` — any token the bias suppresses
+            // MUST NOT bump the counter or the close-tag gate would
+            // unlock one token too early.
+            let is_whitespace_token =
+                crate::whitespace_mask::is_whitespace(tok);
+            if !is_whitespace_token {
+                a.param_body_chars_emitted =
+                    a.param_body_chars_emitted.saturating_add(1);
+            }
+        }
+        return;
+    }
+
+    // Not yet inside_parameter_body: scan for `<parameter=KEY>` opener
+    // ending at this `>` (29). Lookback 8 tokens for `[27, 15704, 28]`
+    // signature without an intervening close.
+    if tok != TOK_GT {
+        return;
+    }
+    // Auto-detect whether `tok` is already in output_tokens (caller
+    // pushed) or not (caller has not yet pushed). The signature search
+    // must NOT include `tok` itself — the lookback is "what came
+    // BEFORE this `>`".
+    let n = a.output_tokens.len();
+    let n_for_lookback = if n > 0 && a.output_tokens[n - 1] == tok {
+        n - 1
+    } else {
+        n
+    };
+    if n_for_lookback < 3 {
+        return;
+    }
+    let start = n_for_lookback.saturating_sub(8);
+    let window = &a.output_tokens[start..n_for_lookback];
+    let mut sig_idx: Option<usize> = None;
+    for i in 0..window.len().saturating_sub(2) {
+        if window[i] == TOK_LT
+            && window[i + 1] == TOK_PARAMETER
+            && window[i + 2] == TOK_EQ
+        {
+            sig_idx = Some(i + 3);
+        }
+    }
+    let Some(after_eq) = sig_idx else { return };
+    // Check no intervening `</` or `>` in the KEY span between
+    // `<parameter=` and the current `>`.
+    let body_segment = &window[after_eq..];
+    let intervening_close = body_segment
+        .iter()
+        .any(|&t| t == TOK_LT_SLASH || t == TOK_GT);
+    if !intervening_close {
+        a.inside_parameter_body = true;
+        a.param_body_chars_emitted = 0;
+    }
+}
+
+// SM1 unit tests deferred: ActiveSeq has 60+ fields and no public
+// constructor; building a test instance requires more boilerplate
+// than the state machine itself. Live-verification post-deploy via
+// the "ws1/am1 mask active" INFO log is the integration test.

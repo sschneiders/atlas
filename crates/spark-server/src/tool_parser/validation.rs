@@ -244,6 +244,35 @@ pub fn normalize_paths(calls: &mut [ToolCall], cwd: &str) {
         let mut changed = false;
         for key in PATH_KEYS {
             if let Some(serde_json::Value::String(path)) = args.get(*key) {
+                // Long-context FP8 drift mode (2026-05-28): the model
+                // sometimes emits the value with XML-attribute-style
+                // framing — `="/tmp/x/main.rs"` instead of `/tmp/x/main.rs`.
+                // The qwen3_coder grammar accepts the literal `=` and quotes
+                // as part of the parameter body. Strip them here so the
+                // downstream path-shape check and write dispatch see a
+                // clean path. vLLM's tool_parser does similar leniency.
+                let trimmed = path.trim();
+                let mut sanitized: &str = trimmed;
+                if let Some(rest) = sanitized.strip_prefix('=') {
+                    sanitized = rest.trim_start();
+                }
+                if sanitized.len() >= 2
+                    && sanitized.starts_with('"')
+                    && sanitized.ends_with('"')
+                {
+                    sanitized = &sanitized[1..sanitized.len() - 1];
+                }
+                if sanitized != path.as_str() {
+                    args.insert(
+                        key.to_string(),
+                        serde_json::Value::String(sanitized.to_string()),
+                    );
+                    changed = true;
+                }
+                // Re-read after possible sanitization
+                let Some(serde_json::Value::String(path)) = args.get(*key) else {
+                    continue;
+                };
                 if !path.starts_with('/') {
                     continue; // Already relative — leave it
                 }
@@ -402,12 +431,14 @@ pub fn validate_single_tool_call(call: &ToolCall, tools: &[ToolDefinition]) -> R
                              like '/tmp/calc-test75/Cargo.toml'."
                     ));
                 }
-                // Epoch 4 (Tier-2): paths must look like paths. EBNF
-                // grammar enforces ≥1 non-WS non-`<` byte but the model
-                // sometimes satisfies with a single backslash (`\`) or
-                // other 1-char garbage. Real filesystem paths under
-                // opencode always have either an absolute leading `/`
-                // OR a relative `.` / `..`, AND are ≥2 chars long.
+                // Long-context FP8 drift mode: model occasionally emits
+                // the value with XML-attribute-style framing — e.g.
+                // `<parameter=filePath>="/tmp/x/main.rs"</parameter>`
+                // — leaking the `="..."` shape into the value. Strip a
+                // leading `=` and a single pair of surrounding ASCII
+                // double-quotes before the path-shape check so these
+                // drifted-but-recoverable calls still resolve. vLLM's
+                // tool_parser does similar leniency.
                 let starts_ok = trimmed.starts_with('/')
                     || trimmed.starts_with("./")
                     || trimmed.starts_with("../");

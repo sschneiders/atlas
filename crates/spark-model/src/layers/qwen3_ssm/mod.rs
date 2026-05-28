@@ -120,6 +120,18 @@ pub struct Qwen3SsmLayer {
     out_proj_fp8: Option<DevicePtr>,
     fp8_gemm_k: KernelHandle,
     fp8_gemm_t_m128_k: KernelHandle, // M128: halves B re-reads for out_proj at ISL > 128
+    // Block-scaled W8A16 prefill kernels (preferred over single-scale
+    // fp8_gemm_n128 when block-scaled FP8 weights are available — matches
+    // vLLM's per-128-block scale precision instead of single-scale).
+    w8a16_gemm_k: KernelHandle,
+    w8a16_gemm_t_k: KernelHandle,
+    // W8A8 + FP32 epilogue (vLLM-equivalent) prefill kernels.
+    // `per_token_group_quant_fp8` produces FP8 activations + per-token-per-128
+    // FP32 scale; `fp8_gemm_t_blockscaled` consumes both with FP8 MMA and
+    // applies a_scale × b_scale in the FP32 epilogue. Gated behind
+    // `ATLAS_FP8_W8A8=1` for staged rollout.
+    per_token_group_quant_fp8_k: KernelHandle,
+    fp8_gemm_t_blockscaled_k: KernelHandle,
 }
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────

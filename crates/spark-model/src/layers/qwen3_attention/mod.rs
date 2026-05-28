@@ -17,6 +17,7 @@
 mod decode;
 mod helpers;
 mod init;
+mod op_dump;
 mod prefill;
 mod prefill_weights;
 mod trait_impl;

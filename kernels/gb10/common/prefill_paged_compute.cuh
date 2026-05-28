@@ -70,6 +70,11 @@ __device__ __forceinline__ float sw_exp(float x) {
 }
 
 #define BR 32
+// B5 (chunked-prefill audit fix 2026-05-27): tried BC=64 → PTX JIT
+// failure in `inferspark_prefill_paged_batched` (smem/register budget
+// blown under PREFILL_BATCHED). Tried BC=48 → compiles but
+// non-power-of-2 doesn't align cleanly to m16n8k16 MMA fragments.
+// Reverted to BC=32 baseline; B5 deferred to a smem redesign pass.
 #define BC 32
 #ifndef HDIM
 #define HDIM 256

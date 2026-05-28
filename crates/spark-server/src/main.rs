@@ -55,9 +55,12 @@ mod symbol_trie;
 mod tokenizer;
 mod tool_arg_dedup;
 pub mod tool_parser;
+mod attractor_mask;
 mod tool_rag;
 mod tool_salvage;
+mod toml_repair;
 mod tscg;
+mod whitespace_mask;
 
 use anyhow::Result;
 use clap::Parser;

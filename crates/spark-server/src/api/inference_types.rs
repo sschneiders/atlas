@@ -54,7 +54,11 @@ pub enum GrammarSpec {
 pub enum InferenceRequest {
     /// Blocking: waits for full response.
     Blocking {
-        prompt_tokens: Vec<u32>,
+        /// Prompt token slice. `Arc`-wrapped so the scheduler request,
+        /// the streaming context, and the Tier 5c retry path can share
+        /// the read-only data without cloning ~40 KB for a typical
+        /// long-context opencode prompt.
+        prompt_tokens: std::sync::Arc<Vec<u32>>,
         /// Session hash for SSM snapshot isolation (hash of first 64 prompt tokens).
         session_hash: u64,
         /// Preprocessed image data: (pixels `[P,1536]` f32, grid_h, grid_w) per image.
@@ -127,7 +131,11 @@ pub enum InferenceRequest {
     },
     /// Streaming: sends tokens as they're generated.
     Streaming {
-        prompt_tokens: Vec<u32>,
+        /// Prompt token slice. `Arc`-wrapped so the scheduler request,
+        /// the streaming context, and the Tier 5c retry path can share
+        /// the read-only data without cloning ~40 KB for a typical
+        /// long-context opencode prompt.
+        prompt_tokens: std::sync::Arc<Vec<u32>>,
         /// Session hash for SSM snapshot isolation (hash of first 64 prompt tokens).
         session_hash: u64,
         /// Preprocessed image data: (pixels `[P,1536]` f32, grid_h, grid_w) per image.

@@ -109,6 +109,12 @@ pub(crate) async fn chat_completions_stream(
     // `<think>\n\n</think>\n\n` and the model generates no thinking tokens —
     // no need for scheduler tracking.
     let scheduler_thinking = enable_thinking;
+    // Wrap prompt tokens in Arc ONCE — the scheduler request, the
+    // streaming context, and the Tier 5c retry path all share the
+    // same Arc. No deep clones of the ~40 KB Vec<u32>.
+    let prompt_tokens = std::sync::Arc::new(prompt_tokens);
+    let prompt_tokens_for_retry = prompt_tokens.clone();
+    let grammar_spec_for_retry = grammar_spec.clone();
     let request = InferenceRequest::Streaming {
         prompt_tokens,
         session_hash,
@@ -186,6 +192,19 @@ pub(crate) async fn chat_completions_stream(
         .map(|m| m.saturating_sub(1))
         .unwrap_or(0);
 
+    // A2-AO (2026-05-26): pre-compute prompt vocabulary for always-on
+    // fuzzy repair. Decoding the full prompt tokens is ~30ms on a
+    // ~10K-token chat probe; doing it once per request keeps per-tool-
+    // call work to a HashSet lookup. Arc-wrap so the per-event closure
+    // shares the read-only set without cloning.
+    let prompt_vocab: Arc<std::collections::HashSet<String>> = {
+        let text = state
+            .tokenizer
+            .decode(&prompt_tokens_for_retry)
+            .unwrap_or_default();
+        Arc::new(tool_parser::fuzzy_repair::extract_prompt_vocab(&text))
+    };
+
     let ctx = StreamCtx {
         state: state.clone(),
         model: model_name.clone(),
@@ -205,11 +224,19 @@ pub(crate) async fn chat_completions_stream(
         req_stream_include_usage,
         req_ctx,
         dump_seq,
+        // Tier 5c
+        tool_retry_enabled: super::chat::tool_retry::tool_retry_enabled(&state) && tools_active,
+        prompt_tokens: prompt_tokens_for_retry,
+        prompt_vocab,
+        grammar_spec: grammar_spec_for_retry,
+        max_tokens,
+        timeout_at,
     };
 
     let mut stream_state = StreamState::new(tools_active, enable_thinking, cancel_flag.clone());
 
     let token_stream = ReceiverStream::new(token_rx).flat_map(move |event| {
+        use futures::StreamExt;
         let events = match event {
             StreamEvent::Token(tok) | StreamEvent::TokenWithLogprobs(tok, _) => {
                 handle_token::handle_token(&mut stream_state, &ctx, tok)
@@ -234,7 +261,99 @@ pub(crate) async fn chat_completions_stream(
             ),
             StreamEvent::Error(msg) => handle_error::handle_error(&ctx, msg),
         };
-        futures::stream::iter(events)
+
+        // Tier 5c (2026-05-26, streaming): if `pending_retry` was set
+        // during the stream (a hard validation error fired in
+        // `handle_tool_call_delta` under `ATLAS_TOOL_RETRY=1`), splice
+        // the retry's SSE events into the output stream BEFORE the
+        // `finish_reason` chunk. The retry runs on its own tokio task
+        // (no `block_in_place` — the per-event closure stays purely
+        // sync and the spawned future runs async on the same runtime).
+        if let Some(pending) = stream_state.pending_retry.take() {
+            let app_state = ctx.state.clone();
+            // Arc refcount bump — no Vec copy.
+            let prompt_tokens_clone = ctx.prompt_tokens.clone();
+            let errors_summary = pending.errors_summary;
+            let tool_defs = ctx.tool_defs_for_backfill.clone();
+            let cwd = ctx.cwd_for_normalize.clone();
+            let grammar = ctx.grammar_spec.clone();
+            let max_tok = ctx.max_tokens.min(2048);
+            let timeout = ctx.timeout_at;
+            let model = ctx.model.clone();
+            let id_str = ctx.id.clone();
+            let failed_idx = pending.failed_idx;
+
+            // Split `events` at the final `finish_reason` chunk so the
+            // retry events land in front of it. The done chunk is
+            // always emitted last by `handle_done`, so we peel off the
+            // last 1-2 events (final + optional usage) and chain
+            // around the retry. `Event` isn't `Clone`, so we move the
+            // Vec via `split_off`.
+            let final_chunks_to_peel = if ctx.req_stream_include_usage { 2 } else { 1 };
+            let mut before = events;
+            let split_point = before.len().saturating_sub(final_chunks_to_peel);
+            let after = before.split_off(split_point);
+
+            let retry_stream = futures::stream::once(async move {
+                let retry_result = super::chat::tool_retry::attempt_tool_retry(
+                    &app_state,
+                    &prompt_tokens_clone,
+                    &errors_summary,
+                    &tool_defs,
+                    cwd.as_deref(),
+                    grammar,
+                    max_tok,
+                    timeout,
+                )
+                .await;
+                let mut out: Vec<Result<axum::response::sse::Event, std::convert::Infallible>> = Vec::new();
+                match retry_result {
+                    Some(retry_calls) => {
+                        tracing::info!(
+                            "Tier 5c (stream): retry produced {} valid tool-call(s); emitting",
+                            retry_calls.len()
+                        );
+                        for (i, tc) in retry_calls.iter().enumerate() {
+                            let synth_idx = failed_idx + i;
+                            let start = ChatCompletionChunk::tool_call_start_chunk(
+                                &model, &id_str, tc, synth_idx,
+                            );
+                            out.push(Ok(axum::response::sse::Event::default()
+                                .data(serde_json::to_string(&start).unwrap_or_default())));
+                            let frag = ChatCompletionChunk::tool_call_args_fragment(
+                                &model,
+                                &id_str,
+                                synth_idx,
+                                &tc.function.arguments,
+                            );
+                            out.push(Ok(axum::response::sse::Event::default()
+                                .data(serde_json::to_string(&frag).unwrap_or_default())));
+                            crate::metrics::TOOL_CALLS_TOTAL.inc();
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            "Tier 5c (stream): retry failed — falling back to error content"
+                        );
+                        let msg = format!(
+                            "[atlas] Tool call rejected (retry also failed): {errors_summary}"
+                        );
+                        let chunk = ChatCompletionChunk::content_chunk(&model, &id_str, msg);
+                        out.push(Ok(axum::response::sse::Event::default()
+                            .data(serde_json::to_string(&chunk).unwrap_or_default())));
+                    }
+                }
+                futures::stream::iter(out)
+            })
+            .flatten();
+
+            return futures::stream::iter(before)
+                .chain(retry_stream)
+                .chain(futures::stream::iter(after))
+                .boxed();
+        }
+
+        futures::stream::iter(events).boxed()
     });
 
     // Prepend role chunk, append [DONE] sentinel

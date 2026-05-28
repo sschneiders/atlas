@@ -241,10 +241,19 @@ impl GrammarEngine {
             // close-tag-as-first-body-token failure mode without
             // requiring sampler-level intervention.
             //
-            // Trade-off: parameter VALUES that legitimately start with
-            // `<` (rare — Rust generics `<T>` inside path strings, bash
-            // redirection `< input`) cannot match. Empirically opencode
-            // tool args almost never start with `<`.
+            // F2-revert (2026-05-26): F2 had relaxed the grammar to allow
+            // `<` mid-value (`rest_part ::= [^<] | "<" [^/]`) to admit
+            // Rust generics / shell redirects / HTML in tool args. Live
+            // Wave-3 opencode testing showed the relaxation let the
+            // model fall into XML-attribute syntax (emitting
+            // `filePath="..." content="..."` inside what was supposed to
+            // be a `<parameter=filePath>` body), creating a worse drift
+            // mode than the original "1-char garbage" Epoch-3 failure.
+            // The strict `[^<]*` is restored; legitimate `<` mid-value
+            // is handled via parser-side recovery in
+            // `tool_parser/parse_single_b.rs` and, where structurally
+            // possible, the in-server schema-validation re-roll
+            // (Tier 5c).
             let body_ebnf = r#"root ::= param ("\n" param)*
 param ::= "<parameter=" paramname ">" value "</parameter>"
 paramname ::= [a-zA-Z_] [a-zA-Z_0-9]*

@@ -386,6 +386,7 @@ pub fn process_decode_logits(
             // output_tokens for correct token count; the API layer strips the
             // decoded text for blocking responses.
             a.output_tokens.push(tok);
+            crate::scheduler::emit_step::update_tool_param_state(a, tok);
             a.finished = true;
         } else if a.eos_tokens.contains(&tok) && suppress_eos {
             // EOS suppressed: grammar not terminated or legacy tool call not yet seen.
@@ -393,6 +394,13 @@ pub fn process_decode_logits(
             // Don't add to output_tokens (EOS is discarded).
         } else {
             a.output_tokens.push(tok);
+            // SM1 (2026-05-26): drive the tool-body / parameter-body
+            // state machine from the non-spec decode path. Previously
+            // only spec/verify paths called this (via emit_token),
+            // leaving every dependent gate (close-tag mask, WS1 pos-0
+            // mask, WS2, AM1, B1, A1) silently dead under
+            // `mtp=false`.
+            crate::scheduler::emit_step::update_tool_param_state(a, tok);
             // Phase-C: if this committed token is a content-phase
             // boundary token (sentence end / newline) and the model is
             // hybrid (attention + SSM), snapshot the recurrent SSM

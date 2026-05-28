@@ -37,8 +37,18 @@ pub(crate) fn preflight_reserve(
     } else {
         1
     };
+    // B4 (chunked-prefill BF16 KV cliff): the prior `.min(8192)` cap forced
+    // every prompt > 8 k to chunk, which compounds K-side BF16 rounding noise
+    // at chunk boundaries (per the 4-agent audit 2026-05-27). When the user
+    // explicitly passes `--max-prefill-tokens N` (anything other than the
+    // default 8192), respect it — no hard cap. Otherwise default to 8192 to
+    // bound GDN persistent-buffer reservation for unbounded `max_seq_len`.
     let ssm_prefill_chunk: usize = if config.num_ssm_layers() > 0 {
-        args.max_seq_len.min(8192)
+        if args.max_prefill_tokens != 8192 && args.max_prefill_tokens > 0 {
+            args.max_seq_len.min(args.max_prefill_tokens)
+        } else {
+            args.max_seq_len.min(8192)
+        }
     } else {
         0
     };

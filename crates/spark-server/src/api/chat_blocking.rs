@@ -100,6 +100,11 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> Response {
     let mut total_reasoning_tokens = 0u32;
     let mut total_cached_prompt_tokens = 0u32;
 
+    // Arc-wrap the prompt tokens ONCE. Per-choice scheduler requests
+    // and the Tier 5c retry path all share the same Arc — no Vec<u32>
+    // deep clones (~40 KB on a typical long-context opencode prompt).
+    let prompt_tokens = std::sync::Arc::new(prompt_tokens);
+
     for choice_idx in 0..n {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let request = InferenceRequest::Blocking {
@@ -192,7 +197,18 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> Response {
             tools_active,
             cwd_hint.as_deref(),
             choice_idx,
-        );
+            // Tier 5c (2026-05-26): when `ATLAS_TOOL_RETRY=1`, attempt
+            // exactly one re-sample if `validate_tool_calls` flags a
+            // hard error. Passes the original `prompt_tokens` + a few
+            // sampling params through so the retry can submit its own
+            // InferenceRequest with the model's failed attempt + a
+            // synthetic correction nudge appended.
+            &prompt_tokens,
+            grammar_spec.clone(),
+            max_tokens,
+            timeout_at,
+        )
+        .await;
 
         all_choices.push(crate::openai::ChatChoice {
             index: choice_idx,
@@ -272,7 +288,8 @@ fn decode_response_text(
 /// Build the assistant message + finish_reason for one choice. Tool
 /// parsing, validation, content-strip + refusal-classifier all live
 /// here.
-fn build_choice_message(
+#[allow(clippy::too_many_arguments)]
+async fn build_choice_message(
     state: &AppState,
     req: &ChatCompletionRequest,
     response: &super::inference_types::InferenceResponse,
@@ -281,6 +298,10 @@ fn build_choice_message(
     tools_active: bool,
     cwd_hint: Option<&str>,
     choice_idx: usize,
+    prompt_tokens: &[u32],
+    grammar_spec: Option<GrammarSpec>,
+    max_tokens: usize,
+    timeout_at: Option<std::time::Instant>,
 ) -> (crate::openai::ChatMessage, String) {
     let _ = response; // currently only used for finish_reason.clone() below
     let mut message = crate::openai::ChatMessage {
@@ -301,7 +322,33 @@ fn build_choice_message(
                 "raw pre-parse output (tools_active, choice {choice_idx}): {output_text_i:?}"
             );
         }
-        let (content, mut tool_calls_i) = tool_parser::parse_tool_calls(&output_text_i);
+        // F7 (2026-05-26): also scan `reasoning_content_i` for tool calls.
+        // When the model emits a `<tool_call>...</tool_call>` block INSIDE
+        // its `<think>...</think>` reasoning, `decode_response_text` splits
+        // at `</think>` and routes the tool call into reasoning_content,
+        // hiding it from the post-`</think>` parser below — the tool call
+        // is silently dropped (matches vLLM #39055 pattern). When found in
+        // reasoning, hoist the calls back into the assistant message and
+        // scrub the residual XML from the reasoning trace so it isn't
+        // double-emitted to the client.
+        let (hoisted_reasoning, hoisted_tool_calls): (Option<String>, Vec<_>) =
+            if let Some(ref rc) = message.reasoning_content {
+                let (scrubbed, tcs) = tool_parser::parse_tool_calls(rc);
+                (scrubbed, tcs)
+            } else {
+                (None, Vec::new())
+            };
+        if !hoisted_tool_calls.is_empty() {
+            tracing::info!(
+                "F7: hoisted {} tool-call(s) from inside <think> block (would have been silently dropped)",
+                hoisted_tool_calls.len()
+            );
+            message.reasoning_content = hoisted_reasoning.clone();
+            message.reasoning = hoisted_reasoning;
+        }
+        let (content, parsed_tool_calls) = tool_parser::parse_tool_calls(&output_text_i);
+        let mut tool_calls_i = hoisted_tool_calls;
+        tool_calls_i.extend(parsed_tool_calls);
         if !tool_calls_i.is_empty() {
             let tools_ref = req.tools.as_ref().cloned().unwrap_or_default();
             tool_parser::backfill_required_params(&mut tool_calls_i, &tools_ref);
@@ -315,10 +362,150 @@ fn build_choice_message(
             if let Some(cwd) = cwd_hint {
                 tool_parser::normalize_paths(&mut tool_calls_i, cwd);
             }
-            let validated = tool_parser::validate_tool_calls(tool_calls_i, &tools_ref);
+            // A2-AO (2026-05-26, /loop iter 1): always-on fuzzy repair.
+            // Runs BEFORE validation. Substitutes any field word whose
+            // single unambiguous Lev≤2 match in the prompt vocabulary
+            // differs from itself — closes drift #1 (path 1-byte
+            // mutations like `axum`→`axut`, `test-rust-axum`→`test/
+            // rust/axum`) which would otherwise pass validation as
+            // structurally-valid-but-wrong and never trigger the
+            // hard-error A2 fallback below.
+            {
+                let prompt_text: String = req
+                    .messages
+                    .iter()
+                    .map(|m| m.content.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let prompt_vocab =
+                    tool_parser::fuzzy_repair::extract_prompt_vocab(&prompt_text);
+                super::chat::tool_retry::apply_fuzzy_repair_inplace(
+                    &mut tool_calls_i,
+                    &prompt_vocab,
+                );
+            }
+            // SC1 (2026-05-26, /loop iter 2): TOML auto-repair on
+            // write tool calls. For any tool call where filePath ends
+            // with `.toml` AND the content fails to parse as TOML,
+            // try the SC1 repair pipeline (preamble strip + newline
+            // insertion). If a repaired version parses cleanly, swap
+            // it into the tool call's arguments. Closes the dominant
+            // residual drift mode after WS1/WS2/AM1: section-header
+            // newline collapse + model-prepended fake error preambles.
+            for tc in tool_calls_i.iter_mut() {
+                if tc.function.name != "write" {
+                    continue;
+                }
+                let Ok(serde_json::Value::Object(map)) =
+                    serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                else {
+                    continue;
+                };
+                let path_lower = map
+                    .get("filePath")
+                    .or_else(|| map.get("path"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_ascii_lowercase())
+                    .unwrap_or_default();
+                if !path_lower.ends_with(".toml") {
+                    continue;
+                }
+                let Some(content) = map.get("content").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if let Some(repaired) = crate::toml_repair::try_repair_toml(content) {
+                    let mut new_map = map.clone();
+                    new_map.insert(
+                        "content".to_string(),
+                        serde_json::Value::String(repaired),
+                    );
+                    tc.function.arguments = serde_json::Value::Object(new_map).to_string();
+                }
+            }
+            let mut validated = tool_parser::validate_tool_calls(tool_calls_i, &tools_ref);
             if !validated.errors.is_empty() {
                 for err in &validated.errors {
                     tracing::warn!("Tool call validation error: {err}");
+                }
+
+                // Tier 5c (2026-05-26): when `ATLAS_TOOL_RETRY=1`, attempt
+                // one re-sample with the model's failed attempt + a
+                // synthetic correction nudge appended. Hard errors only —
+                // "soft" errors (empty required string) get passed through
+                // to opencode as before so the client surfaces its own
+                // schema validation message.
+                let retry_enabled = super::chat::tool_retry::tool_retry_enabled(state);
+                let has_hard_err = validated
+                    .errors
+                    .iter()
+                    .any(|e| !e.contains("non-empty"));
+                if retry_enabled && has_hard_err && validated.valid.is_empty() {
+                    // A2 (2026-05-26): try fuzzy repair against the
+                    // prompt vocabulary FIRST. Levenshtein match against
+                    // identifiers the user explicitly named catches the
+                    // dominant FP8 drift mode (axum→axut, hyphen drops)
+                    // at zero inference cost. If repair succeeds, skip
+                    // the Tier 5c inference retry entirely.
+                    let prompt_text: String = req
+                        .messages
+                        .iter()
+                        .map(|m| m.content.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let prompt_vocab =
+                        tool_parser::fuzzy_repair::extract_prompt_vocab(&prompt_text);
+                    let (_, mut reparsed) = tool_parser::parse_tool_calls(&output_text_i);
+                    tool_parser::backfill_required_params(&mut reparsed, &tools_ref);
+                    if state
+                        .tool_call_parser
+                        .as_ref()
+                        .is_some_and(|p| p.wants_typed_arguments())
+                    {
+                        tool_parser::coerce_all(&mut reparsed, &tools_ref);
+                    }
+                    let mut fuzzy_succeeded = false;
+                    if !reparsed.is_empty()
+                        && let Some(fuzzy_valid) = super::chat::tool_retry::attempt_fuzzy_repair(
+                            &reparsed,
+                            &prompt_vocab,
+                            &tools_ref,
+                            cwd_hint,
+                        )
+                    {
+                        validated.valid = fuzzy_valid;
+                        validated.errors.clear();
+                        fuzzy_succeeded = true;
+                    }
+                    if !fuzzy_succeeded {
+                        let errors_summary = validated.errors.join("; ");
+                        tracing::info!(
+                            "Tier 5c: fuzzy repair didn't bite; launching one tool-call retry. Validation errors: {errors_summary}"
+                        );
+                        if let Some(retry_valid) = super::chat::tool_retry::attempt_tool_retry(
+                            state,
+                            prompt_tokens,
+                            &errors_summary,
+                            &tools_ref,
+                            cwd_hint,
+                            grammar_spec.clone(),
+                            max_tokens.min(2048),
+                            timeout_at,
+                        )
+                        .await
+                        {
+                            tracing::info!(
+                                "Tier 5c: retry produced {} valid tool-call(s) (replacing {} failed)",
+                                retry_valid.len(),
+                                validated.errors.len()
+                            );
+                            validated.valid = retry_valid;
+                            validated.errors.clear();
+                        } else {
+                            tracing::info!(
+                                "Tier 5c: retry did not produce a valid tool call — surfacing original error"
+                            );
+                        }
+                    }
                 }
             }
             // Strip orphan tool call XML tags + ```lang fences from content

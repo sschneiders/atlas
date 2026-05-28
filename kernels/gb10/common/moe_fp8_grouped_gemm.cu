@@ -28,6 +28,12 @@
 #define K_STEP 16
 #define PAD 2
 #define FP8_BLOCK 128
+// Inner-promotion stride. Smaller than FP8_BLOCK applies the same scale at
+// finer granularity within a scale-block — mathematically identical for
+// FP32 accumulators ((a+b)*s == a*s + b*s), but matches DeepGEMM's
+// "4 WGMMA per promote" structure and exposes any subtle two-level path
+// bugs more frequently. Must divide FP8_BLOCK evenly.
+#define K_PROMOTE 64
 
 __device__ __constant__ float E4M3_LUT_GMOE[256] = {
     0.0f, 0.001953125f, 0.00390625f, 0.005859375f,
@@ -175,7 +181,8 @@ extern "C" __global__ void moe_fp8_grouped_gemm(
 
     const unsigned int cta_n = blockIdx.x * N_TILE;
 
-    // Load expert weight/scale pointers from table
+    // Load expert weight/scale pointers from table.
+    // mantissa noise from the previous BF16-cast-at-use path.
     const unsigned char* B_exp = (const unsigned char*)B_weight_ptrs[expert_id];
     const __nv_bfloat16* S_exp = (const __nv_bfloat16*)B_scale_ptrs[expert_id];
     if (B_exp == 0) return;  // NULL → remote expert under EP
@@ -265,7 +272,7 @@ extern "C" __global__ void moe_fp8_grouped_gemm(
 
         // End-of-K-block: scale inner_acc, accumulate to outer_acc, reset.
         unsigned int next_k = k_base + K_STEP;
-        if (next_k % FP8_BLOCK == 0 || next_k >= K) {
+        if (next_k % K_PROMOTE == 0 || next_k >= K) {
             unsigned int k_block = k_base / FP8_BLOCK;
             float scale = __bfloat162float(S_exp[n_block * k_blocks + k_block]);
             #pragma unroll
@@ -433,7 +440,7 @@ extern "C" __global__ void moe_fp8_grouped_gemm_v2(
 
         // End-of-K-block: scale inner_acc → outer_acc, reset inner.
         unsigned int next_k = k_base + K_STEP;
-        if (next_k % FP8_BLOCK == 0 || next_k >= K) {
+        if (next_k % K_PROMOTE == 0 || next_k >= K) {
             unsigned int k_block = k_base / FP8_BLOCK;
             float scale = __bfloat162float(S_exp[n_block * k_blocks + k_block]);
             #pragma unroll

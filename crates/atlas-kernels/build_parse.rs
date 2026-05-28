@@ -143,6 +143,7 @@ pub(super) struct ParsedBehavior {
     pub disable_tool_grammar: bool,
     pub rollback_resteer: bool,
     pub rom_head: String,
+    pub tool_retry: bool,
 }
 
 impl Default for ParsedBehavior {
@@ -167,6 +168,7 @@ impl Default for ParsedBehavior {
             disable_tool_grammar: false,
             rollback_resteer: true,
             rom_head: String::new(),
+            tool_retry: true,
         }
     }
 }
@@ -271,6 +273,10 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let tool_retry = b
+        .and_then(|v| v.get("tool_retry"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     ParsedBehavior {
         thinking_in_tools,
         max_thinking_budget,
@@ -291,6 +297,7 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         disable_tool_grammar,
         rollback_resteer,
         rom_head,
+        tool_retry,
     }
 }
 

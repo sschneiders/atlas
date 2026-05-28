@@ -193,6 +193,12 @@ impl Qwen3AttentionLayer {
             v_fp8w_t: None,
             o_fp8w_t: None,
             w8a16_gemm_t_k: super::super::try_kernel(gpu, "w8a16_gemm_t", "w8a16_gemm_t"),
+            per_token_group_quant_fp8_k: super::super::try_kernel(
+                gpu, "per_token_group_quant_fp8", "per_token_group_quant_fp8",
+            ),
+            fp8_gemm_t_blockscaled_k: super::super::try_kernel(
+                gpu, "fp8_gemm_t_blockscaled", "fp8_gemm_t_blockscaled",
+            ),
             rms_norm_k: gpu.kernel("norm", "rms_norm")?,
             rms_norm_residual_k: if config.use_fp32_residual() {
                 if config.model_type == "gemma4" {
@@ -219,6 +225,21 @@ impl Qwen3AttentionLayer {
             rope_yarn_k: super::super::try_kernel(gpu, "rope", "rope_forward_yarn"),
             rope_proportional_k: super::super::try_kernel(gpu, "rope", "rope_forward_proportional"),
             reshape_cache_k: gpu.kernel(reshape_mod, reshape_fn)?,
+            fused_k_norm_rope_cache_write_bf16_k: super::super::try_kernel(
+                gpu,
+                "fused_k_norm_rope_cache",
+                "fused_k_norm_rope_cache_write_bf16",
+            ),
+            fused_k_norm_rope_mrope_cache_write_bf16_k: super::super::try_kernel(
+                gpu,
+                "fused_k_norm_rope_cache",
+                "fused_k_norm_rope_mrope_cache_write_bf16",
+            ),
+            reshape_and_cache_flash_v_only_k: super::super::try_kernel(
+                gpu,
+                "reshape_and_cache",
+                "reshape_and_cache_flash_v_only",
+            ),
             wht_bf16_k: super::super::try_kernel(gpu, "wht_bf16", "wht_bf16_inplace"),
             paged_decode_k: gpu.kernel(decode_mod, decode_fn)?,
             paged_decode_512_k: match kv_dtype {

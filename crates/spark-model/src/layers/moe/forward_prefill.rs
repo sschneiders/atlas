@@ -21,6 +21,15 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // BF16 experts (FP8-dequant-on-load path): same dispatch shape as
+        // FP8 — grouped GEMM for long prefills, fused per-token for short.
+        if self.bf16_gate_weight_ptrs.is_some() {
+            if self.moe_bf16_grouped_gemm_k.0 != 0 && num_tokens > 64 {
+                return self.forward_prefill_bf16(input, num_tokens, ctx, stream);
+            }
+            return self.forward_batched(input, num_tokens, ctx, stream);
+        }
+
         // FP8 experts: use grouped GEMM for long prefills (>64 tokens),
         // fall back to per-token fused GEMV for short prefills where
         // the GEMM launch overhead exceeds the bandwidth savings.

@@ -92,6 +92,41 @@ impl Qwen3AttentionLayer {
         let k_contiguous = ctx.buffers.ssm_qkvz();
         let v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16);
         let q_contiguous = ctx.buffers.ssm_deinterleaved();
+        // Defensive memset (audit fix #B2): clear the V region before any
+        // V-projection GEMM writes here. Historical comment on the
+        // aliasing math notes a prior "stale V on chunk-1+" regression
+        // when the V GEMM under-wrote the region. Zeroing first is
+        // ~5 µs at 9k tokens and rules that class of bug out forever.
+        ctx.gpu.memset_async(v_contiguous, 0, num_tokens * kv_dim * bf16, stream)?;
+        // B1 fused K-path: save the post-GEMM RAW K to scratch BEFORE k_norm
+        // and RoPE mutate `k_contiguous`. After the existing chain writes
+        // (incorrectly-triple-rounded K + correct V) to the paged cache, we
+        // re-do the K-path in a single fused kernel reading from this
+        // scratch buffer and OVERWRITE the K side of the cache with
+        // single-rounded values. ctx.buffers.attn_output() is free here
+        // (it's written by FA later) and sized for `num_tokens * num_q_heads
+        // * head_dim * 2`, plenty for our `num_tokens * num_kv_heads *
+        // head_dim * 2` raw-K save. Gated on:
+        //   - ATLAS_FUSED_KV=1  (opt-in during dev; expected default later)
+        //   - mrope_interleaved kernel handle loaded
+        //   - BF16 KV cache (FP8 path has its own quantization noise that
+        //     masks the cliff; not the workload that needs this fix)
+        let fused_kv_enabled = self.mrope_interleaved
+            && self.fused_k_norm_rope_mrope_cache_write_bf16_k.0 != 0
+            && self.reshape_and_cache_flash_v_only_k.0 != 0
+            && std::env::var("ATLAS_FUSED_KV").ok().as_deref() == Some("1");
+        let raw_k_scratch = if fused_kv_enabled {
+            let scratch = ctx.buffers.attn_output();
+            ctx.gpu.copy_d2d_async(
+                k_contiguous,
+                scratch,
+                num_tokens * kv_dim * bf16,
+                stream,
+            )?;
+            Some(scratch)
+        } else {
+            None
+        };
         if self.gated && !self.attn.q_norm.weight.is_null() {
             // Fused deinterleave + Q norm: eliminates Q global memory round-trip
             ops::deinterleave_qg_split_qnorm(
@@ -369,6 +404,40 @@ impl Qwen3AttentionLayer {
                 stream,
                 ctx.graph_capture,
             )?;
+            // B1 fused K-path: re-do the K side of the cache with the
+            // single-rounded fused kernel (k_norm → RoPE → BF16 write all
+            // in FP32 internally). Overwrites the triple-rounded K values
+            // the chained path just wrote. V side is left as the chained
+            // path wrote it (V passes through BF16 just once, no double-
+            // rounding to fix).
+            if let Some(raw_k) = raw_k_scratch
+                && !self.attn.k_norm.weight.is_null()
+            {
+                use spark_runtime::kv_cache::KvCacheDtype;
+                if kv_cache.dtype() == KvCacheDtype::Bf16 {
+                    ops::fused_k_norm_rope_cache_write_bf16_mrope(
+                        ctx.gpu,
+                        self.fused_k_norm_rope_mrope_cache_write_bf16_k,
+                        raw_k,
+                        self.attn.k_norm.weight,
+                        bmeta_positions,
+                        bmeta_positions_h,
+                        bmeta_positions_w,
+                        kv_cache.k_pool_ptr(self.attn_layer_idx),
+                        bmeta_slot,
+                        n,
+                        nkv,
+                        hd,
+                        self.rotary_dim_override
+                            .unwrap_or(ctx.config.rotary_dim() as u32),
+                        bs as u32,
+                        ctx.config.rms_norm_eps as f32,
+                        self.rope_theta_override
+                            .unwrap_or(ctx.config.rope_theta as f32),
+                        stream,
+                    )?;
+                }
+            }
         }
 
         // ── 8. Paged Flash Attention for chunk 1+ ── (extracted to paged_attn.rs)
@@ -424,6 +493,22 @@ impl Qwen3AttentionLayer {
             }
         }
 
+        // ATLAS_OP_DUMP: attn_out BEFORE sigmoid gate (raw attention-kernel output).
+        // Compares 1:1 against vLLM's "attn_out" dump in qwen3_next.py:_dump_op.
+        // Use last-token slice n_elements = num_heads * head_dim.
+        if num_tokens > 0 {
+            let nq_hd = (nq * hd) as usize;
+            super::super::op_dump::dump_bf16(
+                ctx.gpu,
+                attn_out,
+                (num_tokens - 1) * nq_hd * bf16,
+                nq_hd,
+                self.attn_layer_idx,
+                "attn_out_pre_gate",
+                stream,
+            )?;
+        }
+
         // ── 9. Sigmoid gate × attn_out (gated only) — single batched kernel ──
         if self.gated {
             // Gate data is in qg_out at offset q_dim (after deinterleave_qg_split),
@@ -438,6 +523,20 @@ impl Qwen3AttentionLayer {
                 nq * hd,
                 q_proj_dim as u32,
                 n,
+                stream,
+            )?;
+        }
+
+        // ATLAS_OP_DUMP: attn_out AFTER sigmoid gate (input to o_proj linear).
+        if num_tokens > 0 {
+            let nq_hd = (nq * hd) as usize;
+            super::super::op_dump::dump_bf16(
+                ctx.gpu,
+                attn_out,
+                (num_tokens - 1) * nq_hd * bf16,
+                nq_hd,
+                self.attn_layer_idx,
+                "attn_out_post_gate",
                 stream,
             )?;
         }

@@ -59,6 +59,16 @@ pub(super) fn render_template(
             if let Some(ref tcs) = m.tool_calls {
                 msg["tool_calls"] = serde_json::Value::Array(tcs.clone());
             }
+            // F1: forward historical reasoning trace to the Jinja
+            // template. The template at qwen3_5_moe.jinja:90-104
+            // reads `message.reasoning_content` and rehydrates the
+            // `<think>` block for the historical assistant turns.
+            // Without this, every historical assistant message
+            // rendered an empty `<think>\n\n</think>\n\n` wrapper
+            // (empty-think poisoning, → premature `<|im_end|>`).
+            if let Some(ref rc) = m.reasoning_content {
+                msg["reasoning_content"] = serde_json::Value::String(rc.clone());
+            }
             msg
         })
         .collect();

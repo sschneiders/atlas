@@ -31,7 +31,10 @@ pub(super) enum ResponseSink {
 
 /// An in-progress chunked prefill (prompt being processed in chunks).
 pub(super) struct PrefillInProgress {
-    pub prompt_tokens: Vec<u32>,
+    /// Arc-wrapped so the original request, the per-prefill scheduler
+    /// state, and any retry path (Tier 5c) can share the read-only
+    /// token slice without copying ~40 KB on every long prompt.
+    pub prompt_tokens: std::sync::Arc<Vec<u32>>,
     pub session_hash: u64,
     pub seq: SequenceState,
     pub chunk_offset: usize,

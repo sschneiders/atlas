@@ -79,8 +79,36 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             )
         })?;
     let sampling_presets = ptx_set.sampling;
+
+    // QV1 (2026-05-26): kernel ↔ model quant compatibility validation.
+    //
+    // `ptx_for_config` selects on (model_type, hidden_size) but not on
+    // QUANT. With ATLAS_TARGET_QUANT=* the build emits one bundle per
+    // model whose label happens to be the first variant compiled
+    // ("nvfp4") even when the bundle contains native FP8 dispatch too.
+    // For now we accept the historically-compatible pairs hardcoded in
+    // `quant_pair_compatible` (and only those). Anything else hard
+    // errors RIGHT HERE with an explicit "rebuild with X" message,
+    // before any weight loading runs and any silent garbage path can
+    // be entered. A future refinement moves the compat list into
+    // MODEL.toml `[kernel].supported_quants`.
+    let model_quant = canonicalize_model_quant(&config);
+    let kernel_quant = ptx_set.target.quant;
+    if !quant_pair_compatible(kernel_quant, &model_quant) {
+        anyhow::bail!(
+            "Kernel/model QUANT MISMATCH. Kernel target: {} (quant={kernel_quant}). \
+             Model declares quant={model_quant} ({}). \
+             The compiled kernel set has no known dispatch path for \
+             quant '{model_quant}' — loading would produce silent garbage. \
+             Rebuild with ATLAS_TARGET_QUANT={model_quant} (or =* to bundle multiple \
+             variants) and restart.",
+            ptx_set.target,
+            describe_quant_source(&config),
+        );
+    }
     tracing::info!(
-        "Selected kernel target: {} ({} modules)",
+        "Selected kernel target: {} ({} modules) — quant compat: kernel={kernel_quant} \
+         model={model_quant} OK",
         ptx_set.target,
         ptx_set.modules.len(),
     );
@@ -277,6 +305,16 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         Some(std::path::Path::new(".")), // repo root for override templates
     )?;
 
+    // WS1 (2026-05-26): scan vocab for whitespace-only tokens. Hot
+    // paths in scheduler use the result instead of the historical
+    // 5-token literal mask (which covered only 5 of ~440 in Qwen3.6).
+    crate::whitespace_mask::init(tokenizer.inner());
+
+    // AM1 (2026-05-26): register known FP8 drift attractor tokens
+    // (drift catalog #7 — the `lean://` prefix attractor). The
+    // scheduler biases these tokens down at param-body position 0.
+    crate::attractor_mask::init(tokenizer.inner());
+
     // Tokenizer-derived runtime: vocab cap, reasoning parser, think tokens,
     // im_start hard-stop, tool-call open/close tokens, and the XGrammar
     // engine.
@@ -460,6 +498,9 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             if let Some(cli_budget) = args.max_thinking_budget {
                 b.max_thinking_budget = cli_budget;
             }
+            if let Some(cli_disable) = args.disable_tool_grammar {
+                b.disable_tool_grammar = cli_disable;
+            }
             b
         },
         disable_thinking: args.disable_thinking,
@@ -518,4 +559,114 @@ fn build_auth_config(args: &cli::ServeArgs) -> Result<Option<Arc<crate::auth::Au
         if cfg.token_count() == 1 { "" } else { "s" },
     );
     Ok(Some(Arc::new(cfg)))
+}
+
+/// QV1 (2026-05-26): canonicalize the model's declared quantization to
+/// one of `"fp8"`, `"nvfp4"`, `"bf16"`, or `"unknown"`. Reads
+/// `quantization_config.quant_method`/`quant_algo`/`format` and applies
+/// the heuristics needed across ModelOpt + compressed-tensors checkpoints.
+/// Returns `"bf16"` when no quant config is present (the HF default for
+/// unquantized BF16 weights).
+fn canonicalize_model_quant(config: &atlas_core::config::ModelConfig) -> String {
+    let Some(qc) = config.quantization_config.as_ref() else {
+        return "bf16".to_string();
+    };
+    let method = qc.quant_method.to_ascii_lowercase();
+    let algo = qc.quant_algo.to_ascii_lowercase();
+    let fmt = qc.format.to_ascii_lowercase();
+    // NVFP4 detection — explicit algo OR a format string containing "nvfp4"
+    // (compressed-tensors: "nvfp4-pack-quantized" et al).
+    if algo == "nvfp4" || fmt.contains("nvfp4") {
+        return "nvfp4".into();
+    }
+    // FP8 detection — explicit algo OR method/format containing "fp8".
+    if algo == "fp8" || method.contains("fp8") || fmt.contains("fp8") {
+        return "fp8".into();
+    }
+    // compressed-tensors with no FP8/NVFP4 marker is usually GPTQ/AWQ —
+    // we don't currently dispatch those on Atlas; report verbatim so
+    // the bail message is precise.
+    if !algo.is_empty() {
+        return algo;
+    }
+    if !method.is_empty() {
+        return method;
+    }
+    "unknown".into()
+}
+
+/// QV1 helper: short debug string of where the quant declaration came
+/// from, used in the bail message so the operator can locate the
+/// mis-declared field quickly.
+fn describe_quant_source(config: &atlas_core::config::ModelConfig) -> String {
+    match config.quantization_config.as_ref() {
+        Some(qc) => format!(
+            "quant_method={:?}, quant_algo={:?}, format={:?}",
+            qc.quant_method, qc.quant_algo, qc.format
+        ),
+        None => "no quantization_config in config.json".into(),
+    }
+}
+
+/// QV1: returns `true` iff the kernel target's declared quant string is
+/// known to handle the model's canonicalized quant.
+///
+/// The current Atlas build emits one bundle per (hw, model) regardless
+/// of how many quant variants it dispatches at runtime: the bundle
+/// label is whichever `ATLAS_TARGET_QUANT` value the build script
+/// happened to record first (today: always `"nvfp4"`). Each bundle
+/// nonetheless contains native FP8 / native NVFP4 / BF16-dequant code
+/// paths for the same model. This compat table makes that explicit.
+///
+/// When new quants appear (e.g. FP4 E2M1 on a future SM), add the new
+/// entry here AND the dispatch path in the weight loader. The
+/// canonical home for this list will eventually be MODEL.toml
+/// `[kernel].supported_quants` — until then, hardcode keeps the
+/// fail-fast working without a build-time plumb-through.
+fn quant_pair_compatible(kernel_quant: &str, model_quant: &str) -> bool {
+    if kernel_quant == model_quant {
+        return true;
+    }
+    matches!(
+        (kernel_quant, model_quant),
+        // The NVFP4-labeled bundle today carries native FP8 paths
+        // (FP8 fused MoE batch1/2/3, w8a16_gemv decode, FP8 prefill).
+        ("nvfp4", "fp8") |
+        // The NVFP4 bundle also handles unquantized BF16 inputs via
+        // runtime dequant → quantize. Slow but correct.
+        ("nvfp4", "bf16") |
+        // BF16 reference bundle handles any quant by dequant on load.
+        ("bf16", "fp8") |
+        ("bf16", "nvfp4")
+    )
+}
+
+#[cfg(test)]
+mod qv1_tests {
+    use super::*;
+
+    // canonicalize_model_quant is exercised via integration through
+    // the server boot path; unit-testing it requires building
+    // ModelConfig which has no `Default` impl (it's intentionally
+    // bound to a loaded model). The pair-compatibility table is a
+    // pure function and worth a unit test.
+
+    #[test]
+    fn compat_self_pair() {
+        assert!(quant_pair_compatible("nvfp4", "nvfp4"));
+        assert!(quant_pair_compatible("fp8", "fp8"));
+        assert!(quant_pair_compatible("bf16", "bf16"));
+    }
+
+    #[test]
+    fn compat_nvfp4_handles_fp8_and_bf16() {
+        assert!(quant_pair_compatible("nvfp4", "fp8"));
+        assert!(quant_pair_compatible("nvfp4", "bf16"));
+    }
+
+    #[test]
+    fn incompat_unknown_rejected() {
+        assert!(!quant_pair_compatible("nvfp4", "gptq-4bit"));
+        assert!(!quant_pair_compatible("fp8", "nvfp4"));
+    }
 }
