@@ -720,6 +720,14 @@ pub fn process_seq_logits(
         }
     }
 
+    // Snapshot the applied bias for the logit dump BEFORE it's moved into
+    // SamplingParams (only clones when ATLAS_LOGIT_DUMP is set).
+    let dump_bias: Option<Vec<(u32, f32)>> = if super::logit_dump::enabled() {
+        Some(logit_bias_local.clone())
+    } else {
+        None
+    };
+
     let sampled = sample_with_params_history(
         f32_bytes,
         &SamplingParams {
@@ -756,6 +764,20 @@ pub fn process_seq_logits(
         },
         &a.output_tokens,
     );
+
+    // Complete per-step logit dump (#222): ATLAS_LOGIT_DUMP=<file>. Captures
+    // raw top-K + every applied bias + sampled, for Atlas↔vLLM divergence
+    // analysis. Inert unless the env var is set.
+    if let Some(bias) = dump_bias.as_ref() {
+        super::logit_dump::record(
+            a.output_tokens.len(),
+            a.inside_parameter_body,
+            a.param_body_chars_emitted as usize,
+            &f32_logits,
+            bias,
+            sampled,
+        );
+    }
 
     // Extract top-K logprobs from f32_logits if requested.
     let logprobs = a

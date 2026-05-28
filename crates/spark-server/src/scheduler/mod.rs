@@ -21,6 +21,7 @@ mod decode_step;
 mod emit_step;
 mod helpers;
 mod lifecycle;
+mod logit_dump;
 mod logit_processors;
 mod logprobs;
 mod mod_helpers;
