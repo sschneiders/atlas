@@ -226,6 +226,55 @@ pub fn find_empty_required_params(call: &ToolCall, tools: &[ToolDefinition]) -> 
 ///   should not second-guess. If it really is wrong, the filesystem op will
 ///   fail with a clear error and the model can self-correct.
 /// - Already relative paths → unchanged
+/// FP8 path-drift recovery: when a file-write's `filePath` is unusable —
+/// empty, a bare directory, or a drifted/hallucinated absolute path OUTSIDE
+/// cwd (e.g. `/tmp/harness-mtpr6/Cargo.toml` with a truncated dir, or
+/// `/tmp/pure_axioms.txt`) — infer the intended in-project path from a
+/// recognizable basename or the CONTENT shape and return it (relative to
+/// cwd). Returns None when `cur` is already a sane in-project path. The
+/// model's content is correct; only the path string drifted (low-margin FP8
+/// token flips on arbitrary path strings) — this recovers intent, it never
+/// invents content. Gated by ATLAS_WRITE_PATH_RECOVERY (PCND opt-in).
+fn recover_drifted_write_path(cur: &str, content: &str, cwd: &str) -> Option<String> {
+    let cwd_trim = cwd.trim_end_matches('/');
+    let c = cur.trim().trim_start_matches('=').trim().trim_matches('"');
+    let bn = c.rsplit('/').next().unwrap_or("");
+    let in_cwd = !c.is_empty() && c.starts_with(&format!("{cwd_trim}/"));
+    let is_dir = c.is_empty() || c.ends_with('/') || c == cwd_trim || c == cwd;
+    let sane_file = !bn.is_empty() && bn.contains('.');
+    // Already a usable in-project path (relative, or cwd-rooted) → leave it.
+    if !is_dir && sane_file && (in_cwd || !c.starts_with('/')) {
+        return None;
+    }
+    // 1) Drifted DIR but recognizable basename → canonical in-project location.
+    if sane_file {
+        let low = bn.to_ascii_lowercase();
+        if low == "cargo.toml" {
+            return Some("Cargo.toml".into());
+        }
+        if low == "main.rs" {
+            return Some("src/main.rs".into());
+        }
+        if low == "lib.rs" {
+            return Some("src/lib.rs".into());
+        }
+        if low.ends_with(".rs") {
+            return Some(format!("src/{bn}"));
+        }
+        if low.ends_with(".toml") || low.ends_with(".lock") {
+            return Some(bn.to_string());
+        }
+    }
+    // 2) Empty / bare-dir / unrecognizable path → infer from content shape.
+    if content.contains("[package]") || content.contains("[dependencies]") {
+        return Some("Cargo.toml".into());
+    }
+    if content.contains("fn main(") {
+        return Some("src/main.rs".into());
+    }
+    None
+}
+
 pub fn normalize_paths(calls: &mut [ToolCall], cwd: &str) {
     // Common parameter names that contain file paths
     const PATH_KEYS: &[&str] = &["file_path", "filePath", "path", "file"];
@@ -288,6 +337,36 @@ pub fn normalize_paths(calls: &mut [ToolCall], cwd: &str) {
                     args.insert(key.to_string(), serde_json::Value::String(new_path));
                     changed = true;
                 }
+            }
+        }
+        // FP8 path-drift recovery for file writes (env-gated, PCND opt-in).
+        if std::env::var("ATLAS_WRITE_PATH_RECOVERY").as_deref() == Ok("1")
+            && matches!(
+                call.function.name.as_str(),
+                "write" | "Write" | "edit" | "Edit"
+            )
+        {
+            let content = args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let cur = ["filePath", "file_path", "path", "file"]
+                .iter()
+                .find_map(|k| args.get(*k).and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            if let Some(rp) = recover_drifted_write_path(&cur, &content, cwd) {
+                for k in ["file_path", "path", "file"] {
+                    args.remove(k);
+                }
+                tracing::warn!(
+                    "ATLAS_WRITE_PATH_RECOVERY: drifted write path {:?} → {:?} (content-inferred)",
+                    cur,
+                    rp
+                );
+                args.insert("filePath".to_string(), serde_json::Value::String(rp));
+                changed = true;
             }
         }
         if changed && let Ok(new_args) = serde_json::to_string(&serde_json::Value::Object(args)) {
