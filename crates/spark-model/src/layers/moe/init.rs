@@ -49,12 +49,7 @@ impl MoeLayer {
                 .kernel("moe_shared_expert_fused", "moe_expert_silu_down_shared")?,
             moe_topk: gpu.kernel("moe_topk", "moe_topk_softmax")?,
             moe_weighted_sum_blend: gpu.kernel("moe_expert_gemv", "moe_weighted_sum_blend")?,
-            residual_add: if config.use_fp32_residual() {
-                gpu.kernel("norm", "f32_residual_add")
-                    .or_else(|_| gpu.kernel("residual_add", "bf16_residual_add"))?
-            } else {
-                gpu.kernel("residual_add", "bf16_residual_add")?
-            },
+            residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
             moe_topk_batched: gpu.kernel("moe_topk", "moe_topk_softmax_batched")?,
             moe_expert_gate_up_shared_batch2: gpu
                 .kernel("moe_fused_batch2", "moe_expert_gate_up_shared_batch2")?,

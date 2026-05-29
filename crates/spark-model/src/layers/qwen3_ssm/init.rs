@@ -35,12 +35,7 @@ impl Qwen3SsmLayer {
             qkvz_fp8w: None,
             out_proj_fp8w: None,
             sequential_qkvz: false,
-            rms_norm_residual_k: if config.use_fp32_residual() {
-                gpu.kernel("norm", "rms_norm_residual_f32")
-                    .or_else(|_| gpu.kernel("norm", "rms_norm_residual"))?
-            } else {
-                gpu.kernel("norm", "rms_norm_residual")?
-            },
+            rms_norm_residual_k: gpu.kernel("norm", "rms_norm_residual")?,
             gated_rms_norm_k: gpu.kernel("norm", "gated_rms_norm")?,
             gated_rms_norm_f32_k: super::super::try_kernel(gpu, "norm", "gated_rms_norm_f32_input"),
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
@@ -79,19 +74,9 @@ impl Qwen3SsmLayer {
                 "gated_delta_rule_decode_f32",
             ),
             ba_gates_k: gpu.kernel("ssm_preprocess", "dense_gemv_ba_gates")?,
-            residual_add_k: if config.use_fp32_residual() {
-                gpu.kernel("norm", "f32_residual_add")
-                    .or_else(|_| gpu.kernel("residual_add", "bf16_residual_add"))?
-            } else {
-                gpu.kernel("residual_add", "bf16_residual_add")?
-            },
+            residual_add_k: gpu.kernel("residual_add", "bf16_residual_add")?,
             l2_norm_k: gpu.kernel("norm", "l2_norm_bf16")?,
-            residual_add_rms_norm_k: if config.use_fp32_residual() {
-                gpu.kernel("norm", "residual_add_rms_norm_f32")
-                    .or_else(|_| gpu.kernel("norm", "residual_add_rms_norm"))?
-            } else {
-                gpu.kernel("norm", "residual_add_rms_norm")?
-            },
+            residual_add_rms_norm_k: gpu.kernel("norm", "residual_add_rms_norm")?,
             gated_rms_norm_prefill_k: gpu.kernel("norm", "gated_rms_norm_prefill")?,
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_k: gpu.kernel("w4a16", "w4a16_gemm_t")?,

@@ -128,11 +128,6 @@ pub struct MtpHead {
 
     // Kernel handles (always needed)
     rms_norm_k: KernelHandle,
-    /// FP32-input rms_norm: used for the step-2 hidden norm when the main
-    /// model runs an FP32 residual stream (ATLAS_FP32_RESIDUAL). The saved
-    /// hidden is then FP32; reading it as BF16 (rms_norm_k) yields NaN →
-    /// constant draft 0 → 0% MTP acceptance. This reads it as FP32, BF16 out.
-    rms_norm_f32_k: KernelHandle,
     rms_norm_residual_k: KernelHandle,
     w4a16_gemv_k: KernelHandle,
     w4a16_gemv_qg_k: KernelHandle,

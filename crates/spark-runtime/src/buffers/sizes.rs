@@ -131,9 +131,8 @@ impl BufferSizes {
         // Total slots = num_seqs * num_splits ≤ NUM_SMS, so this is constant ~48 KB.
         let splitk_workspace = 48 * (hd + 2) * 4;
 
-        // Residual dtype controlled by config.use_fp32_residual().
-        // FP32 prevents BF16 truncation across 48 layers but costs 2x bandwidth.
-        let residual_elem = if config.use_fp32_residual() { 4 } else { bf16 };
+        // The residual stream is always BF16.
+        let residual_elem = bf16;
 
         Self {
             hidden_states: m * h * residual_elem,

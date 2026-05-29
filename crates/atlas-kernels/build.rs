@@ -395,17 +395,6 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
         .to_string();
     println!("cargo:rerun-if-changed={}", hw_toml_path.display());
 
-    // Propagate hardware config flags to Rust code via compile-time env vars
-    if let Some(fp32_res) = hw_toml["hardware"]
-        .get("use_fp32_residual")
-        .and_then(|v| v.as_bool())
-    {
-        println!(
-            "cargo:rustc-env=ATLAS_HW_FP32_RESIDUAL={}",
-            if fp32_res { "true" } else { "false" }
-        );
-    }
-
     // Expand model wildcard (exclude the `common/` shared-kernel dir,
     // which has no MODEL.toml).
     let models: Vec<String> = if model_spec == "*" {

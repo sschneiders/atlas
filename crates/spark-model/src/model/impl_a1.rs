@@ -52,30 +52,14 @@ impl TransformerModel {
         ssm_cache_slots: usize,
         ssm_checkpoint_interval: usize,
     ) -> Result<Self> {
-        let fp32_residual = config.use_fp32_residual();
-        let rms_norm_kernel = if fp32_residual {
-            gpu.kernel("norm", "rms_norm_f32")
-                .or_else(|_| gpu.kernel("norm", "rms_norm"))?
-        } else {
-            gpu.kernel("norm", "rms_norm")?
-        };
-        let bf16_to_f32_kernel = if fp32_residual {
-            gpu.kernel("residual_add", "bf16_to_f32")
-                .unwrap_or(KernelHandle(0))
-        } else {
-            KernelHandle(0) // BF16 models don't need conversion
-        };
+        let rms_norm_kernel = gpu.kernel("norm", "rms_norm")?;
+        // Residual stream is always BF16 — no BF16→FP32 conversion needed.
+        let bf16_to_f32_kernel = KernelHandle(0);
         let dense_gemv_kernel = gpu.kernel("gemv", "dense_gemv_bf16")?;
-        // FP32-output dense GEMV — only loaded when LM head needs FP32 logits.
-        // For models that don't use FP32 residual, this stays KernelHandle(0)
-        // and the BF16 path is taken. The kernel lives in the same `gemv`
-        // module as `dense_gemv_bf16` so this lookup is cheap.
-        let dense_gemv_fp32out_kernel = if fp32_residual {
-            gpu.kernel("gemv", "dense_gemv_bf16_fp32out")
-                .unwrap_or(KernelHandle(0))
-        } else {
-            KernelHandle(0)
-        };
+        // FP32-output dense GEMV — the FP32 logits path required an FP32
+        // residual stream, which no longer exists, so this stays
+        // KernelHandle(0) and the BF16 path is always taken.
+        let dense_gemv_fp32out_kernel = KernelHandle(0);
         let w4a16_gemv_kernel = gpu.kernel("w4a16_gemv", "w4a16_gemv")?;
         let w4a16_gemv_logits_kernel = gpu.kernel("w4a16_gemv", "w4a16_gemv_logits")?;
         let w4a16_gemm_kernel = gpu.kernel("w4a16", "w4a16_gemm")?;
@@ -83,12 +67,7 @@ impl TransformerModel {
         let dense_gemm_kernel = gpu.kernel("gemm", "dense_gemm_bf16")?;
         let argmax_kernel = gpu.kernel("argmax", "argmax_bf16")?;
         let argmax_logits_kernel = gpu.kernel("argmax", "argmax_fp32")?;
-        let batched_embed_kernel = if fp32_residual {
-            gpu.kernel("embed_from_argmax", "batched_embed_f32")
-                .or_else(|_| gpu.kernel("embed_from_argmax", "batched_embed"))?
-        } else {
-            gpu.kernel("embed_from_argmax", "batched_embed")?
-        };
+        let batched_embed_kernel = gpu.kernel("embed_from_argmax", "batched_embed")?;
         let fill_slots_kernel = gpu.kernel("metadata_fill", "fill_slots_from_block_table")?;
         let profile = std::env::var("ATLAS_PROFILE").is_ok();
         let profile_first = std::env::var("ATLAS_PROFILE_FIRST").is_ok();
@@ -281,15 +260,9 @@ impl TransformerModel {
         // FP32 softcap variant — only loaded when both softcap and FP32
         // residual are active (i.e. Gemma-4 dense). Other models keep the
         // BF16 softcap (or no softcap at all).
-        let logit_softcap_fp32_kernel = if config.final_logit_softcapping > 0.0 && fp32_residual {
-            gpu.kernel("logit_softcap", "logit_softcap_fp32")
-                .unwrap_or_else(|e| {
-                    tracing::warn!("logit_softcap_fp32 kernel not found: {e}");
-                    KernelHandle(0)
-                })
-        } else {
-            KernelHandle(0)
-        };
+        // The FP32 logit softcap variant required an FP32 residual stream,
+        // which no longer exists, so the BF16 softcap path is always taken.
+        let logit_softcap_fp32_kernel = KernelHandle(0);
         // FP32 logits gate. The LM head produces FP32 (rather than BF16)
         // logits when the residual stream is FP32 AND the LM head is a
         // dense BF16 weight (no NVFP4 quant). NVFP4 LM heads keep their
@@ -323,12 +296,10 @@ impl TransformerModel {
         // bisection's *qualitative* conclusion: FP32 lm_head + softcap
         // doesn't materially fix Gemma-4's structural NVFP4 attention
         // drift on greedy code generation. Fix is upstream of lm_head.
-        let env_override = std::env::var("ATLAS_GEMMA4_FP32_LMHEAD").ok();
-        let fp32_requested = matches!(env_override.as_deref(), Some("1") | Some("true"));
-        let use_fp32_logits = fp32_requested
-            && fp32_residual
-            && ((lm_head_nvfp4.is_none() && dense_gemv_fp32out_kernel.0 != 0)
-                || (lm_head_nvfp4.is_some() && w4a16_gemv_logits_kernel.0 != 0));
+        // FP32 logits (ATLAS_GEMMA4_FP32_LMHEAD) required an FP32 residual
+        // stream as a precondition. With the residual stream now always BF16,
+        // the FP32 logits path can never activate, so it is permanently off.
+        let use_fp32_logits = false;
         // Dedicated FP32 logits scratch — only the single-token decode path
         // uses it. Prefill and batched-decode lm_head still write BF16 to the
         // shared `buffers.logits()`. Sized for one row of `vocab_size` FP32.

@@ -310,13 +310,7 @@ impl MtpHead {
             kv_cache: Mutex::new(kv_cache),
             attn_layer_idx: 0,
             rms_norm_k: gpu.kernel("norm", "rms_norm")?,
-            rms_norm_f32_k: gpu.kernel("norm", "rms_norm_f32")?,
-            rms_norm_residual_k: if config.use_fp32_residual() {
-                gpu.kernel("norm", "rms_norm_residual_f32")
-                    .or_else(|_| gpu.kernel("norm", "rms_norm_residual"))?
-            } else {
-                gpu.kernel("norm", "rms_norm_residual")?
-            },
+            rms_norm_residual_k: gpu.kernel("norm", "rms_norm_residual")?,
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_qg_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_qg")?,
             w4a16_gemv_dual_k: gpu.kernel("w4a16_gemv_fused", "w4a16_gemv_dual")?,
@@ -332,18 +326,8 @@ impl MtpHead {
                 gpu.kernel("paged_decode_fp8", "paged_decode_attn_fp8")?
             },
             kv_bf16,
-            residual_add_k: if config.use_fp32_residual() {
-                gpu.kernel("norm", "f32_residual_add")
-                    .or_else(|_| gpu.kernel("residual_add", "bf16_residual_add"))?
-            } else {
-                gpu.kernel("residual_add", "bf16_residual_add")?
-            },
-            residual_add_rms_norm_k: if config.use_fp32_residual() {
-                gpu.kernel("norm", "residual_add_rms_norm_f32")
-                    .or_else(|_| gpu.kernel("norm", "residual_add_rms_norm"))?
-            } else {
-                gpu.kernel("norm", "residual_add_rms_norm")?
-            },
+            residual_add_k: gpu.kernel("residual_add", "bf16_residual_add")?,
+            residual_add_rms_norm_k: gpu.kernel("norm", "residual_add_rms_norm")?,
             sigmoid_gate_mul_k: gpu.kernel("residual_add", "sigmoid_gate_mul")?,
             bf16_concat_k: gpu.kernel("residual_add", "bf16_concat")?,
             argmax_k: gpu.kernel("argmax", "argmax_bf16")?,

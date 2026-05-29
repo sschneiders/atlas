@@ -245,11 +245,6 @@ impl TransformerModel {
         let stream = self.gpu.default_stream();
         let v = self.config.vocab_size;
         let bf16 = 2usize;
-        let _fp32 = if self.config.use_fp32_residual() {
-            4usize
-        } else {
-            2usize
-        };
         let out_ptr = self.buffers.scratch();
         for i in 0..n {
             let logits_i = logits_ptr.offset(i * v * bf16);

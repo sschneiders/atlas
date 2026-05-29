@@ -56,11 +56,7 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<DevicePtr> {
         let h = self.config.hidden_size;
-        let fp32 = if self.config.use_fp32_residual() {
-            4usize
-        } else {
-            2usize
-        };
+        let fp32 = 2usize;
         let hidden = self.buffers.hidden_states();
         let bs = kv_cache.block_size();
 

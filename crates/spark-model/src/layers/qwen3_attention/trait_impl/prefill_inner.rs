@@ -418,14 +418,7 @@ impl Qwen3AttentionLayer {
 
         // Gemma-4: hidden *= layer_scalar at end of layer (applied to ALL tokens)
         if let Some(scalar) = self.layer_scalar {
-            self.apply_layer_scalar(
-                ctx.gpu,
-                hidden,
-                num_tokens * h,
-                scalar,
-                stream,
-                ctx.config.use_fp32_residual(),
-            )?;
+            self.apply_layer_scalar(ctx.gpu, hidden, num_tokens * h, scalar, stream)?;
         }
 
         // DIAGNOSTIC: residual after L0 and L35

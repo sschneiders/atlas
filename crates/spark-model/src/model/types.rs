@@ -190,17 +190,9 @@ pub struct TransformerModel {
     /// Used when `use_fp32_logits` is true.
     pub(super) logit_softcap_fp32_kernel: KernelHandle,
     /// Whether the single-token decode LM head produces FP32 logits (rather
-    /// than BF16). True when `config.use_fp32_residual()` AND the LM head is
-    /// a dense BF16 weight (no NVFP4 quant). Drives:
-    ///   - dense_gemv_bf16_fp32out kernel writes to `logits_fp32_buf`
-    ///   - logit_softcap_fp32 kernel applied in place on the FP32 buffer
-    ///   - sampler reads FP32 directly, skipping BF16→FP32 expansion
-    ///
-    /// Gated by config.model_type=="gemma4" via use_fp32_residual() — other
-    /// models keep the BF16 path. Prefill / batched-decode lm_head still
-    /// write BF16 to `buffers.logits()`; only single-token decode is FP32
-    /// because the bug it fixes (greedy argmax tiebreak flip on the BF16
-    /// representable boundary at value 16-32) only manifests there.
+    /// than BF16). The FP32 logits path required an FP32 residual stream as a
+    /// precondition; with the residual stream now always BF16, this is always
+    /// false and the BF16 logits path is always taken.
     pub(super) use_fp32_logits: bool,
     /// FP32 logits scratch [vocab_size × 4 bytes]. NULL when `use_fp32_logits`
     /// is false (no allocation).

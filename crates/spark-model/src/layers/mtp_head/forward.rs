@@ -75,19 +75,11 @@ impl MtpHead {
             stream,
         )?;
 
-        // The saved hidden is FP32 when the main model runs an FP32 residual
-        // stream — read it with the FP32-input rms_norm (BF16 output) so it
-        // isn't misinterpreted as BF16 (which NaNs → constant draft 0 → 0%
-        // MTP acceptance). The token embedding above is always BF16.
+        // The saved hidden is always BF16 (the residual stream is BF16).
         let normed_hidden = ctx.buffers.ssm_gates();
-        let hidden_norm_k = if ctx.config.use_fp32_residual() {
-            self.rms_norm_f32_k
-        } else {
-            self.rms_norm_k
-        };
         ops::rms_norm(
             ctx.gpu,
-            hidden_norm_k,
+            self.rms_norm_k,
             target_hidden,
             &self.pre_fc_norm_hidden,
             normed_hidden,
@@ -488,24 +480,8 @@ impl MtpHead {
                     .sum::<f64>()
                     .sqrt()
             };
-            let f32_norm = |p: DevicePtr, n: usize| -> f64 {
-                let mut b = vec![0u8; n * 4];
-                if ctx.gpu.copy_d2h(p, &mut b).is_err() {
-                    return -1.0;
-                }
-                b.chunks_exact(4)
-                    .map(|c| {
-                        let f = f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64;
-                        f * f
-                    })
-                    .sum::<f64>()
-                    .sqrt()
-            };
-            let hin = if ctx.config.use_fp32_residual() {
-                f32_norm(target_hidden, h as usize)
-            } else {
-                bf16_norm(target_hidden, h as usize)
-            };
+            // The residual stream is always BF16, so the saved hidden is BF16.
+            let hin = bf16_norm(target_hidden, h as usize);
             tracing::warn!(
                 "MTP_DEBUG_NORMS: ||input_hidden||={:.4} ||final_normed||={:.4} ||logits||={:.4}",
                 hin,
