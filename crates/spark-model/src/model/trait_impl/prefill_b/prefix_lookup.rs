@@ -138,6 +138,16 @@ impl TransformerModel {
                             prefix_match.matched_blocks.len(),
                             snap_id,
                         );
+                        // Exact full-prompt leaf hit (snap_tok == matched ==
+                        // total): the last prompt token is re-run for logits,
+                        // double-advancing the SSM recurrent state. Flag it so
+                        // finalize_last re-restores state@N and emits the first
+                        // token from the snapshot's stashed hidden. Only when
+                        // the whole prompt matched — a shorter-than-total match
+                        // (matched < total) continues forward correctly.
+                        if matched == total {
+                            seq.marconi_exact_snap = Some(snap_id);
+                        }
                     }
                     true
                 } else {

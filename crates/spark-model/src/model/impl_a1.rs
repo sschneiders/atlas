@@ -158,6 +158,10 @@ impl TransformerModel {
             ssm_pool.num_ssm_layers,
             decode_ring_slots,
             max_batch_size,
+            // Last-token hidden snapshot: post-final-norm `norm_output` is
+            // BF16 (`hidden_size` elements). Used to emit exact-hit logits
+            // without re-running the last token through the SSM layers.
+            config.hidden_size * 2,
             gpu.as_ref(),
         )?;
         if ssm_checkpoint_interval > 0 && ssm_cache_slots > 0 {

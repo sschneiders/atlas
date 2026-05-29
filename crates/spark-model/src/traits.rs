@@ -88,6 +88,13 @@ pub struct SequenceState {
     /// Set on chunk 0's prefix cache lookup, read by subsequent chunks to skip
     /// computation for tokens already covered by the snapshot + KV cache.
     pub marconi_skip_to: usize,
+    /// Marconi exact-hit: snapshot slot when the *entire* prompt matched a
+    /// leaf snapshot (`matched == total`). On this path the last prompt
+    /// token is re-run for logits, which double-advances the SSM recurrent
+    /// state; `finalize_last` uses this to re-restore the pristine state@N
+    /// and emit the first token's logits from the snapshot's stashed hidden
+    /// instead. `None` for all other paths.
+    pub marconi_exact_snap: Option<usize>,
     /// Session hash for SSM snapshot isolation. Set by the scheduler before
     /// prefill. The model uses this to tag saved snapshots and verify ownership
     /// before restoring. 0 = no session tracking (legacy behavior).

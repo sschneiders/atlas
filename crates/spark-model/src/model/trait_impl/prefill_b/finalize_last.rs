@@ -108,6 +108,39 @@ impl TransformerModel {
             .ok();
         }
 
+        // ── 6b. Marconi exact-hit fixup ──
+        // On an exact full-prompt leaf hit the last prompt token was re-run
+        // for logits (proc_range Compute{N-1, 1}). For SSM layers that re-run
+        // applies the last token's recurrent update a second time on top of
+        // the restored state@N → double-advance, corrupting both the logits
+        // computed above and the pool state decode will read. Undo it:
+        //   (1) re-restore the pristine SSM state@N from the snapshot, and
+        //   (2) overwrite `normed` with the snapshot's stashed last-token
+        //       post-norm hidden so `lm_head` emits the correct first token.
+        // The redundant 1-token forward is otherwise harmless (its KV write
+        // duplicates already-cached values).
+        if let Some(snap_id) = seq.marconi_exact_snap {
+            self.ssm_snapshots.restore(
+                snap_id,
+                seq.slot_idx,
+                &self.ssm_pool,
+                self.gpu.as_ref(),
+                stream,
+            )?;
+            if self.ssm_snapshots.has_hidden(snap_id) {
+                self.ssm_snapshots
+                    .restore_hidden(snap_id, normed, self.gpu.as_ref(), stream)?;
+            } else {
+                // Leaf snapshots always stash the hidden; absence means a
+                // non-leaf snapshot was matched at full length. Fail loud
+                // rather than silently emit double-advanced logits.
+                tracing::warn!(
+                    "Marconi exact hit on snapshot {snap_id} without stashed hidden — \
+                     first-token logits may be degraded (SSM state restored)"
+                );
+            }
+        }
+
         // ── 7. LM head on last token → logits ──
         self.lm_head(normed, stream)?;
 
@@ -168,7 +201,12 @@ impl TransformerModel {
         }
 
         // ── 8. Insert into prefix cache + Marconi snapshot ──
-        if self.ssm_snapshots.is_enabled() {
+        // Exact full-prompt hit: the snapshot and cache entry we matched
+        // already exist — nothing new to persist, and re-inserting would
+        // churn the radix tree. Skip the whole save/insert phase.
+        if seq.marconi_exact_snap.is_some() {
+            // nothing to save (handled in the exact-hit fixup above)
+        } else if self.ssm_snapshots.is_enabled() {
             let snap_result = match self.ssm_snapshots.save(
                 seq.slot_idx,
                 seq.session_hash,
@@ -213,6 +251,13 @@ impl TransformerModel {
                         tokens.len(),
                         seq.block_table.len(),
                     );
+                    // Stash the last-token post-norm hidden so a future exact
+                    // full-prompt hit can emit the first token's logits without
+                    // re-running the last token through the SSM layers. `normed`
+                    // still holds the post-final-norm last-token hidden here
+                    // (lm_head reads it without mutating).
+                    self.ssm_snapshots
+                        .save_hidden(snap_id, normed, self.gpu.as_ref(), stream)?;
                     let (displaced, acquired) = self.prefix_cache.insert_with_snapshot(
                         tokens,
                         &seq.block_table,
