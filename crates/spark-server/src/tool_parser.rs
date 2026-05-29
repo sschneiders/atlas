@@ -365,7 +365,7 @@ mod qwen3_xml;
 mod streaming;
 mod streaming_impl;
 mod type_coerce;
-mod validation;
+pub(crate) mod validation;
 
 pub use bare_json::*;
 pub use gemma4::*;

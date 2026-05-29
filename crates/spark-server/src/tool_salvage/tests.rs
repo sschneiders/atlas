@@ -71,6 +71,61 @@ fn fenced_block_with_file_info_string_writes_to_path() {
 }
 
 #[test]
+fn bare_rust_fence_infers_main_rs_when_inference_enabled() {
+    // Narrate-then-tool failure mode (FP8 drift): the model renders the
+    // whole main.rs inside a bare ```rust fence with NO `:path` info-
+    // string and never emits the write() tool call. With path inference
+    // enabled, the body's content shape (`fn main(`) recovers
+    // `src/main.rs`. Calls the pure extractor directly so the test is
+    // deterministic (no env dependence).
+    let content = "Here's the server:\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n";
+    let tools = [write_tool()];
+    let matchers: Vec<_> = tools.iter().map(super::shape::ToolShape::new).collect();
+
+    // Inference OFF (default): a bare fence with no path is dropped.
+    let off = super::extract::extract_fenced(content, &matchers, false);
+    assert!(
+        off.is_empty(),
+        "bare rust fence must NOT salvage when inference disabled"
+    );
+
+    // Inference ON: content shape recovers src/main.rs.
+    let on = super::extract::extract_fenced(content, &matchers, true);
+    assert_eq!(on.len(), 1);
+    assert_eq!(on[0].function.name, "Write");
+    let args: serde_json::Value = serde_json::from_str(&on[0].function.arguments).unwrap();
+    assert_eq!(args["file_path"], "src/main.rs");
+    assert!(args["content"].as_str().unwrap().contains("fn main()"));
+}
+
+#[test]
+fn bare_toml_fence_infers_cargo_toml_when_inference_enabled() {
+    let content = "Cargo manifest:\n\n```toml\n[package]\nname = \"x\"\nversion = \"0.1.0\"\n```\n";
+    let tools = [write_tool()];
+    let matchers: Vec<_> = tools.iter().map(super::shape::ToolShape::new).collect();
+    let on = super::extract::extract_fenced(content, &matchers, true);
+    assert_eq!(on.len(), 1);
+    let args: serde_json::Value = serde_json::from_str(&on[0].function.arguments).unwrap();
+    assert_eq!(args["file_path"], "Cargo.toml");
+    assert!(args["content"].as_str().unwrap().contains("[package]"));
+}
+
+#[test]
+fn bare_illustrative_fence_without_signature_is_not_salvaged() {
+    // A ```rust snippet with no `fn main(` / `[package]` signature must
+    // NOT synthesize a spurious write even with inference enabled —
+    // guards against converting illustrative code into a file write.
+    let content = "For example:\n\n```rust\nlet x = 1 + 2;\n```\n";
+    let tools = [write_tool()];
+    let matchers: Vec<_> = tools.iter().map(super::shape::ToolShape::new).collect();
+    let on = super::extract::extract_fenced(content, &matchers, true);
+    assert!(
+        on.is_empty(),
+        "snippet without a project-file signature must not salvage"
+    );
+}
+
+#[test]
 fn header_body_extracts_two_files() {
     let content = "Now I'll create the project files:\n\n\
                        Cargo.toml\n\n[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\

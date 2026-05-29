@@ -86,7 +86,25 @@ pub(super) fn parse_xml_kv(
 /// ```` ```LANG\n<body>\n``` ```` — fenced-code form. Salvages when
 /// LANG matches a tool name (or "shell"→bash) AND the tool has
 /// exactly one required string parameter.
-pub(super) fn extract_fenced(content: &str, matchers: &[ToolShape]) -> Vec<ToolCall> {
+///
+/// For the file-write shape (path + content params) the target path is
+/// recovered two ways:
+///   (a) an explicit `LANG:path` info-string the model spelled out, or
+///   (b) when `infer_paths` is set and there is NO info-path, from the
+///       fence body's CONTENT shape (`fn main(`→`src/main.rs`,
+///       `[package]`→`Cargo.toml`).
+///
+/// (b) recovers the narrate-then-tool failure mode (FP8 drift): the
+/// model renders an entire file inside a bare ```rust/```toml fence and
+/// never emits the `write()` tool call, so the file never lands. It is
+/// opt-in (caller gates on `ATLAS_WRITE_PATH_RECOVERY`) and uses the
+/// same classifier as the drifted-write-path recovery — it recovers
+/// intent from content the model produced, never invents content.
+pub(super) fn extract_fenced(
+    content: &str,
+    matchers: &[ToolShape],
+    infer_paths: bool,
+) -> Vec<ToolCall> {
     let mut out = Vec::new();
     let mut search = 0usize;
     while let Some(rel) = content[search..].find("```") {
@@ -125,16 +143,27 @@ pub(super) fn extract_fenced(content: &str, matchers: &[ToolShape]) -> Vec<ToolC
         for m in matchers {
             let mname = m.name_lower();
             if !lang_aliases.contains(&mname.as_str()) {
-                // Try the file-write shape: lang denotes file type,
-                // info-string carries `:path`.
-                if let (Some(path), Some((path_prop, content_prop))) =
-                    (path_in_info.as_ref(), m.path_and_content())
-                {
-                    let mut args = serde_json::Map::new();
-                    args.insert(path_prop, serde_json::Value::String(path.clone()));
-                    args.insert(content_prop, serde_json::Value::String(body.to_string()));
-                    if let Some(tc) = synthesise(m.name(), &args, "fenced") {
-                        out.push(tc);
+                // File-write shape: the fence LANG denotes a file type
+                // rather than a command. Recover the target path from the
+                // explicit `:path` info-string, or — when `infer_paths`
+                // is on and no info-path was given — from the body's
+                // content shape (narrate-then-tool recovery).
+                if let Some((path_prop, content_prop)) = m.path_and_content() {
+                    let path = path_in_info.clone().or_else(|| {
+                        if infer_paths {
+                            crate::tool_parser::validation::classify_path_from_content(body)
+                                .map(str::to_string)
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(path) = path {
+                        let mut args = serde_json::Map::new();
+                        args.insert(path_prop, serde_json::Value::String(path));
+                        args.insert(content_prop, serde_json::Value::String(body.to_string()));
+                        if let Some(tc) = synthesise(m.name(), &args, "fenced") {
+                            out.push(tc);
+                        }
                     }
                 }
                 continue;

@@ -60,6 +60,14 @@ pub fn salvage(content: &str, tools: &[ToolDefinition]) -> Vec<ToolCall> {
     }
     let matchers: Vec<ToolShape<'_>> = tools.iter().map(ToolShape::new).collect();
 
+    // Narrate-then-tool recovery: when the model renders an entire file
+    // inside a bare ```rust/```toml fence (no `:path` info-string) and
+    // emits no write() call, let the fenced extractor infer the target
+    // from the content shape. Same opt-in policy + classifier as the
+    // drifted-write-path recovery (PCND: off unless the operator sets
+    // ATLAS_WRITE_PATH_RECOVERY=1).
+    let infer_paths = std::env::var("ATLAS_WRITE_PATH_RECOVERY").as_deref() == Ok("1");
+
     let mut out: Vec<ToolCall> = Vec::new();
     let emit_unique = |tc: ToolCall, out: &mut Vec<ToolCall>| {
         // Dedupe by exact (name, args) match OR by (name, file_path)
@@ -94,7 +102,7 @@ pub fn salvage(content: &str, tools: &[ToolDefinition]) -> Vec<ToolCall> {
     for tc in extract::extract_xml(content, &matchers) {
         emit_unique(tc, &mut out);
     }
-    for tc in extract::extract_fenced(content, &matchers) {
+    for tc in extract::extract_fenced(content, &matchers, infer_paths) {
         emit_unique(tc, &mut out);
     }
     for tc in extract::extract_heredoc(content, &matchers) {
