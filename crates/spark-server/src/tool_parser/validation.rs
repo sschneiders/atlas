@@ -425,6 +425,29 @@ pub fn validate_single_tool_call(call: &ToolCall, tools: &[ToolDefinition]) -> R
             if let Some(serde_json::Value::String(path)) = args.get(*key) {
                 let trimmed = path.trim();
                 if trimmed.is_empty() {
+                    // #211 option-B diagnostic (env-gated): pinpoint the
+                    // empty_path drift — generation vs parse. Logs the full
+                    // post-parse arg shape (keys + per-value lengths). An
+                    // empty filePath alongside a large `content` is the
+                    // self-truncation generation pattern (F78); filePath
+                    // absent ⇒ omission; a path under an unexpected key ⇒
+                    // parser. Inert unless ATLAS_TOOLCALL_DEBUG=1.
+                    if std::env::var("ATLAS_TOOLCALL_DEBUG").as_deref() == Ok("1") {
+                        let shape: Vec<String> = args
+                            .iter()
+                            .map(|(k, v)| match v {
+                                serde_json::Value::String(s) => {
+                                    format!("{k}=str(len={})", s.len())
+                                }
+                                other => format!("{k}={}", other),
+                            })
+                            .collect();
+                        tracing::warn!(
+                            tool = %name, empty_key = %key,
+                            "ATLAS_TOOLCALL_DEBUG empty-path arg shape: [{}]",
+                            shape.join(", ")
+                        );
+                    }
                     return Err(format!(
                         "Error: {name} requires a non-empty '{key}'. \
                              Got empty string — provide an absolute path \

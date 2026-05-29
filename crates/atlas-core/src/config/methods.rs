@@ -216,6 +216,14 @@ impl ModelConfig {
     /// FP32 lm_head path (gated by `ATLAS_GEMMA4_FP32_LMHEAD=1`) can
     /// then act on full-precision weights without the NVFP4 floor.
     pub fn skip_lm_head_quantization(&self) -> bool {
+        // A/B lever (FP8 gap #lm-head-nvfp4-quant): keep the LM head in BF16
+        // instead of runtime-quantizing it to NVFP4. The 4-bit floor on the
+        // final vocab projection is a prime suspect for argmax flips in long
+        // structured generation; vLLM keeps lm_head at checkpoint precision.
+        // Explicit opt-in (PCND) — default behavior unchanged.
+        if std::env::var("ATLAS_LMHEAD_BF16").ok().as_deref() == Some("1") {
+            return true;
+        }
         if self.kv_lora_rank > 0 {
             return true;
         }

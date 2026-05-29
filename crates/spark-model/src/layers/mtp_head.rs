@@ -128,6 +128,11 @@ pub struct MtpHead {
 
     // Kernel handles (always needed)
     rms_norm_k: KernelHandle,
+    /// FP32-input rms_norm: used for the step-2 hidden norm when the main
+    /// model runs an FP32 residual stream (ATLAS_FP32_RESIDUAL). The saved
+    /// hidden is then FP32; reading it as BF16 (rms_norm_k) yields NaN →
+    /// constant draft 0 → 0% MTP acceptance. This reads it as FP32, BF16 out.
+    rms_norm_f32_k: KernelHandle,
     rms_norm_residual_k: KernelHandle,
     w4a16_gemv_k: KernelHandle,
     w4a16_gemv_qg_k: KernelHandle,
@@ -135,6 +140,12 @@ pub struct MtpHead {
     rope_k: KernelHandle,
     reshape_cache_k: KernelHandle,
     paged_decode_k: KernelHandle,
+    /// MTP KV cache dtype: true = BF16 (matches the main model), false = FP8.
+    /// The FP8 path hard-passed k_scale=v_scale=1.0 which collapsed the MTP
+    /// attention output to a constant on Qwen3.6-A3B (large deep-layer K/V
+    /// magnitudes) → constant draft token 0 → 0% acceptance. BF16 KV (this
+    /// head is a single tiny attention layer) fixes it. Gated by mtp_quant.
+    kv_bf16: bool,
     residual_add_k: KernelHandle,
     residual_add_rms_norm_k: KernelHandle,
     sigmoid_gate_mul_k: KernelHandle,

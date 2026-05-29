@@ -100,6 +100,25 @@ multiple lines\n\
 </parameter>\n\
 </function>\n\
 </tool_call>\n\n\
+");
+        // #211 option-B A/B (off-policy hypothesis): Qwen3.6 was RL-tuned
+        // against the SHORT official <IMPORTANT> reminder (chat_template.jinja
+        // line 53). Atlas's expanded IMMEDIATE_TOOL_USE + 10-bullet IMPORTANT
+        // diverges from that trained distribution and correlates with
+        // malformed tool calls (empty {filePath,content} scaffolds, mixed
+        // <function_calls> tags). ATLAS_OFFICIAL_TOOL_PROMPT=1 swaps in the
+        // verbatim official 4-bullet reminder. Default = current Atlas block.
+        if std::env::var("ATLAS_OFFICIAL_TOOL_PROMPT").as_deref() == Ok("1") {
+            prompt.push_str("\
+<IMPORTANT>\n\
+Reminder:\n\
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n\
+- Required parameters MUST be specified\n\
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n\
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n\
+</IMPORTANT>");
+        } else {
+            prompt.push_str("\
 <IMMEDIATE_TOOL_USE>\n\
 Tools are IMMEDIATELY EXECUTABLE. When you decide to use a tool, emit the <tool_call> directly. The tool_call's parameter values are the ONLY place file content, commands, or other tool inputs should appear — do NOT pre-render that content as prose or in markdown fences before the call.\n\
 For 'bash'/'Bash' tools specifically: do NOT stage the command in a ```bash``` fence and do NOT prefix with phrases like \"Let me run this command:\" or \"Let me execute:\". The next emission after deciding to run a shell command must be the <tool_call> — the command goes inside <parameter=command>, not in markdown.\n\
@@ -122,8 +141,8 @@ Example:\n\
 - Tool names like 'write', 'read', 'edit', 'bash' are ONLY valid inside the `<function=NAME>` line of a `<tool_call>` block. NEVER emit bare tags like `<write>`, `<filePath>`, or `<command>` at the top level of your content.\n\
 - You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after.\n\
 - If there is no function call available, answer the question with your current knowledge and do not tell the user about function calls.\n\
-</IMPORTANT>",
-        );
+</IMPORTANT>");
+        }
         append_tool_choice_instruction(&mut prompt, tool_choice);
         prompt
     }

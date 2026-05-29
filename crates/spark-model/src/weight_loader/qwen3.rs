@@ -108,19 +108,32 @@ impl ModelWeightLoader for Qwen3WeightLoader {
             } else {
                 load_moe(store, &lp, config.num_experts, gpu, config, variant, qctx)?
             };
-            let gate_nvfp4 = quantize_to_nvfp4(
-                &moe_weights.gate,
-                config.num_experts,
-                h,
-                gpu,
-                absmax_k,
-                quantize_k,
-                stream,
-            )?;
+            // ATLAS_BF16_ROUTER=1: keep the MoE router/gate in BF16 (skip the
+            // NVFP4 quant) so expert SELECTION is decided by full-precision gate
+            // logits. The bf16moe experiment showed dequanting EXPERTS to BF16
+            // eliminates the empty_path tool-call drift (FP8 flips were the seed)
+            // but halves decode throughput. The router is a tiny num_experts×h
+            // GEMM, so making ONLY it high-precision targets the expert-selection
+            // flips at ~zero throughput cost (experts stay FP8). The forward
+            // (dense_gemv/dense_gemm) already falls back to weights.gate (BF16)
+            // when gate_nvfp4 is None. Explicit opt-in (PCND); default unchanged.
+            let gate_nvfp4 = if std::env::var("ATLAS_BF16_ROUTER").as_deref() == Ok("1") {
+                None
+            } else {
+                Some(quantize_to_nvfp4(
+                    &moe_weights.gate,
+                    config.num_experts,
+                    h,
+                    gpu,
+                    absmax_k,
+                    quantize_k,
+                    stream,
+                )?)
+            };
             let mut moe_layer = MoeLayer::new(
                 moe_weights,
                 config.num_experts,
-                Some(gate_nvfp4),
+                gate_nvfp4,
                 gpu,
                 config,
             )?;
