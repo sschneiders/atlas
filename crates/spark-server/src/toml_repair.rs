@@ -293,6 +293,32 @@ axum = "0.8"
     }
 
     #[test]
+    fn probe_r105_content_leak_missing_eq() {
+        // r105 shape: collapsed one-line + `version.workspace true` (no =)
+        // + trailing `</content>` XML leak.
+        let broken = r#"[package] name = "pingpong" version.workspace true edition = "2024" [dependencies] axum = "0.8"</content>"#;
+        let r = try_repair_toml(broken);
+        eprintln!("PROBE r105 => {:?}", r);
+    }
+
+    #[test]
+    fn probe_r110_content_leak() {
+        // r110 shape: collapsed one-line + trailing `</content>` XML leak,
+        // axum="0".
+        let broken = r#"[package] name = "srv" version = "0.1.0" edition = "2024" [dependencies] axum = "0"</content>"#;
+        let r = try_repair_toml(broken);
+        eprintln!("PROBE r110 => {:?}", r);
+    }
+
+    #[test]
+    fn probe_r4_pure_collapse() {
+        // r4 shape: pure newline collapse, no XML leak. SC1 should fix.
+        let broken = r#"[package] name = "x" version = "0.1.0" edition = "2024" [dependencies] axum = { version = "0.8", features=["json"] }"#;
+        let r = try_repair_toml(broken);
+        eprintln!("PROBE r4 => {:?}", r);
+    }
+
+    #[test]
     fn newline_collapse_run8() {
         // run_sm1_8.json — partial collapse (mid-line `version = "X" edition = "Y"`).
         let broken = r#"[package]
