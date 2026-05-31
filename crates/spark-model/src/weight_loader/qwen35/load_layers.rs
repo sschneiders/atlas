@@ -206,13 +206,22 @@ pub(super) fn load_layers(
         // route MoE through the BF16 grouped GEMM + fused-decode kernels.
         // Eliminates the per-layer 0.989 FP8 cosine ceiling. Memory cost:
         // ~2× expert weights vs native FP8.
+        // ATLAS_FP8_DEQUANT_LAYERS (PCND opt-in): restrict BF16 dequant to a
+        // subset of absolute layer indices (e.g. "31-39" or "31,35,39"). Unset
+        // → all layers (legacy behaviour). Selective late-layer BF16 targets
+        // the worst-drift deep layers while keeping early layers FP8-fast,
+        // cutting the ~2× MoE decode bandwidth that drives 360s harness
+        // timeouts (the bit-perfect speed wall, task #231).
+        let layer_sel = layer_dequant_selected(i);
         let dequant_moe_to_bf16 = native_fp8
-            && std::env::var("ATLAS_FP8_DEQUANT_MOE_TO_BF16").ok().as_deref() == Some("1");
+            && std::env::var("ATLAS_FP8_DEQUANT_MOE_TO_BF16").ok().as_deref() == Some("1")
+            && layer_sel;
         // Diagnostic: dequant attention Q/K/V/O FP8→BF16 at load and run them
         // through dense BF16 GEMM (isolates the FP8-attention contribution to
         // the Atlas↔vLLM cosine floor). TP=1 only.
         let dequant_attn_to_bf16 = native_fp8
-            && std::env::var("ATLAS_FP8_DEQUANT_ATTN_TO_BF16").ok().as_deref() == Some("1");
+            && std::env::var("ATLAS_FP8_DEQUANT_ATTN_TO_BF16").ok().as_deref() == Some("1")
+            && layer_sel;
 
         if dequant_moe_to_bf16 {
             use crate::weight_map::dequant_fp8_blockscaled_to_bf16;
@@ -597,4 +606,36 @@ pub(super) fn load_layers(
     );
 
     Ok(layers)
+}
+
+/// Whether absolute layer index `layer` is selected for BF16 dequant per
+/// `ATLAS_FP8_DEQUANT_LAYERS` (PCND opt-in). The spec is a comma-separated
+/// list of singletons and inclusive ranges, e.g. `"31-39"` or `"31,35,39"`.
+/// Unset → every layer selected (legacy all-layers behaviour). Parsed once.
+fn layer_dequant_selected(layer: usize) -> bool {
+    use std::sync::OnceLock;
+    // None  = env unset → all layers; Some(ranges) = explicit selection.
+    static SPEC: OnceLock<Option<Vec<(usize, usize)>>> = OnceLock::new();
+    let spec = SPEC.get_or_init(|| {
+        let s = std::env::var("ATLAS_FP8_DEQUANT_LAYERS").ok()?;
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for part in s.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some((a, b)) = part.split_once('-') {
+                if let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                    ranges.push((a.min(b), a.max(b)));
+                }
+            } else if let Ok(a) = part.parse::<usize>() {
+                ranges.push((a, a));
+            }
+        }
+        Some(ranges)
+    });
+    match spec {
+        None => true,
+        Some(ranges) => ranges.iter().any(|&(a, b)| layer >= a && layer <= b),
+    }
 }
