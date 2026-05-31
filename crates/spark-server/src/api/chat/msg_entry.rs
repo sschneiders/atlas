@@ -61,6 +61,11 @@ pub(super) fn build_msg_entries(
     let mut all_images: Vec<String> = Vec::new();
     let mut image_pad_counts: Vec<usize> = Vec::new();
     let mut consecutive_tool_errors: u32 = 0;
+    // BW1 bash-wandering watchdog: tally tool-call productivity across the
+    // conversation so a steering nudge can fire if the agent explores/runs
+    // many commands without ever writing the deliverable (gap #9).
+    let mut total_tool_calls: usize = 0;
+    let mut productive_tool_calls: usize = 0;
 
     // F6 (2026-05-26): `last_query_index` was previously used to gate
     // an empty `<think>\n\n</think>\n\n` injection for historical
@@ -100,6 +105,20 @@ pub(super) fn build_msg_entries(
         } else {
             None
         };
+
+        // BW1: tally tool-call productivity (write/edit/build-run vs explore).
+        if m.role == "assistant"
+            && let Some(ref tcs) = m.tool_calls
+        {
+            for tc in tcs {
+                total_tool_calls += 1;
+                let args: serde_json::Value =
+                    serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+                if crate::hint_injector::tool_call_is_productive(&tc.function.name, &args) {
+                    productive_tool_calls += 1;
+                }
+            }
+        }
 
         // Tool-response messages: pass raw content; Jinja template
         // handles `<tool_response>` wrapping and consecutive
@@ -241,6 +260,18 @@ pub(super) fn build_msg_entries(
     }
     // If no vision_config (text-only model), image_pad_counts stays
     // 0 and images are silently dropped on the encoder side.
+
+    // BW1 bash-wandering watchdog: if the agent has run many tool calls with
+    // no productive file output, append a steering nudge to the most recent
+    // tool response (what the model reads just before its next action). Gated
+    // by ATLAS_BASH_WANDER_WATCHDOG (PCND, default-off).
+    if tools_active
+        && let Some(hint) =
+            crate::hint_injector::bash_wander_hint(total_tool_calls, productive_tool_calls)
+        && let Some(last_tool) = messages.iter_mut().rev().find(|e| e.role == "tool")
+    {
+        last_tool.content.push_str(&hint);
+    }
 
     Ok(BuildOut {
         messages,
