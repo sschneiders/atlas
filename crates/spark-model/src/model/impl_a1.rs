@@ -413,7 +413,11 @@ impl TransformerModel {
             // naturally outside the captured region.
             suppress_graphs: std::sync::atomic::AtomicBool::new(
                 has_fp8_calibration
-                    || std::env::var("ATLAS_DIAG_GEMMA4").is_ok_and(|v| v == "1" || v == "true"),
+                    || std::env::var("ATLAS_DIAG_GEMMA4").is_ok_and(|v| v == "1" || v == "true")
+                    // PCND diagnostic: force eager decode (no CUDA-graph capture)
+                    // so ATLAS_DEBUG_SYNC_KERNELS can synchronize per launch and
+                    // surface async faults at the culprit kernel. Default-off.
+                    || std::env::var("ATLAS_DEBUG_NO_GRAPH").as_deref() == Ok("1"),
             ),
             ssm_pool,
             ssm_snapshots,
