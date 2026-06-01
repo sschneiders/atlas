@@ -173,15 +173,35 @@ impl TransformerModel {
                 );
             }
             // For SSM models: use ssm_snapshot_tokens (not matched) as skip point.
-            // Exception: when matched == total (exact prompt match), the snapshot
-            // covers the entire prompt, so skip all tokens.
+            // Exception: when the snapshot covers the ENTIRE matched prefix
+            // (snap_tok == matched) AND the whole prompt matched
+            // (matched == total), the restored recurrent state is already
+            // at token `total`, so we can skip all tokens (the exact-hit
+            // fixup in finalize_last handles the redundant last-token re-run).
+            //
+            // CRITICAL (warm-hit SSM corruption fix): when an *intermediate*
+            // checkpoint matched at full prompt length (snap_tok < matched
+            // == total — e.g. the leaf snapshot was evicted from the
+            // 16-slot pool under agentic churn, leaving only a block-aligned
+            // checkpoint), the restored recurrent state is at token
+            // `snap_tok`, NOT `total`. Skipping to `total` here would leave
+            // the SSM h_state/conv_state stale by (total - snap_tok) tokens
+            // while positions/KV advance to `total`, so the first decoded
+            // token reads a misaligned recurrent state → garbage → immediate
+            // stop (empty completion). We MUST skip only to `snap_tok` so the
+            // suffix-prefill recomputes SSM over [snap_tok, total), exactly
+            // like the `matched < total` intermediate path. The redundant KV
+            // writes for [snap_tok, matched) are harmless (they duplicate
+            // already-cached values).
+            //
             // For pure attention (MLA/GQA): use matched tokens directly.
+            let snap_tok = prefix_match.ssm_snapshot_tokens;
             let skip_tokens = if skip && !has_ssm {
                 matched
-            } else if skip && matched == total {
+            } else if skip && matched == total && snap_tok == matched {
                 matched
             } else if skip {
-                prefix_match.ssm_snapshot_tokens
+                snap_tok
             } else {
                 0
             };

@@ -143,14 +143,17 @@ run_one() {
 
   local START_TS END_TS START_TS_INT
   START_TS=$(date +%s.%N)
-  # opencode has its own internal timeout; we cap at 6 min as a hard ceiling.
+  # opencode has its own internal timeout; we cap at OC_TIMEOUT seconds as a
+  # hard ceiling. Default 360 (6 min) is the established harness ceiling; the
+  # OC_TIMEOUT env var overrides it for de-confounding experiments (e.g. slow
+  # full-BF16 runs that need a longer agentic budget to finish).
   # ATLAS_HARNESS_PORT is exposed both to opencode (so the model can read it
   # to write port-reading Rust) AND to score_run.py (so it can curl the right port).
   # --dir sets opencode's working directory; the model sees only "current
   # working directory" in the prompt, never the absolute path.
   ATLAS_HARNESS_PORT=3001 \
   ${extra_env} \
-    timeout 360 opencode run --dangerously-skip-permissions --dir "${TARGET}" --format json \
+    timeout "${OC_TIMEOUT:-360}" opencode run --dangerously-skip-permissions --dir "${TARGET}" --format json \
     "${PROMPT}" > "${OC_JSON}" 2> "${OC_ERR}" || true
   END_TS=$(date +%s.%N)
 
