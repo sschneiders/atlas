@@ -64,7 +64,22 @@ pub(super) fn check_loops(
         let tool_args_len: usize = m.tool_calls.as_ref().map_or(0, |tcs| {
             tcs.iter().map(|tc| tc.function.arguments.len()).sum()
         });
-        let is_substantial = m.content.text.len() >= 500 || tool_args_len >= 100;
+        // A turn that issued ANY tool call is taking an action (progress) — it
+        // is NOT spinning, even when the args are short. In an agentic coding
+        // loop the verify cycle (`bash cargo build`, `bash cargo run`,
+        // `bash curl`, `read`, small `edit`) is a run of legitimately
+        // short-arg tool calls; counting those as "short" tripped the
+        // recent_short>=5 spinning suppressor and hard-masked the NEXT
+        // tool_call, killing the build→error→fix→rebuild loop after ~5 turns
+        // (Atlas capped at ~4-5 turns vs vLLM's 12-17 on the same task).
+        // Genuine repeated-tool-call loops are caught separately by
+        // `loop_detector::detect` (the Suppress verdict above); spinning here
+        // should only fire on consecutive short PURE-TEXT turns (no action).
+        let made_tool_call = m
+            .tool_calls
+            .as_ref()
+            .is_some_and(|tcs| !tcs.is_empty());
+        let is_substantial = made_tool_call || m.content.text.len() >= 500 || tool_args_len >= 100;
         if is_substantial {
             break;
         }
