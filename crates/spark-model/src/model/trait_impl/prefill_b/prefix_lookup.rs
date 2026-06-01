@@ -156,6 +156,25 @@ impl TransformerModel {
             } else {
                 false
             };
+            // CBD probe (env-gated, default OFF = current behavior): bypass the
+            // exact-leaf-hit snapshot shortcut + marconi_exact_snap fixup, routing
+            // exact full-prompt hits through full recompute (the proven-correct
+            // cache-off-equivalent). Isolates whether the exact-snap stashed-hidden
+            // path degrades output quality (cache-ON ws ~23% vs cache-OFF ~60% with
+            // give-ups already eliminated). If ws climbs with this set, that path
+            // is the residual bug.
+            if skip
+                && prefix_match.ssm_snapshot_tokens == matched
+                && matched == total
+                && std::env::var("ATLAS_NO_MARCONI_EXACT").as_deref() == Ok("1")
+            {
+                skip = false;
+                seq.marconi_exact_snap = None;
+                tracing::info!(
+                    "ATLAS_NO_MARCONI_EXACT: bypassing exact-leaf snapshot shortcut \
+                     for {matched}-token full hit — recomputing all KV+SSM"
+                );
+            }
             let has_ssm = self.config.num_ssm_layers() > 0;
             if matched > 0 && !skip && has_ssm {
                 tracing::info!(
