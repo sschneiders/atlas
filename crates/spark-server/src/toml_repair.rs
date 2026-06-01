@@ -73,7 +73,52 @@ fn generate_repair_candidates(content: &str) -> Vec<String> {
     }
     // (b) Newline insertion only
     out.push(insert_newlines(content));
+    // (c) Strip C-style `//` comments (TOML uses `#`). The FP8 model
+    // sometimes annotates Cargo.toml lines with `// ...`, e.g.
+    // `name = "x"  // not real TOML`, which makes the whole file
+    // unparseable. Combine with the other steps too.
+    let decommented = strip_line_comments(content);
+    if decommented != content {
+        out.push(decommented.clone());
+        out.push(insert_newlines(&decommented));
+        if let Some(stripped) = strip_preamble(&decommented) {
+            out.push(stripped);
+        }
+    }
     out
+}
+
+/// Strip C-style `//` line comments that the FP8 model occasionally
+/// emits in Cargo.toml (TOML's comment marker is `#`, not `//`).
+/// Conservative + char-safe: per line, truncate at the first `//` that
+/// occurs OUTSIDE a double-quoted string (so `https://…` inside a
+/// string value, or a `#`-comment, is untouched). Re-validated by the
+/// caller, so a wrong strip simply fails to parse and is discarded.
+fn strip_line_comments(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    for (idx, line) in content.split('\n').enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        out.push_str(strip_line_comment_one(line));
+    }
+    out
+}
+
+fn strip_line_comment_one(line: &str) -> &str {
+    let b = line.as_bytes();
+    let mut in_str = false;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'"' && !is_escaped(b, i) {
+            in_str = !in_str;
+        } else if !in_str && b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+            // `i` is the byte index of an ASCII '/', a valid char boundary.
+            return line[..i].trim_end();
+        }
+        i += 1;
+    }
+    line
 }
 
 /// Find the first `[` at the start of a line (`\n[` or beginning of
@@ -330,5 +375,27 @@ version = "0.1.0" edition = "2024"
         let repaired = try_repair_toml(broken);
         assert!(repaired.is_some(), "expected repair on partial collapse");
         assert!(toml::from_str::<toml::Value>(&repaired.unwrap()).is_ok());
+    }
+
+    #[test]
+    fn cpp_comment_strip_nothink_r1() {
+        // disable-thinking run produced: `name = "x"  // This is just
+        // metadata, not real TOML` — `//` is invalid TOML and breaks parse.
+        let broken = "[package]\nname = \"harness-server\"  // This is just metadata, not real TOML\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        let repaired = try_repair_toml(broken);
+        assert!(repaired.is_some(), "expected // comment strip");
+        let r = repaired.unwrap();
+        assert!(toml::from_str::<toml::Value>(&r).is_ok());
+        assert!(!r.contains("//"), "comment should be stripped");
+        assert!(r.contains("harness-server"), "value preserved");
+    }
+
+    #[test]
+    fn cpp_comment_preserves_url_in_string() {
+        // A `//` INSIDE a string (e.g. a URL) must NOT be stripped.
+        let s = "[package]\nname = \"x\"\nversion = \"0.1.0\"\nhomepage = \"https://example.com/x\"\n";
+        // already valid → try_repair returns None, but the stripper itself
+        // must leave the URL intact.
+        assert_eq!(strip_line_comments(s), s);
     }
 }

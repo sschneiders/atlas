@@ -117,6 +117,13 @@ pub(super) fn extract_fenced(
             .unwrap_or(content.len());
         let info = content[after..info_end].trim();
         let body_start = info_end + 1;
+        // Guard: a fence with no newline after the info string (a bare ``` at
+        // end-of-content) makes info_end == content.len(), so body_start would
+        // be content.len()+1 and the slice below panics. No body can follow —
+        // stop scanning.
+        if body_start > content.len() {
+            break;
+        }
         // Find closing fence.
         let Some(close_rel) = content[body_start..].find("\n```") else {
             break;
@@ -305,4 +312,19 @@ pub(super) fn extract_header_body(content: &str, matchers: &[ToolShape]) -> Vec<
             synthesise(write_shape.name(), &args, "header_body")
         })
         .collect()
+}
+
+#[cfg(test)]
+mod eof_fence_regression {
+    use super::*;
+
+    // Regression: a bare ``` at end-of-content with no trailing newline made
+    // body_start = content.len()+1 and panicked the slice at extract.rs:121.
+    #[test]
+    fn bare_fence_at_eof_does_not_panic() {
+        let _ = extract_fenced("intro text\n```", &[], false);
+        let _ = extract_fenced("```", &[], true);
+        let _ = extract_fenced("a```", &[], false);
+        let _ = extract_fenced("```rust", &[], true);
+    }
 }
