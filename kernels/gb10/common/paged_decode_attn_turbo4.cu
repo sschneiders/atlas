@@ -30,6 +30,15 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+__device__ __forceinline__ float scl_fp8(unsigned char b) {
+    unsigned int s = (b >> 7) & 1u, e = (b >> 3) & 0xFu, m = b & 0x7u; float v;
+    if (e == 0u)               v = (float)m * 0.001953125f;
+    else if (e == 15u && m == 7u) v = 0.0f;
+    else                       v = __uint_as_float(((e + 120u) << 23) | (m << 20));
+    return s ? -v : v;
+}
+
+
 #define WARP_SIZE 32
 #ifndef HDIM
 #define HDIM 256
@@ -48,7 +57,7 @@ __device__ __forceinline__ void unpack2_bf16(unsigned int packed, float& v0, flo
 }
 
 __device__ __forceinline__ float fp8e4m3_to_f32(__nv_fp8_storage_t b) {
-    return __half2float(__nv_cvt_fp8_to_halfraw(b, __NV_E4M3));
+    return scl_fp8(b);  // standard E4M3 (SCALE __NV_E4M3 non-standard)
 }
 
 // Load packed NVFP4 data + FP8 group scale → dequantized floats.

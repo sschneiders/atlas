@@ -179,10 +179,14 @@ impl TransformerModel {
                 }
             }
             // Diagnostic: dump hidden state norm after first 4 and last 4 layers
-            if profile_now && (i < 4 || i >= self.layers.len() - 4) {
+            if (profile_now && (i < 4 || i >= self.layers.len() - 4))
+                || std::env::var("ATLAS_DUMP_LAYER_NORM").is_ok()
+            {
                 self.gpu.synchronize(stream)?;
-                let (_, norm) = self.readback_bf16(hidden, self.config.hidden_size.min(64))?;
-                tracing::info!("L{i} hidden[0] norm={norm:.4}");
+                let _lo = (proc_count - 1) * h * 2;
+                let (vals, norm) = self.readback_bf16(hidden.offset(_lo), 8)?;
+                let lt = self.config.layer_type(i);
+                tracing::info!("L{i} ({lt:?}) LASTnorm={norm:.4} v={:.4?}", &vals[..4.min(vals.len())]);
             }
             // Last-chunk diagnostic: log LAST token's hidden norm at every layer.
             if profile_now && is_last_chunk && proc_count > 1 && (chunk_start + chunk_len) > 16384 {

@@ -15,6 +15,25 @@
 // So storing WHT(K) and WHT(V) preserves attention correctness.
 
 #include <cuda_bf16.h>
+
+__device__ __forceinline__ float scl_fp8(unsigned char b) {
+    unsigned int s = (b >> 7) & 1u, e = (b >> 3) & 0xFu, m = b & 0x7u; float v;
+    if (e == 0u)               v = (float)m * 0.001953125f;
+    else if (e == 15u && m == 7u) v = 0.0f;
+    else                       v = __uint_as_float(((e + 120u) << 23) | (m << 20));
+    return s ? -v : v;
+}
+__device__ __forceinline__ unsigned char scl_enc_fp8(float v) {
+    if (v != v) return 0x7F;                 // NaN
+    unsigned int bb = __float_as_uint(v); unsigned int sign = (bb >> 31) & 1u;
+    int e = (int)((bb >> 23) & 0xFF) - 127; unsigned int man = bb & 0x7FFFFFu;
+    int ee = e + 7; unsigned int em;
+    if (ee < 1) { ee = 0; em = 0; if (e >= -10) { float a = v < 0 ? -v : v; em = (unsigned int)(a / 0.001953125f + 0.5f); if (em > 7u) em = 7u; } }
+    else if (ee > 15) { ee = 15; em = 6; }
+    else { em = (man + (1u << 19)) >> 20; if (em > 7u) { em = 0; ee++; if (ee > 15) { ee = 15; em = 6; } } }
+    return (unsigned char)((sign << 7) | ((unsigned)ee << 3) | em);
+}
+
 #include <cuda_fp8.h>
 
 #define GROUP_SIZE 16
@@ -50,7 +69,7 @@ __device__ __forceinline__ __nv_fp8_storage_t float_to_fp8(float val) {
     // NVIDIA's own documented intrinsic with identical SATFINITE+E4M3
     // semantics — numerically exact, not an approximation. (SCALE defines
     // __SCALE__, not __HIP_PLATFORM_AMD__, in the device pass.)
-    return __nv_cvt_float_to_fp8(val, __NV_SATFINITE, __NV_E4M3);
+    return scl_enc_fp8(val);
 #else
     unsigned short pair;
     asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %1;"

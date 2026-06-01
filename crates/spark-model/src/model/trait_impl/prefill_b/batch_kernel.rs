@@ -442,6 +442,27 @@ impl TransformerModel {
                     stream,
                 )?;
             }
+            if std::env::var("ATLAS_DUMP_LAYER_NORM").is_ok() {
+                let _ = self.gpu.synchronize(stream);
+                let mut hb = vec![0u8; h * dtype_bytes];
+                let _ = self.gpu.copy_d2h(hidden_base, &mut hb);
+                let mut ss = 0f64;
+                let mut nonfinite = false;
+                if dtype_bytes == 4 {
+                    for c in hb.chunks_exact(4) {
+                        let x = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                        if !x.is_finite() { nonfinite = true; }
+                        ss += (x as f64) * (x as f64);
+                    }
+                } else {
+                    for c in hb.chunks_exact(2) {
+                        let x = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
+                        if !x.is_finite() { nonfinite = true; }
+                        ss += (x as f64) * (x as f64);
+                    }
+                }
+                eprintln!("[layer-norm] L{layer_idx} ssm={} hidden_norm={:.4} nonfinite={}", layer.is_ssm_layer(), ss.sqrt(), nonfinite);
+            }
         }
 
         // ── PHASE C: per-stream finalize ──

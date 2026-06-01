@@ -24,6 +24,25 @@
 
 #include <cuda_bf16.h>
 
+__device__ __forceinline__ float scl_fp8(unsigned char b) {
+    unsigned int s = (b >> 7) & 1u, e = (b >> 3) & 0xFu, m = b & 0x7u; float v;
+    if (e == 0u)               v = (float)m * 0.001953125f;
+    else if (e == 15u && m == 7u) v = 0.0f;
+    else                       v = __uint_as_float(((e + 120u) << 23) | (m << 20));
+    return s ? -v : v;
+}
+__device__ __forceinline__ unsigned char scl_enc_fp8(float v) {
+    if (v != v) return 0x7F;                 // NaN
+    unsigned int bb = __float_as_uint(v); unsigned int sign = (bb >> 31) & 1u;
+    int e = (int)((bb >> 23) & 0xFF) - 127; unsigned int man = bb & 0x7FFFFFu;
+    int ee = e + 7; unsigned int em;
+    if (ee < 1) { ee = 0; em = 0; if (e >= -10) { float a = v < 0 ? -v : v; em = (unsigned int)(a / 0.001953125f + 0.5f); if (em > 7u) em = 7u; } }
+    else if (ee > 15) { ee = 15; em = 6; }
+    else { em = (man + (1u << 19)) >> 20; if (em > 7u) { em = 0; ee++; if (ee > 15) { ee = 15; em = 6; } } }
+    return (unsigned char)((sign << 7) | ((unsigned)ee << 3) | em);
+}
+
+
 extern "C" __global__ void reshape_and_cache_flash(
     const __nv_bfloat16* __restrict__ key,       // [num_tokens, num_kv_heads, head_dim]
     const __nv_bfloat16* __restrict__ value,     // [num_tokens, num_kv_heads, head_dim]
@@ -169,8 +188,8 @@ extern "C" __global__ void reshape_and_cache_flash_fp8(
         unsigned int base = n_pairs * 2;
         float kf = __bfloat162float(key_src[base]) * inv_k_scale;
         float vf = __bfloat162float(val_src[base]) * inv_v_scale;
-        key_dst[base] = __nv_cvt_float_to_fp8(kf, __NV_SATFINITE, __NV_E4M3);
-        val_dst[base] = __nv_cvt_float_to_fp8(vf, __NV_SATFINITE, __NV_E4M3);
+        key_dst[base] = scl_enc_fp8(kf);
+        val_dst[base] = scl_enc_fp8(vf);
     }
 }
 
@@ -231,14 +250,12 @@ __device__ void nvfp4_quantize_group(
     // fp8_scale = absmax / 6.0 (clamped to avoid divide-by-zero)
     float fp8_scale_f = absmax * (1.0f / 6.0f);
     // Convert scale to FP8 E4M3 for storage
-    __nv_fp8_storage_t fp8_scale = __nv_cvt_float_to_fp8(
-        fp8_scale_f, __NV_SATFINITE, __NV_E4M3
-    );
+    __nv_fp8_storage_t fp8_scale = scl_enc_fp8(fp8_scale_f);
     *scale_dst = fp8_scale;
 
     // Effective scale for dequant = fp8_to_float(fp8_scale)
     // For quant, we need inv_scale = 1.0 / fp8_to_float(fp8_scale)
-    float dequant_scale = __half2float(__nv_cvt_fp8_to_halfraw(fp8_scale, __NV_E4M3));
+    float dequant_scale = scl_fp8((unsigned char)fp8_scale);
     float inv_scale = (dequant_scale > 0.0f) ? (1.0f / dequant_scale) : 0.0f;
 
     // Quantize each element and pack pairs into bytes

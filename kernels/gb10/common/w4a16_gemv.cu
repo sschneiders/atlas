@@ -24,6 +24,14 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+__device__ __forceinline__ float scl_fp8(unsigned char b) {
+    unsigned int s = (b >> 7) & 1u, e = (b >> 3) & 0xFu, m = b & 0x7u; float v;
+    if (e == 0u)               v = (float)m * 0.001953125f;
+    else if (e == 15u && m == 7u) v = 0.0f;
+    else                       v = __uint_as_float(((e + 120u) << 23) | (m << 20));
+    return s ? -v : v;
+}
+
 #define BLOCK_SIZE 256
 #define N_PER_BLOCK 4
 #define WARP_SIZE 32
@@ -90,7 +98,7 @@ extern "C" __global__ void w4a16_gemv(
         unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + scale_group];
         __nv_fp8_e4m3 fp8;
         *(unsigned char*)&fp8 = scale_byte;
-        float scale = (float)fp8 * scale2;
+        float scale = scl_fp8(*(const unsigned char*)&fp8) * scale2;
 
         // Unpack 8 bytes × 2 nibbles = 16 weight values, FMA with activations
         #pragma unroll
@@ -173,7 +181,7 @@ extern "C" __global__ void w4a16_gemv_logits(
         unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + scale_group];
         __nv_fp8_e4m3 fp8;
         *(unsigned char*)&fp8 = scale_byte;
-        float scale = (float)fp8 * scale2;
+        float scale = scl_fp8(*(const unsigned char*)&fp8) * scale2;
         #pragma unroll
         for (int b = 0; b < 8; b++) {
             unsigned char byte_val = (unsigned char)(packed8 >> (b * 8));
@@ -264,7 +272,7 @@ extern "C" __global__ void w4a16_gemv_batch2(
         unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + scale_group];
         __nv_fp8_e4m3 fp8;
         *(unsigned char*)&fp8 = scale_byte;
-        float scale = (float)fp8 * scale2;
+        float scale = scl_fp8(*(const unsigned char*)&fp8) * scale2;
 
         // Unpack weights and FMA with BOTH activation vectors
         #pragma unroll
@@ -364,7 +372,7 @@ extern "C" __global__ void w4a16_gemv_qg(
         unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + scale_group];
         __nv_fp8_e4m3 fp8;
         *(unsigned char*)&fp8 = scale_byte;
-        float scale = (float)fp8 * scale2;
+        float scale = scl_fp8(*(const unsigned char*)&fp8) * scale2;
 
         #pragma unroll
         for (int b = 0; b < 4; b++) {
@@ -463,7 +471,7 @@ extern "C" __global__ void w4a16_gemv_qkvz(
         unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups_k + scale_group];
         __nv_fp8_e4m3 fp8;
         *(unsigned char*)&fp8 = scale_byte;
-        float scale = (float)fp8 * scale2;
+        float scale = scl_fp8(*(const unsigned char*)&fp8) * scale2;
 
         #pragma unroll
         for (int b = 0; b < 4; b++) {
@@ -572,7 +580,7 @@ extern "C" __global__ void w4a16_gemv_qg_batch2(
         unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + scale_group];
         __nv_fp8_e4m3 fp8;
         *(unsigned char*)&fp8 = scale_byte;
-        float scale = (float)fp8 * scale2;
+        float scale = scl_fp8(*(const unsigned char*)&fp8) * scale2;
 
         #pragma unroll
         for (int b = 0; b < 4; b++) {
@@ -689,7 +697,7 @@ extern "C" __global__ void w4a16_gemv_dual_batch2(
         unsigned int sg = base_k / GROUP_SIZE;
         unsigned char sb = B_scale[(unsigned long long)n * num_groups + sg];
         __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = sb;
-        float scale = (float)fp8 * s2;
+        float scale = scl_fp8(*(const unsigned char*)&fp8) * s2;
 
         #pragma unroll
         for (int b = 0; b < 4; b++) {
@@ -795,7 +803,7 @@ extern "C" __global__ void w4a16_gemv_batch3(
         unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + scale_group];
         __nv_fp8_e4m3 fp8;
         *(unsigned char*)&fp8 = scale_byte;
-        float scale = (float)fp8 * scale2;
+        float scale = scl_fp8(*(const unsigned char*)&fp8) * scale2;
 
         #pragma unroll
         for (int b = 0; b < 4; b++) {
@@ -908,7 +916,7 @@ extern "C" __global__ void w4a16_gemv_qg_batch3(
         unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + scale_group];
         __nv_fp8_e4m3 fp8;
         *(unsigned char*)&fp8 = scale_byte;
-        float scale = (float)fp8 * scale2;
+        float scale = scl_fp8(*(const unsigned char*)&fp8) * scale2;
 
         #pragma unroll
         for (int b = 0; b < 4; b++) {
@@ -1037,7 +1045,7 @@ extern "C" __global__ void w4a16_gemv_dual_batch3(
         unsigned int sg = base_k / GROUP_SIZE;
         unsigned char sb = B_scale[(unsigned long long)n * num_groups + sg];
         __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = sb;
-        float scale = (float)fp8 * s2;
+        float scale = scl_fp8(*(const unsigned char*)&fp8) * s2;
 
         #pragma unroll
         for (int b = 0; b < 4; b++) {

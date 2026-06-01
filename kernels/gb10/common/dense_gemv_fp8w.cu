@@ -19,6 +19,25 @@
 // 64 threads (2 warps) per output, cross-warp shared memory reduction.
 
 #include <cuda_bf16.h>
+
+__device__ __forceinline__ float scl_fp8(unsigned char b) {
+    unsigned int s = (b >> 7) & 1u, e = (b >> 3) & 0xFu, m = b & 0x7u; float v;
+    if (e == 0u)               v = (float)m * 0.001953125f;
+    else if (e == 15u && m == 7u) v = 0.0f;
+    else                       v = __uint_as_float(((e + 120u) << 23) | (m << 20));
+    return s ? -v : v;
+}
+__device__ __forceinline__ unsigned char scl_enc_fp8(float v) {
+    if (v != v) return 0x7F;                 // NaN
+    unsigned int bb = __float_as_uint(v); unsigned int sign = (bb >> 31) & 1u;
+    int e = (int)((bb >> 23) & 0xFF) - 127; unsigned int man = bb & 0x7FFFFFu;
+    int ee = e + 7; unsigned int em;
+    if (ee < 1) { ee = 0; em = 0; if (e >= -10) { float a = v < 0 ? -v : v; em = (unsigned int)(a / 0.001953125f + 0.5f); if (em > 7u) em = 7u; } }
+    else if (ee > 15) { ee = 15; em = 6; }
+    else { em = (man + (1u << 19)) >> 20; if (em > 7u) { em = 0; ee++; if (ee > 15) { ee = 15; em = 6; } } }
+    return (unsigned char)((sign << 7) | ((unsigned)ee << 3) | em);
+}
+
 #include <cuda_fp8.h>
 
 #define BLOCK_SIZE 256
@@ -152,13 +171,13 @@ extern "C" __global__ void dense_gemv_fp8w(
             __nv_bfloat16 a_lo, a_hi;
             *(unsigned short*)&a_lo = (unsigned short)(a32_lo & 0xFFFF);
             *(unsigned short*)&a_hi = (unsigned short)(a32_lo >> 16);
-            acc += __bfloat162float(a_lo) * (float)fp8_0;
-            acc += __bfloat162float(a_hi) * (float)fp8_1;
+            acc += __bfloat162float(a_lo) * scl_fp8(*(const unsigned char*)&fp8_0);
+            acc += __bfloat162float(a_hi) * scl_fp8(*(const unsigned char*)&fp8_1);
 
             *(unsigned short*)&a_lo = (unsigned short)(a32_hi & 0xFFFF);
             *(unsigned short*)&a_hi = (unsigned short)(a32_hi >> 16);
-            acc += __bfloat162float(a_lo) * (float)fp8_2;
-            acc += __bfloat162float(a_hi) * (float)fp8_3;
+            acc += __bfloat162float(a_lo) * scl_fp8(*(const unsigned char*)&fp8_2);
+            acc += __bfloat162float(a_hi) * scl_fp8(*(const unsigned char*)&fp8_3);
         }
 
         // Process next 8 FP8 weights with next 8 BF16 activations
@@ -179,13 +198,13 @@ extern "C" __global__ void dense_gemv_fp8w(
             __nv_bfloat16 a_lo, a_hi;
             *(unsigned short*)&a_lo = (unsigned short)(a32_lo & 0xFFFF);
             *(unsigned short*)&a_hi = (unsigned short)(a32_lo >> 16);
-            acc += __bfloat162float(a_lo) * (float)fp8_0;
-            acc += __bfloat162float(a_hi) * (float)fp8_1;
+            acc += __bfloat162float(a_lo) * scl_fp8(*(const unsigned char*)&fp8_0);
+            acc += __bfloat162float(a_hi) * scl_fp8(*(const unsigned char*)&fp8_1);
 
             *(unsigned short*)&a_lo = (unsigned short)(a32_hi & 0xFFFF);
             *(unsigned short*)&a_hi = (unsigned short)(a32_hi >> 16);
-            acc += __bfloat162float(a_lo) * (float)fp8_2;
-            acc += __bfloat162float(a_hi) * (float)fp8_3;
+            acc += __bfloat162float(a_lo) * scl_fp8(*(const unsigned char*)&fp8_2);
+            acc += __bfloat162float(a_hi) * scl_fp8(*(const unsigned char*)&fp8_3);
         }
     }
 

@@ -91,6 +91,18 @@ impl Qwen3SsmLayer {
         }
 
         prof!("rms_norm_residual", t0);
+        if std::env::var("ATLAS_DUMP_GDN").is_ok() {
+            let _ = ctx.gpu.synchronize(stream);
+            let dmp = |tag: &str, p: spark_runtime::gpu::DevicePtr| {
+                let mut b = vec![0u8; 64 * 2];
+                let _ = ctx.gpu.copy_d2h(p, &mut b);
+                let mut ss = 0f64;
+                for c in b.chunks_exact(2) { let x = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16); ss += (x as f64) * (x as f64); }
+                eprintln!("[gdn] {} norm={:.3}", tag, ss.sqrt());
+            };
+            dmp("hidden_in", hidden);
+            dmp("normed_in", normed);
+        }
         t0 = if ctx.profile {
             ctx.gpu.synchronize(stream)?;
             Some(std::time::Instant::now())
@@ -230,6 +242,7 @@ impl Qwen3SsmLayer {
             stream,
         )?;
         prof!("ba+gates", t0);
+        if std::env::var("ATLAS_DUMP_GDN").is_ok() { let _=ctx.gpu.synchronize(stream); let n = nv as usize; let mut bd=vec![0u8; n*4]; let _=ctx.gpu.copy_d2h(gates_buf, &mut bd); let vd:Vec<f32>=bd.chunks_exact(4).map(|c|f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect(); let mut bb=vec![0u8; n*4]; let _=ctx.gpu.copy_d2h(gates_buf.offset(nv * fp32), &mut bb); let vb:Vec<f32>=bb.chunks_exact(4).map(|c|f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect(); eprintln!("[gdn] decay[0..4]={:?} beta[0..4]={:?}", &vd[..4.min(vd.len())], &vb[..4.min(vb.len())]); }
         t0 = if ctx.profile {
             ctx.gpu.synchronize(stream)?;
             Some(std::time::Instant::now())
@@ -260,6 +273,7 @@ impl Qwen3SsmLayer {
             stream,
         )?;
         prof!("conv1d", t0);
+        if std::env::var("ATLAS_DUMP_GDN").is_ok() { let _=ctx.gpu.synchronize(stream); let mut b=vec![0u8;128]; let _=ctx.gpu.copy_d2h(conv_out_buf,&mut b); let mut ss=0f64; for c in b.chunks_exact(2){ let x=f32::from_bits((u16::from_le_bytes([c[0],c[1]]) as u32)<<16); ss+=(x as f64)*(x as f64); } eprintln!("[gdn] conv_out norm={:.3}", ss.sqrt()); }
         t0 = if ctx.profile {
             ctx.gpu.synchronize(stream)?;
             Some(std::time::Instant::now())
@@ -282,6 +296,8 @@ impl Qwen3SsmLayer {
             stream,
         )?;
         prof!("l2_norm", t0);
+        if std::env::var("ATLAS_DUMP_GDN").is_ok() { let _=ctx.gpu.synchronize(stream); let mut b=vec![0u8;128]; let _=ctx.gpu.copy_d2h(conv_out_buf,&mut b); let mut ss=0f64; for c in b.chunks_exact(2){ let x=f32::from_bits((u16::from_le_bytes([c[0],c[1]]) as u32)<<16); ss+=(x as f64)*(x as f64); } eprintln!("[gdn] post_l2norm_q norm={:.3}", ss.sqrt()); }
+        if std::env::var("ATLAS_DUMP_GDN").is_ok() { let _=ctx.gpu.synchronize(stream); let mut b=vec![0u8;128]; let _=ctx.gpu.copy_d2h(conv_out_buf.offset(key_dim * 2 * bf16),&mut b); let mut ss=0f64; for c in b.chunks_exact(2){ let x=f32::from_bits((u16::from_le_bytes([c[0],c[1]]) as u32)<<16); ss+=(x as f64)*(x as f64); } eprintln!("[gdn] v_in norm={:.3}", ss.sqrt()); }
         t0 = if ctx.profile {
             ctx.gpu.synchronize(stream)?;
             Some(std::time::Instant::now())
@@ -373,6 +389,26 @@ impl Qwen3SsmLayer {
         }
 
         prof!("gdn_prefill", t0);
+        macro_rules! gdnmag {
+            ($tag:expr, $ptr:expr, $n:expr) => {
+                if std::env::var("ATLAS_DUMP_GDN").is_ok() {
+                    let _ = ctx.gpu.synchronize(stream);
+                    let mut b = vec![0u8; ($n) * 2];
+                    let _ = ctx.gpu.copy_d2h($ptr, &mut b);
+                    let mut ss = 0f64;
+                    let mut nf = false;
+                    for c in b.chunks_exact(2) {
+                        let x = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
+                        if !x.is_finite() { nf = true; }
+                        ss += (x as f64) * (x as f64);
+                    }
+                    let mut first=[0f32;6]; for ii in 0..6.min(b.len()/2){ first[ii]=f32::from_bits((u16::from_le_bytes([b[ii*2],b[ii*2+1]]) as u32)<<16);} eprintln!("[gdn] {} norm={:.6} nonfinite={} first={:?}", $tag, ss.sqrt(), nf, first);
+                }
+            };
+        }
+        gdnmag!("gdn_out", gdn_out_buf, 64);
+        gdnmag!("qkvz_q", deinterleaved, 64);
+        if k > 1 { gdnmag!("qkvz_qLAST", deinterleaved.offset((k as usize - 1) * (qkvz_size as usize) * bf16), 64); }
         t0 = if ctx.profile {
             ctx.gpu.synchronize(stream)?;
             Some(std::time::Instant::now())
@@ -383,6 +419,8 @@ impl Qwen3SsmLayer {
         // ── 9. Gated RMS norm (batched: all tokens × heads in one launch) ──
         let normed_out_buf = conv_out_buf;
         let z_base = deinterleaved.offset((key_dim * 2 + value_dim) * bf16);
+        gdnmag!("gate_z", z_base, 64);
+        gdnmag!("norm_w", self.ssm.norm.weight, 64);
         ops::gated_rms_norm_prefill(
             ctx.gpu,
             self.gated_rms_norm_prefill_k,
@@ -399,6 +437,7 @@ impl Qwen3SsmLayer {
             stream,
         )?;
         prof!("gated_rms_norm", t0);
+        gdnmag!("post_norm", normed_out_buf, 64);
         t0 = if ctx.profile {
             ctx.gpu.synchronize(stream)?;
             Some(std::time::Instant::now())
@@ -411,6 +450,7 @@ impl Qwen3SsmLayer {
         self.prefill_out_proj_dispatch(ctx, normed_out_buf, out_proj_buf, k, h, value_dim, stream)?;
 
         prof!("out_proj", t0);
+        gdnmag!("out_proj", out_proj_buf, 64);
         t0 = if ctx.profile {
             ctx.gpu.synchronize(stream)?;
             Some(std::time::Instant::now())

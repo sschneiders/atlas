@@ -397,6 +397,27 @@ impl TransformerModel {
                     stream,
                 )
                 .map_err(|e| anyhow::anyhow!("Prefill layer {i} failed: {e}"))?;
+            if std::env::var("ATLAS_DUMP_LAYER_NORM").is_ok() {
+                let _ = self.gpu.synchronize(stream);
+                let mut hb = vec![0u8; h * fp32];
+                let _ = self.gpu.copy_d2h(hidden, &mut hb);
+                let mut ss = 0f64;
+                let mut nonfinite = false;
+                if fp32 == 4 {
+                    for c in hb.chunks_exact(4) {
+                        let x = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                        if !x.is_finite() { nonfinite = true; }
+                        ss += (x as f64) * (x as f64);
+                    }
+                } else {
+                    for c in hb.chunks_exact(2) {
+                        let x = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
+                        if !x.is_finite() { nonfinite = true; }
+                        ss += (x as f64) * (x as f64);
+                    }
+                }
+                eprintln!("[layer-norm] L{i} ssm={} hidden_norm={:.4} nonfinite={}", layer.is_ssm_layer(), ss.sqrt(), nonfinite);
+            }
             // DFlash prefill capture: writes layer i's hidden output for
             // all `proc_count` tokens into the seq's accumulator at slots
             // [layer_kv_write_start .. layer_kv_write_start + proc_count].

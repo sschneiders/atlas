@@ -12,6 +12,30 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+// Standard E4M3 (1-4-3, bias 7) decode via pure bit-math. On real NVIDIA this is
+// byte-identical to (float)__nv_fp8_e4m3; on SCALE/gfx1151 the built-in
+// __nv_fp8_e4m3->float decode is a NON-STANDARD narrow format (verified: 1.0->1.5,
+// 0.5->1.0, 3.5->2.75) which mismatches the standard E4M3 scales written by
+// quantize_bf16_to_nvfp4 -> corrupts every block scale. Use this to match the encoder.
+__device__ __forceinline__ float scl_fp8(unsigned char b) {
+    unsigned int s = (b >> 7) & 1u, e = (b >> 3) & 0xFu, m = b & 0x7u; float v;
+    if (e == 0u)               v = (float)m * 0.001953125f;            // subnormal m*2^-9
+    else if (e == 15u && m == 7u) v = 0.0f;                            // NaN -> 0
+    else                       v = __uint_as_float(((e + 120u) << 23) | (m << 20)); // 2^(e-7)*(1+m/8)
+    return s ? -v : v;
+}
+
+__device__ __forceinline__ unsigned char scl_enc_fp8(float v) {
+    if (v != v) return 0x7F;
+    unsigned int bb = __float_as_uint(v); unsigned int sign = (bb >> 31) & 1u;
+    int e = (int)((bb >> 23) & 0xFF) - 127; unsigned int man = bb & 0x7FFFFFu;
+    int ee = e + 7; unsigned int em;
+    if (ee < 1) { ee = 0; em = 0; if (e >= -10) { float a = v < 0 ? -v : v; em = (unsigned int)(a / 0.001953125f + 0.5f); if (em > 7u) em = 7u; } }
+    else if (ee > 15) { ee = 15; em = 6; }
+    else { em = (man + (1u << 19)) >> 20; if (em > 7u) { em = 0; ee++; if (ee > 15) { ee = 15; em = 6; } } }
+    return (unsigned char)((sign << 7) | ((unsigned)ee << 3) | em);
+}
+
 // SCALE/gfx1151: the `cvt.rn.satfinite.e4m3x2.f32` inline PTX has no codegen
 // (SCALE lacks the internal __nv_cvt_floatraw_to_fp8 lowering helper).
 // __nv_cvt_float_to_fp8 is NVIDIA's own documented intrinsic with identical
@@ -22,8 +46,8 @@
 // PTX `cvt.e4m3x2.f32 d,a,b`: d hi-byte = e4m3(a), lo-byte = e4m3(b).
 __device__ __forceinline__ unsigned short atlas_cvt_e4m3x2_f32(float a_hi, float b_lo) {
 #if defined(__SCALE__)
-    unsigned a8 = (unsigned)__nv_cvt_float_to_fp8(a_hi, __NV_SATFINITE, __NV_E4M3);
-    unsigned b8 = (unsigned)__nv_cvt_float_to_fp8(b_lo, __NV_SATFINITE, __NV_E4M3);
+    unsigned a8 = (unsigned)scl_enc_fp8(a_hi);
+    unsigned b8 = (unsigned)scl_enc_fp8(b_lo);
     return (unsigned short)((a8 << 8) | (b8 & 0xFFu));
 #else
     unsigned short d;
@@ -41,7 +65,7 @@ __device__ __forceinline__ unsigned short atlas_cvt_e4m3x2_f32(float a_hi, float
 // byte-identical (zero NVFP4/FP8 regression).
 #if defined(__SCALE__)
 __device__ __forceinline__ float atlas_e4m3_to_f32(unsigned char b) {
-    return __half2float(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)b, __NV_E4M3));
+    return scl_fp8(b);  // standard E4M3, matches quantizer (SCALE __NV_E4M3 is non-standard)
 }
 __device__ __forceinline__ unsigned atlas_bf2(float lo, float hi) {
     unsigned short l = __bfloat16_as_ushort(__float2bfloat16(lo));
@@ -159,7 +183,7 @@ extern "C" __global__ void w4a16_gemm(
                     unsigned int sg = gk / GROUP_SIZE;
                     unsigned char sb = B_scale[(unsigned long long)gn * num_groups + sg];
                     __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = sb;
-                    smem_B[k][n] = __float2bfloat16(E2M1_LUT[nibble] * (float)fp8 * scale2);
+                    smem_B[k][n] = __float2bfloat16(E2M1_LUT[nibble] * scl_fp8(sb) * scale2);
                 } else {
                     smem_B[k][n] = __float2bfloat16(0.0f);
                 }
@@ -293,7 +317,7 @@ extern "C" __global__ void w4a16_gemm_t(
     __shared__ __nv_bfloat16 smem_A[2][M_TILE][K_STEP_T + PAD_T];
     __shared__ unsigned char smem_Bp[2][K_STEP_T / 2][N_TILE_LG + BP_PAD];
     __shared__ unsigned char smem_Bs[2][K_STEP_T / GROUP_SIZE][N_TILE_LG + BP_PAD];
-    __shared__ unsigned char smem_B_fp8[N_TILE_LG][K_STEP_T];
+    __shared__ __nv_bfloat16 smem_B_bf16[N_TILE_LG][K_STEP_T];
     __shared__ float smem_LUT[16];
 
     if (threadIdx.x < 16) smem_LUT[threadIdx.x] = E2M1_LUT[threadIdx.x];
@@ -337,48 +361,53 @@ extern "C" __global__ void w4a16_gemm_t(
         } \
     } while(0)
 
-    // Dequant B: FP4 → FP8 E4M3 (cvt.rn.satfinite.e4m3x2.f32)
+    // Dequant B: NVFP4 -> BF16 directly (gfx1151: device float->E4M3 encode is
+    // broken in SCALE, and SCALE's E4M3 is a narrow [0.125,31] format; BF16
+    // carries the full range/precision. Mirrors the base w4a16_gemm path.)
     #define DEQUANT_T(buf) do { \
         unsigned int my_n = threadIdx.x; \
         unsigned char sb0 = smem_Bs[(buf)][0][my_n]; \
         unsigned char sb1 = smem_Bs[(buf)][1][my_n]; \
         __nv_fp8_e4m3 f0, f1; \
         *(unsigned char*)&f0 = sb0; *(unsigned char*)&f1 = sb1; \
-        float sv0 = (float)f0 * scale2, sv1 = (float)f1 * scale2; \
+        float sv0 = scl_fp8(*(const unsigned char*)&f0) * scale2, sv1 = scl_fp8(*(const unsigned char*)&f1) * scale2; \
         _Pragma("unroll") \
         for (int kp = 0; kp < 8; kp++) { \
             unsigned char packed = smem_Bp[(buf)][kp][my_n]; \
-            float lo = smem_LUT[packed & 0xF] * sv0; \
-            float hi = smem_LUT[packed >> 4] * sv0; \
-            unsigned short fp8_pair; \
-            fp8_pair = atlas_cvt_e4m3x2_f32(hi, lo); \
-            *(unsigned short*)&smem_B_fp8[my_n][kp * 2] = fp8_pair; \
+            smem_B_bf16[my_n][kp * 2]     = __float2bfloat16(smem_LUT[packed & 0xF] * sv0); \
+            smem_B_bf16[my_n][kp * 2 + 1] = __float2bfloat16(smem_LUT[packed >> 4] * sv0); \
         } \
         _Pragma("unroll") \
         for (int kp = 8; kp < 16; kp++) { \
             unsigned char packed = smem_Bp[(buf)][kp][my_n]; \
-            float lo = smem_LUT[packed & 0xF] * sv1; \
-            float hi = smem_LUT[packed >> 4] * sv1; \
-            unsigned short fp8_pair; \
-            fp8_pair = atlas_cvt_e4m3x2_f32(hi, lo); \
-            *(unsigned short*)&smem_B_fp8[my_n][kp * 2] = fp8_pair; \
+            smem_B_bf16[my_n][kp * 2]     = __float2bfloat16(smem_LUT[packed & 0xF] * sv1); \
+            smem_B_bf16[my_n][kp * 2 + 1] = __float2bfloat16(smem_LUT[packed >> 4] * sv1); \
         } \
     } while(0)
 
-    // FP8 MMA: convert A BF16→E4M3 in registers, single m16n8k32 per N-tile
+    // BF16 MMA: 2x m16n8k16 over the 32-wide K step (no FP8 round-trip).
     #define COMPUTE_MMA(a_buf) do { \
-        const unsigned short* sA = (const unsigned short*)smem_A[(a_buf)]; \
+        const __nv_bfloat16* sA = (const __nv_bfloat16*)smem_A[(a_buf)]; \
         unsigned int fr0 = warp_m_offset + group_id, fr1 = fr0 + 8; \
-        unsigned int a0 = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + tid * 4]); \
-        unsigned int a1 = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + tid * 4]); \
-        unsigned int a2 = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + 16 + tid * 4]); \
-        unsigned int a3 = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + 16 + tid * 4]); \
         _Pragma("unroll") \
-        for (int nt = 0; nt < 16; nt++) { \
-            unsigned int nc = nt * 8 + group_id; \
-            unsigned int b0 = *(const unsigned int*)&smem_B_fp8[nc][4 * tid]; \
-            unsigned int b1 = *(const unsigned int*)&smem_B_fp8[nc][16 + 4 * tid]; \
-            atlas_mma_e4m3(acc[nt], a0,a1,a2,a3, b0, b1); \
+        for (int h = 0; h < 2; h++) { \
+            unsigned int fc0 = h * 16 + tid * 2, fc1 = fc0 + 8; \
+            unsigned int a0 = *(const unsigned int*)&sA[fr0 * a_stride + fc0]; \
+            unsigned int a1 = *(const unsigned int*)&sA[fr1 * a_stride + fc0]; \
+            unsigned int a2 = *(const unsigned int*)&sA[fr0 * a_stride + fc1]; \
+            unsigned int a3 = *(const unsigned int*)&sA[fr1 * a_stride + fc1]; \
+            _Pragma("unroll") \
+            for (int nt = 0; nt < 16; nt++) { \
+                unsigned int nc = nt * 8 + group_id; \
+                const __nv_bfloat16* sb = &smem_B_bf16[nc][0]; \
+                unsigned int b0 = *(const unsigned int*)&sb[fc0]; \
+                unsigned int b1 = *(const unsigned int*)&sb[fc1]; \
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 " \
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                    : "=f"(acc[nt][0]), "=f"(acc[nt][1]), "=f"(acc[nt][2]), "=f"(acc[nt][3]) \
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), \
+                      "f"(acc[nt][0]), "f"(acc[nt][1]), "f"(acc[nt][2]), "f"(acc[nt][3])); \
+            } \
         } \
     } while(0)
 
@@ -566,7 +595,7 @@ extern "C" __global__ void predequant_nvfp4_to_fp8(
     unsigned char sb = B_scale[(unsigned long long)n * (K / GROUP_SIZE) + group];
     __nv_fp8_e4m3 fp8_scale;
     *(unsigned char*)&fp8_scale = sb;
-    float sv = (float)fp8_scale * scale2;
+    float sv = scl_fp8(sb) * scale2;
 
     float val_lo = E2M1_LUT[packed & 0xF] * sv;
     float val_hi = E2M1_LUT[packed >> 4] * sv;
@@ -811,8 +840,8 @@ extern "C" __global__ void w4a16_gemm_t_k64(
         *(unsigned char*)&f1 = smem_Bs_k64[(buf)][1][my_n]; \
         *(unsigned char*)&f2 = smem_Bs_k64[(buf)][2][my_n]; \
         *(unsigned char*)&f3 = smem_Bs_k64[(buf)][3][my_n]; \
-        float sv0 = (float)f0 * scale2, sv1 = (float)f1 * scale2; \
-        float sv2 = (float)f2 * scale2, sv3 = (float)f3 * scale2; \
+        float sv0 = scl_fp8(*(const unsigned char*)&f0) * scale2, sv1 = scl_fp8(*(const unsigned char*)&f1) * scale2; \
+        float sv2 = scl_fp8(*(const unsigned char*)&f2) * scale2, sv3 = scl_fp8(*(const unsigned char*)&f3) * scale2; \
         _Pragma("unroll") \
         for (int kp = 0; kp < 8; kp++) { \
             unsigned char packed = smem_Bp_k64[(buf)][kp][my_n]; \
@@ -956,7 +985,7 @@ void w4a16_gemm_t_m128(
     __shared__ __nv_bfloat16 smem_A[2][2 * M_TILE][K_STEP_T + PAD_T];   // 20480 B
     __shared__ unsigned char smem_Bp[2][K_STEP_T / 2][N_TILE_LG + BP_PAD]; // 4608 B
     __shared__ unsigned char smem_Bs[2][K_STEP_T / GROUP_SIZE][N_TILE_LG + BP_PAD]; // 576 B
-    __shared__ unsigned char smem_B_fp8[N_TILE_LG][K_STEP_T];             // 4096 B
+    __shared__ __nv_bfloat16 smem_B_bf16[N_TILE_LG][K_STEP_T];          // BF16 (gfx1151)
     __shared__ float smem_LUT[16];                                         //   64 B
     // Total ≈ 29.8 KB → 3 blocks/SM
 
@@ -1012,58 +1041,49 @@ void w4a16_gemm_t_m128(
         unsigned char sb1 = smem_Bs[(buf)][1][my_n]; \
         __nv_fp8_e4m3 f0, f1; \
         *(unsigned char*)&f0 = sb0; *(unsigned char*)&f1 = sb1; \
-        float sv0 = (float)f0 * scale2, sv1 = (float)f1 * scale2; \
+        float sv0 = scl_fp8(*(const unsigned char*)&f0) * scale2, sv1 = scl_fp8(*(const unsigned char*)&f1) * scale2; \
         _Pragma("unroll") \
         for (int kp = 0; kp < 8; kp++) { \
             unsigned char packed = smem_Bp[(buf)][kp][my_n]; \
-            float lo = smem_LUT[packed & 0xF] * sv0; \
-            float hi = smem_LUT[packed >> 4]  * sv0; \
-            unsigned short fp8_pair; \
-            fp8_pair = atlas_cvt_e4m3x2_f32(hi, lo); \
-            *(unsigned short*)&smem_B_fp8[my_n][kp * 2] = fp8_pair; \
+            smem_B_bf16[my_n][kp * 2]     = __float2bfloat16(smem_LUT[packed & 0xF] * sv0); \
+            smem_B_bf16[my_n][kp * 2 + 1] = __float2bfloat16(smem_LUT[packed >> 4]  * sv0); \
         } \
         _Pragma("unroll") \
         for (int kp = 8; kp < 16; kp++) { \
             unsigned char packed = smem_Bp[(buf)][kp][my_n]; \
-            float lo = smem_LUT[packed & 0xF] * sv1; \
-            float hi = smem_LUT[packed >> 4]  * sv1; \
-            unsigned short fp8_pair; \
-            fp8_pair = atlas_cvt_e4m3x2_f32(hi, lo); \
-            *(unsigned short*)&smem_B_fp8[my_n][kp * 2] = fp8_pair; \
+            smem_B_bf16[my_n][kp * 2]     = __float2bfloat16(smem_LUT[packed & 0xF] * sv1); \
+            smem_B_bf16[my_n][kp * 2 + 1] = __float2bfloat16(smem_LUT[packed >> 4]  * sv1); \
         } \
     } while(0)
 
     // MMA for both M-chunks; B tile (smem_B_fp8) loaded once, reused by both.
     #define M128_COMPUTE(a_buf) do { \
-        const unsigned short* sA = (const unsigned short*)smem_A[(a_buf)]; \
-        unsigned int fr0, fr1, a0, a1, a2, a3; \
-        /* Chunk 0: smem rows 0..63 */ \
-        fr0 = warp_m_offset + group_id; \
-        fr1 = fr0 + 8; \
-        a0 = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + tid * 4]); \
-        a1 = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + tid * 4]); \
-        a2 = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + 16 + tid * 4]); \
-        a3 = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + 16 + tid * 4]); \
+        const __nv_bfloat16* sA = (const __nv_bfloat16*)smem_A[(a_buf)]; \
         _Pragma("unroll") \
-        for (int nt = 0; nt < 16; nt++) { \
-            unsigned int nc = nt * 8 + group_id; \
-            unsigned int b0 = *(const unsigned int*)&smem_B_fp8[nc][4 * tid]; \
-            unsigned int b1 = *(const unsigned int*)&smem_B_fp8[nc][16 + 4 * tid]; \
-            atlas_mma_e4m3(acc0[nt], a0,a1,a2,a3, b0, b1); \
-        } \
-        /* Chunk 1: smem rows 64..127 (offset M_TILE=64) */ \
-        fr0 = M_TILE + warp_m_offset + group_id; \
-        fr1 = fr0 + 8; \
-        a0 = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + tid * 4]); \
-        a1 = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + tid * 4]); \
-        a2 = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + 16 + tid * 4]); \
-        a3 = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + 16 + tid * 4]); \
-        _Pragma("unroll") \
-        for (int nt = 0; nt < 16; nt++) { \
-            unsigned int nc = nt * 8 + group_id; \
-            unsigned int b0 = *(const unsigned int*)&smem_B_fp8[nc][4 * tid]; \
-            unsigned int b1 = *(const unsigned int*)&smem_B_fp8[nc][16 + 4 * tid]; \
-            atlas_mma_e4m3(acc1[nt], a0,a1,a2,a3, b0, b1); \
+        for (int ch = 0; ch < 2; ch++) { \
+            unsigned int fr0 = ch * M_TILE + warp_m_offset + group_id; \
+            unsigned int fr1 = fr0 + 8; \
+            _Pragma("unroll") \
+            for (int h = 0; h < 2; h++) { \
+                unsigned int fc0 = h * 16 + tid * 2, fc1 = fc0 + 8; \
+                unsigned int a0 = *(const unsigned int*)&sA[fr0 * a_stride + fc0]; \
+                unsigned int a1 = *(const unsigned int*)&sA[fr1 * a_stride + fc0]; \
+                unsigned int a2 = *(const unsigned int*)&sA[fr0 * a_stride + fc1]; \
+                unsigned int a3 = *(const unsigned int*)&sA[fr1 * a_stride + fc1]; \
+                _Pragma("unroll") \
+                for (int nt = 0; nt < 16; nt++) { \
+                    unsigned int nc = nt * 8 + group_id; \
+                    const __nv_bfloat16* sb = &smem_B_bf16[nc][0]; \
+                    unsigned int b0 = *(const unsigned int*)&sb[fc0]; \
+                    unsigned int b1 = *(const unsigned int*)&sb[fc1]; \
+                    float* acc = ch ? acc1[nt] : acc0[nt]; \
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 " \
+                        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                        : "=f"(acc[0]), "=f"(acc[1]), "=f"(acc[2]), "=f"(acc[3]) \
+                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), \
+                          "f"(acc[0]), "f"(acc[1]), "f"(acc[2]), "f"(acc[3])); \
+                } \
+            } \
         } \
     } while(0)
 

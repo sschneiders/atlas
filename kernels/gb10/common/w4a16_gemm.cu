@@ -19,6 +19,25 @@
 //                   Coalesced N-dim reads for better LPDDR5X bandwidth.
 
 #include <cuda_bf16.h>
+
+__device__ __forceinline__ float scl_fp8(unsigned char b) {
+    unsigned int s = (b >> 7) & 1u, e = (b >> 3) & 0xFu, m = b & 0x7u; float v;
+    if (e == 0u)               v = (float)m * 0.001953125f;
+    else if (e == 15u && m == 7u) v = 0.0f;
+    else                       v = __uint_as_float(((e + 120u) << 23) | (m << 20));
+    return s ? -v : v;
+}
+__device__ __forceinline__ unsigned char scl_enc_fp8(float v) {
+    if (v != v) return 0x7F;                 // NaN
+    unsigned int bb = __float_as_uint(v); unsigned int sign = (bb >> 31) & 1u;
+    int e = (int)((bb >> 23) & 0xFF) - 127; unsigned int man = bb & 0x7FFFFFu;
+    int ee = e + 7; unsigned int em;
+    if (ee < 1) { ee = 0; em = 0; if (e >= -10) { float a = v < 0 ? -v : v; em = (unsigned int)(a / 0.001953125f + 0.5f); if (em > 7u) em = 7u; } }
+    else if (ee > 15) { ee = 15; em = 6; }
+    else { em = (man + (1u << 19)) >> 20; if (em > 7u) { em = 0; ee++; if (ee > 15) { ee = 15; em = 6; } } }
+    return (unsigned char)((sign << 7) | ((unsigned)ee << 3) | em);
+}
+
 #include <cuda_fp8.h>
 
 #define M_TILE 64
@@ -149,7 +168,7 @@ extern "C" __global__ void w4a16_gemm(
                     unsigned char scale_byte = B_scale[(unsigned long long)gn * num_groups + scale_group];
                     __nv_fp8_e4m3 fp8;
                     *(unsigned char*)&fp8 = scale_byte;
-                    float dequant_val = E2M1_LUT[nibble] * (float)fp8 * scale2;
+                    float dequant_val = E2M1_LUT[nibble] * scl_fp8(*(const unsigned char*)&fp8) * scale2;
                     smem_B[k][n] = __float2bfloat16(dequant_val);
                 } else {
                     smem_B[k][n] = __float2bfloat16(0.0f);
@@ -242,7 +261,7 @@ extern "C" __global__ void w4a16_gemm_t(
                     unsigned char scale_byte = B_scale[(unsigned long long)scale_group * N + gn];
                     __nv_fp8_e4m3 fp8;
                     *(unsigned char*)&fp8 = scale_byte;
-                    float dequant_val = E2M1_LUT[nibble] * (float)fp8 * scale2;
+                    float dequant_val = E2M1_LUT[nibble] * scl_fp8(*(const unsigned char*)&fp8) * scale2;
                     smem_B[k][n] = __float2bfloat16(dequant_val);
                 } else {
                     smem_B[k][n] = __float2bfloat16(0.0f);
@@ -302,7 +321,7 @@ extern "C" __global__ void w4a16_dequant(
 
     __nv_fp8_e4m3 fp8;
     *(unsigned char*)&fp8 = s_byte;
-    float s = (float)fp8 * scale2;
+    float s = scl_fp8(*(const unsigned char*)&fp8) * scale2;
 
     float v0 = E2M1_LUT[nib0] * s;
     float v1 = E2M1_LUT[nib1] * s;

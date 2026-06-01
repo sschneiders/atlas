@@ -10,8 +10,16 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+__device__ __forceinline__ float scl_fp8(unsigned char b) {
+    unsigned int s = (b >> 7) & 1u, e = (b >> 3) & 0xFu, m = b & 0x7u; float v;
+    if (e == 0u)               v = (float)m * 0.001953125f;
+    else if (e == 15u && m == 7u) v = 0.0f;
+    else                       v = __uint_as_float(((e + 120u) << 23) | (m << 20));
+    return s ? -v : v;
+}
+
 __device__ __forceinline__ __nv_bfloat16 fp8_to_bf16(__nv_fp8_storage_t b, float scale) {
-    float v = __half2float(__nv_cvt_fp8_to_halfraw(b, __NV_E4M3)) * scale;
+    float v = scl_fp8(b) * scale;  // standard E4M3 (SCALE __NV_E4M3 non-standard)
     return __float2bfloat16(v);
 }
 
@@ -96,3 +104,4 @@ __device__ __forceinline__ __nv_bfloat16 fp8_to_bf16(__nv_fp8_storage_t b, float
 #define KERNEL_PREAMBLE /* nothing */
 
 #include "prefill_paged_compute.cuh"
+

@@ -21,6 +21,25 @@
 // Block: (256, 1, 1)
 
 #include <cuda_bf16.h>
+
+__device__ __forceinline__ float scl_fp8(unsigned char b) {
+    unsigned int s = (b >> 7) & 1u, e = (b >> 3) & 0xFu, m = b & 0x7u; float v;
+    if (e == 0u)               v = (float)m * 0.001953125f;
+    else if (e == 15u && m == 7u) v = 0.0f;
+    else                       v = __uint_as_float(((e + 120u) << 23) | (m << 20));
+    return s ? -v : v;
+}
+__device__ __forceinline__ unsigned char scl_enc_fp8(float v) {
+    if (v != v) return 0x7F;                 // NaN
+    unsigned int bb = __float_as_uint(v); unsigned int sign = (bb >> 31) & 1u;
+    int e = (int)((bb >> 23) & 0xFF) - 127; unsigned int man = bb & 0x7FFFFFu;
+    int ee = e + 7; unsigned int em;
+    if (ee < 1) { ee = 0; em = 0; if (e >= -10) { float a = v < 0 ? -v : v; em = (unsigned int)(a / 0.001953125f + 0.5f); if (em > 7u) em = 7u; } }
+    else if (ee > 15) { ee = 15; em = 6; }
+    else { em = (man + (1u << 19)) >> 20; if (em > 7u) { em = 0; ee++; if (ee > 15) { ee = 15; em = 6; } } }
+    return (unsigned char)((sign << 7) | ((unsigned)ee << 3) | em);
+}
+
 #include <cuda_fp8.h>
 
 #define WARP_SIZE 32
@@ -49,10 +68,10 @@ __device__ __forceinline__ void unpack4_fp8(
     __nv_fp8_storage_t b2 = (__nv_fp8_storage_t)((packed >> 16) & 0xFF);
     __nv_fp8_storage_t b3 = (__nv_fp8_storage_t)((packed >> 24) & 0xFF);
     // FP8 → half_raw → float, then multiply by dequant scale
-    v0 = __half2float(__nv_cvt_fp8_to_halfraw(b0, __NV_E4M3)) * dq_scale;
-    v1 = __half2float(__nv_cvt_fp8_to_halfraw(b1, __NV_E4M3)) * dq_scale;
-    v2 = __half2float(__nv_cvt_fp8_to_halfraw(b2, __NV_E4M3)) * dq_scale;
-    v3 = __half2float(__nv_cvt_fp8_to_halfraw(b3, __NV_E4M3)) * dq_scale;
+    v0 = scl_fp8((unsigned char)b0) * dq_scale;
+    v1 = scl_fp8((unsigned char)b1) * dq_scale;
+    v2 = scl_fp8((unsigned char)b2) * dq_scale;
+    v3 = scl_fp8((unsigned char)b3) * dq_scale;
 }
 
 // ============================================================================

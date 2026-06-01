@@ -197,47 +197,28 @@ impl ComputeTarget for ScaleTarget {
             ));
         }
 
-        // Step 1: SCALE compiles the .cu to a *relocatable* AMD-GPU
-        // object (`--cuda-device-only -c`; `--ptx` is rejected). No host
-        // link, so host-stdlib deps don't apply to this step.
-        let reloc = output.with_extension("reloc.o");
+        // SCALE's `cuModuleLoadData` (HSA loader) accepts the AMD-GPU ELF
+        // *relocatable* emitted by `--cuda-device-only -c` and performs the
+        // final link itself at module-load time. Verified on gfx1151 / SCALE
+        // 1.7.1: the relocatable loads, `cuModuleGetFunction` resolves, and
+        // `cuLaunchKernel` runs correctly. Do NOT pre-link with `ld.lld
+        // -shared`: that ELF DYN is rejected with CUDA_ERROR_INVALID_IMAGE.
+        // Emit the relocatable directly as the loadable module.
         let mut args: Vec<String> = vec!["--cuda-device-only".into(), "-c".into(), "-O3".into()];
         args.extend(extra_flags.iter().cloned());
         args.push(source.to_str().unwrap().into());
         args.push("-o".into());
-        args.push(reloc.to_str().unwrap().into());
+        args.push(output.to_str().unwrap().into());
 
         let status = Command::new(&nvcc)
             .args(&args)
             .status()
             .map_err(|e| format!("Failed to run SCALE nvcc ({}): {e}", nvcc.display()))?;
-        if !status.success() {
-            return Err(format!(
-                "SCALE `--cuda-device-only -c` failed for {} (arch {arch})",
-                source.display()
-            ));
-        }
-
-        // Step 2: device-link the relocatable into a *loadable* AMD-GPU
-        // code object (ELF DYN). `cuModuleLoadData` (HSA) rejects a bare
-        // relocatable with CUDA_ERROR_INVALID_VALUE; `ld.lld -shared`
-        // resolves it into the shared code object HSA can load.
-        let lld = self.scale_root.join("llvm/bin/ld.lld");
-        let link_status = Command::new(&lld)
-            .args([
-                "-shared",
-                reloc.to_str().unwrap(),
-                "-o",
-                output.to_str().unwrap(),
-            ])
-            .status()
-            .map_err(|e| format!("Failed to run SCALE ld.lld ({}): {e}", lld.display()))?;
-        let _ = std::fs::remove_file(&reloc);
-        if link_status.success() {
+        if status.success() {
             Ok(())
         } else {
             Err(format!(
-                "SCALE device-link (ld.lld -shared) failed for {} (arch {arch})",
+                "SCALE `--cuda-device-only -c` failed for {} (arch {arch})",
                 source.display()
             ))
         }
