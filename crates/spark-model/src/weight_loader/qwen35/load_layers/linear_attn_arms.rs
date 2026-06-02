@@ -89,11 +89,11 @@ pub(super) fn build_linear_attention_fp8(
         z_rows * h,
     )?;
 
-    // ── 3. Concat block scales along the N-block axis (BS=128, BF16):
+    // ── 3. Concat block scales along the N-block axis (BS=128, FP32):
     //       [Nq/BS, K/BS] || [Nz/BS, K/BS] → [(Nq+Nz)/BS, K/BS].
-    //       Each scale row is `(K/BS) * 2` bytes (BF16); number of rows
-    //       is `Nq/BS` and `Nz/BS`. Both Nq and Nz must align to BS for
-    //       the on-disk Qwen FP8 format (verified at load).
+    //       Each scale row is `(K/BS) * 4` bytes (FP32, widened at load);
+    //       number of rows is `Nq/BS` and `Nz/BS`. Both Nq and Nz must align
+    //       to BS for the on-disk Qwen FP8 format (verified at load).
     const BS: usize = 128;
     ensure!(
         qkv_rows.is_multiple_of(BS),
@@ -107,8 +107,9 @@ pub(super) fn build_linear_attention_fp8(
         h.is_multiple_of(BS),
         "SSM L{layer_idx}: hidden_size={h} not divisible by BS={BS}",
     );
-    let scale_cols = h / BS; // K/BS BF16 entries per scale row
-    let scale_row_bytes = scale_cols * 2;
+    let scale_cols = h / BS; // K/BS FP32 entries per scale row
+    // row_scale is FP32 (widened at load by load_fp8_block_scaled_as_fp8weight).
+    let scale_row_bytes = scale_cols * 4;
     let qkv_scale_rows = qkv_rows / BS;
     let z_scale_rows = z_rows / BS;
     let qkvz_scale_bytes = (qkv_scale_rows + z_scale_rows) * scale_row_bytes;

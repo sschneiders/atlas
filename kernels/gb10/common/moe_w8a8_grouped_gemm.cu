@@ -7,7 +7,7 @@
 //     via `per_token_group_quant_fp8`. Dequanted to BF16 in smem via LUT
 //     (lossless: FP8 3-bit mantissa fits in BF16 7-bit).
 //   - a_scale[M_total, K/128] FP32 — looked up via sorted_token_ids[m_start + m_idx].
-//   - b_scale[N/128, K/128] BF16 — same checkpoint layout (read once per fold).
+//   - b_scale[N/128, K/128] FP32 — scale_inv widened to FP32 at load (read once per fold).
 //   - Two-level FP32 accumulation: inner_acc over K=128 block (4× K_STEP=16),
 //     then outer_acc += inner_acc × (a_scale[row, kb] × b_scale[col, kb]).
 //
@@ -144,7 +144,7 @@ extern "C" __global__ void moe_w8a8_grouped_gemm(
     const unsigned char* __restrict__ A_fp8,                // [total_tokens, K] FP8 E4M3
     const float* __restrict__ a_scale,                      // [total_tokens, K/128] FP32
     const unsigned long long* __restrict__ B_weight_ptrs,   // [num_experts] → [N, K] FP8
-    const unsigned long long* __restrict__ B_scale_ptrs,    // [num_experts] → [N/128, K/128] BF16
+    const unsigned long long* __restrict__ B_scale_ptrs,    // [num_experts] → [N/128, K/128] FP32
     __nv_bfloat16* __restrict__ C,                          // [total_expanded, N] BF16
     const int* __restrict__ expert_offsets,                 // [num_experts + 1]
     const int* __restrict__ sorted_token_ids,               // [total_expanded] or NULL
@@ -166,7 +166,7 @@ extern "C" __global__ void moe_w8a8_grouped_gemm(
     const unsigned int cta_n = blockIdx.x * N_TILE;
 
     const unsigned char* B_exp = (const unsigned char*)B_weight_ptrs[expert_id];
-    const __nv_bfloat16* S_exp = (const __nv_bfloat16*)B_scale_ptrs[expert_id];
+    const float* S_exp = (const float*)B_scale_ptrs[expert_id];
     if (B_exp == 0) return;
 
     const unsigned int k_blocks = (K + FP8_BLOCK - 1) / FP8_BLOCK;
@@ -259,7 +259,7 @@ extern "C" __global__ void moe_w8a8_grouped_gemm(
         unsigned int next_k = k_base + K_STEP;
         if (next_k % K_PROMOTE == 0 || next_k >= K) {
             unsigned int k_block = k_base / FP8_BLOCK;
-            const float bs = __bfloat162float(S_exp[n_block * k_blocks + k_block]);
+            const float bs = S_exp[n_block * k_blocks + k_block];
             // a_scale lookup per row. Row 0..7 use r0 = warp_m_offset+group_id,
             // row 8..15 use r1 = r0+8. For each n_tile, acc[][0,1] write to row r0,
             // acc[][2,3] to row r1.

@@ -64,8 +64,9 @@ warmup_endpoint() {
 
 warmup_endpoint "${API_BASE}" "vllm-remote"
 
-# ── Prompt template ────────────────────────────────────────────────
-PROMPT_TEMPLATE='Please create a pure rust Axum project inside __TARGET__. Just have a ping/pong endpoint. The server MUST bind to the port from the ATLAS_HARNESS_PORT env var (default 3001) — use `let port: u16 = std::env::var("ATLAS_HARNESS_PORT").unwrap_or_else(|_| "3001".to_string()).parse().unwrap();` then bind to `0.0.0.0:port`. Add tests, run them and prove all tests pass, then run the server and use curl to prove it works. Finally, tear down the server.'
+# ── Prompt (SSOT: byte-identical to run_tier.sh; uses opencode --dir so the
+#    prompt carries no per-run path — the model's cwd IS the scored target) ──
+PROMPT='Please create a pure rust Axum project here in the current working directory. Just have a ping/pong endpoint. The server MUST bind to the port from the ATLAS_HARNESS_PORT env var (default 3001) — use `let port: u16 = std::env::var("ATLAS_HARNESS_PORT").unwrap_or_else(|_| "3001".to_string()).parse().unwrap();` then bind to `0.0.0.0:port`. Add tests, run them and prove all tests pass, then run the server and use curl to prove it works. Finally, tear down the server.'
 
 echo "=== tier=${TIER} runs=${N} api=${API_BASE} ===" >&2
 echo "harness: ${HARNESS_DIR}" >&2
@@ -79,17 +80,14 @@ for i in $(seq 1 "${N}"); do
 
   rm -rf "${TARGET}" "${OC_JSON}" "${OC_ERR}" "${EMPTY_LOG}"
   : > "${EMPTY_LOG}"          # empty atlas log window — score_run.py handles it
-  mkdir -p "/tmp/harness-${TIER}-r${i}-cwd"
-  cd "/tmp/harness-${TIER}-r${i}-cwd"
-
-  PROMPT="${PROMPT_TEMPLATE//__TARGET__/${TARGET}}"
+  mkdir -p "${TARGET}"        # opencode --dir == scored target (no cwd/target split)
 
   echo "--- run ${i}/${N} target=${TARGET} ---" >&2
 
   START_TS=$(date +%s.%N)
   ATLAS_HARNESS_PORT=3001 \
   XDG_CONFIG_HOME="${XDG_CONFIG_HOME_OVERRIDE:-/tmp/oc-tunnel-config}" \
-    timeout 360 opencode run --dangerously-skip-permissions --format json \
+    timeout "${OC_TIMEOUT:-360}" opencode run --dangerously-skip-permissions --dir "${TARGET}" --format json \
     "${PROMPT}" > "${OC_JSON}" 2> "${OC_ERR}" || true
   END_TS=$(date +%s.%N)
 
@@ -116,4 +114,9 @@ for i in $(seq 1 "${N}"); do
   echo "    files=${files_count} cargo_valid=${cargo_ok} webserver_ok=${webserver_ok} lean=${drift_lean} empty_path=${drift_empty} path_drift=${drift_pathdrift} wall=${wall}s" >&2
 done
 
-echo "=== tier ${TIER} complete (N=${N}). Run aggregate.py next. ===" >&2
+echo "=== tier ${TIER} complete (N=${N}). Aggregating... ===" >&2
+# Exit code = total cargo+webserver failure count (0 = all green).
+python3 "${HARNESS_DIR}/aggregate.py" --tier "${TIER}" >&2
+agg_rc=$?
+echo "=== tier ${TIER}: exit code ${agg_rc} (total cargo+webserver failures) ===" >&2
+exit "${agg_rc}"

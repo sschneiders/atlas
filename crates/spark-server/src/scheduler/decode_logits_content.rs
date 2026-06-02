@@ -67,6 +67,25 @@ pub fn handle_content_token(a: &mut ActiveSeq, model: &dyn Model) {
     a.remaining -= 1;
     a.content_started = true;
     a.content_tokens = a.content_tokens.saturating_add(1);
+    // F1 (2026-06-02): unconditional per-generation post-think content
+    // cap — the non-MTP twin of the guard in `emit_step::emit_token`.
+    // Fires regardless of `inside_tool_body` so it bounds the runaway no
+    // matter which heuristic state machine desynced; the
+    // `grammar_state.is_some()` gate ensures only tool-active requests are
+    // ever capped (plain chat attaches no grammar). Default 100_000
+    // (`MAX_POST_THINK_CONTENT_TOKENS`) = no-op; Qwen3.6-35B-A3B-FP8 sets
+    // 1536 in MODEL.toml.
+    if !crate::scheduler::helpers::disable_watchdogs()
+        && a.grammar_state.is_some()
+        && a.content_tokens > watchdog_params().max_post_think_content_tokens
+    {
+        tracing::warn!(
+            content_tokens = a.content_tokens,
+            max = watchdog_params().max_post_think_content_tokens,
+            "post-think content cap exceeded in non-MTP decode path; ending response (tool-active request would otherwise burn to max_tokens)"
+        );
+        a.finished = true;
+    }
     // think_just_ended is a one-shot: it was set when the prior
     // token was `</think>`; clear it now that we've emitted the
     // first content token (which Change 3b's mask pinned to
@@ -164,9 +183,15 @@ pub fn handle_content_token(a: &mut ActiveSeq, model: &dyn Model) {
     // re-plan, instead of letting the model emit
     // prose↔tool↔prose↔tool forever (the `tool_choice="auto"`
     // grammar never self-terminates — see grammar.rs:461-462).
+    // F4 (2026-06-02): gate on the sticky `tool_request` flag instead of
+    // `grammar_state.is_some()`. The grammar can gracefully DISENGAGE
+    // mid-response (`emit_step` drops `grammar_state` to salvage a turn);
+    // the prior gate then went inert and the prose budget never fired,
+    // letting a disengaged tool turn wander to `max_tokens`.
+    // `tool_request` is set at prefill and survives disengage.
     if !crate::scheduler::helpers::disable_watchdogs()
         && !a.inside_tool_body
-        && a.grammar_state.is_some()
+        && a.tool_request
     {
         a.prose_tokens_since_last_tool = a.prose_tokens_since_last_tool.saturating_add(1);
         let max_prose = watchdog_params().max_inter_tool_prose;

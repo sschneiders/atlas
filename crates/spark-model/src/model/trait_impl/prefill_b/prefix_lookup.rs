@@ -122,6 +122,14 @@ impl TransformerModel {
                         self.gpu.as_ref(),
                         stream,
                     )?;
+                    if std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok() {
+                        self.ssm_pool.debug_state_checksum(
+                            seq.slot_idx,
+                            self.gpu.as_ref(),
+                            stream,
+                            &format!("restore@{snap_tok}"),
+                        );
+                    }
                     if snap_tok < matched {
                         tracing::info!(
                             "Marconi intermediate hit: restored from checkpoint at token {} \

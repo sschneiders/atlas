@@ -135,7 +135,19 @@ def aggregate_tier(runs_dir: pathlib.Path, tier: str) -> dict[str, Any]:
             except Exception:
                 continue
         metrics[name] = summarize(values, kind)
-    return {"tier": tier, "n": len(runs), "metrics": metrics, "runs": [r.get("run") for r in runs]}
+    # Failure counts for the process exit code: a run fails cargo if
+    # cargo.cargo_toml_valid is not truthy, and fails webserver if
+    # webserver.webserver_ok is not truthy (missing/None counts as a failure).
+    cargo_failures = sum(1 for r in runs if not jpath(r, "cargo.cargo_toml_valid"))
+    webserver_failures = sum(1 for r in runs if not jpath(r, "webserver.webserver_ok"))
+    return {
+        "tier": tier,
+        "n": len(runs),
+        "metrics": metrics,
+        "runs": [r.get("run") for r in runs],
+        "cargo_failures": cargo_failures,
+        "webserver_failures": webserver_failures,
+    }
 
 
 def write_csv(report: dict[str, Any], out: pathlib.Path) -> None:
@@ -198,12 +210,24 @@ def main() -> int:
         print("no tiers found in runs dir", file=sys.stderr)
         return 1
 
+    total_failures = 0
     for tier in tiers:
         report = aggregate_tier(args.runs_dir, tier)
         write_csv(report, args.reports_dir / f"{tier}.csv")
         write_md(report, args.reports_dir / f"{tier}.md")
-        print(f"  tier={tier} n={report['n']} -> {args.reports_dir}/{tier}.{{csv,md}}", file=sys.stderr)
-    return 0
+        cf = report.get("cargo_failures", 0)
+        wf = report.get("webserver_failures", 0)
+        total_failures += cf + wf
+        print(
+            f"  tier={tier} n={report['n']} cargo_fail={cf} webserver_fail={wf} "
+            f"-> {args.reports_dir}/{tier}.{{csv,md}}",
+            file=sys.stderr,
+        )
+    # Exit code = total failure count (cargo + webserver), so 0 == all green.
+    # Clamped to 255 (POSIX exit codes are 8-bit); a >255 failure count still
+    # reports non-zero. The full count is printed above for the true total.
+    print(f"=== TOTAL FAILURES (cargo+webserver): {total_failures} ===", file=sys.stderr)
+    return min(total_failures, 255)
 
 
 if __name__ == "__main__":

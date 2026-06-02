@@ -46,6 +46,13 @@ pub fn step_mtp(
                 continue;
             }
         };
+        // Build the seq's configured penalties (rep/presence/frequency/LZ/DRY)
+        // so the MTP bootstrap token sees the SAME penalties+history the
+        // non-MTP path applies — the root-cause fix for repetition_penalty /
+        // dry_multiplier never reaching MTP-emitted tokens. Cloned before the
+        // mutable `grammar_state` borrow to satisfy the borrow checker.
+        let penalties = crate::scheduler::sample_step::penalty_params_for(a);
+        let history = a.output_tokens.clone();
         let tok = match sample_token_with_grammar(
             model,
             logits,
@@ -54,6 +61,8 @@ pub fn step_mtp(
             a.top_p,
             &[],
             a.grammar_state.as_mut(),
+            &penalties,
+            &history,
         ) {
             Ok(t) => t,
             Err(e) => {
@@ -81,10 +90,19 @@ pub fn step_mtp(
             continue;
         }
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
+        // BUG#4 (2026-06-02): when a grammar is active, generate only ONE draft.
+        // run_mtp_propose_multi (mtp_multi.rs) masks only draft[0] with the
+        // position-0 bitmask and leaves draft[1..] UNMASKED, so multi-draft +
+        // grammar desyncs — a draft[1] token can violate its true per-position
+        // mask, get verified+accepted, then be refused by the matcher later
+        // (→ truncation). A single draft uses its own up-to-date mask and is
+        // sound; drafts.len()==1 routes verify to the K=2 path. Mask is a no-op
+        // when grammar is inactive, so NVFP4/non-tool paths keep full K.
+        let effective_num_drafts = if a.grammar_state.is_some() { 1 } else { num_drafts };
         match model.run_mtp_propose_multi(
             tok,
             a.seq.seq_len,
-            num_drafts,
+            effective_num_drafts,
             &mut a.seq,
             0,
             _mtp_grammar_mask.as_deref(),

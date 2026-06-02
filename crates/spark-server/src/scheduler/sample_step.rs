@@ -4,6 +4,55 @@
 
 use super::*;
 
+/// Build the penalty/bias-carrying [`SamplingParams`] for one sequence,
+/// mirroring the non-MTP `decode_logits_seq::process_seq_logits` site so
+/// the MTP bootstrap + verify paths apply the SAME penalties the non-MTP
+/// path does (the root-cause fix for repetition_penalty/dry never reaching
+/// MTP-emitted tokens).
+///
+/// SSOT: the in-tool DRY gate (`dry_multiplier` zeroed inside a tool body)
+/// and the grammar LZ gate (`lz_penalty` zeroed when a grammar is active)
+/// match `process_seq_logits` exactly. `temperature` is forced to 0.0:
+/// the MTP verify/bootstrap emission is a penalty-aware ARGMAX (greedy),
+/// so only the penalty + bias stages of `sample_with_params_*` matter.
+///
+/// `logit_bias` is left empty here — the verify path's bias is the WS1/
+/// AM1/WS2/A4 param-body masking which is state-derived per position and
+/// is NOT replicated on the speculative path; the bootstrap path mirrors
+/// the non-MTP first-decode-token state (no param body open yet → no bias).
+pub(super) fn penalty_params_for(a: &ActiveSeq) -> SamplingParams {
+    let in_tool = a.inside_tool_body && !a.inside_thinking;
+    SamplingParams {
+        temperature: 0.0,
+        top_k: a.top_k,
+        top_p: a.top_p,
+        top_n_sigma: a.top_n_sigma,
+        min_p: a.min_p,
+        logit_bias: Vec::new(),
+        // A1: full penalty INSIDE tool body too (stops attractor patterns:
+        // mismatched-paren runaway, `lean://` prefix loop, same-tool-call
+        // repetition). Matches `process_seq_logits`.
+        repetition_penalty: a.repetition_penalty,
+        repetition_penalty_window: a.repetition_penalty_window,
+        presence_penalty: a.presence_penalty,
+        frequency_penalty: a.frequency_penalty,
+        lz_penalty: if a.grammar_state.is_some() {
+            0.0
+        } else {
+            a.lz_penalty
+        },
+        // DRY stays disabled inside the tool body (its short n-gram window
+        // fights legitimate JSON structural repetition `","`/`":"`).
+        dry_multiplier: if in_tool { 0.0 } else { a.dry_multiplier },
+        dry_base: a.dry_base,
+        dry_allowed_length: a.dry_allowed_length,
+        dry_sequence_breakers: a.dry_sequence_breakers.clone(),
+        max_tokens: 0,
+        stop_token_ids: Vec::new(),
+        seed: None,
+    }
+}
+
 /// Re-sample verify tokens from the logits buffer when temperature > 0.
 ///
 /// After `decode_verify_graphed`, the logits buffer still contains valid
@@ -143,6 +192,15 @@ pub fn sample_token(
 /// Like `sample_token` but also applies grammar bitmask when `grammar_state`
 /// is provided. Always uses host-side sampling when grammar is active (can't
 /// use GPU argmax since grammar bitmask is CPU-side).
+///
+/// `penalties` + `history` carry the sequence's configured repetition /
+/// presence / frequency / LZ / DRY penalties (built via [`penalty_params_for`])
+/// and the output-token history. These are applied via the shared
+/// [`apply_penalties_and_bias`] helper AFTER the grammar bitmask + EOS
+/// suppression and BEFORE the temperature decision — the same order the
+/// non-MTP `process_seq_logits` path uses — so MTP-bootstrap-emitted tokens
+/// see the same penalties as the non-MTP path. Backward-compatible: a
+/// no-op when the penalties are neutral (rep==1.0, dry==0.0, etc.).
 pub fn sample_token_with_grammar(
     model: &dyn Model,
     logits: DevicePtr,
@@ -150,11 +208,44 @@ pub fn sample_token_with_grammar(
     top_k: u32,
     top_p: f32,
     suppress_ids: &[u32],
-    grammar_state: Option<&mut GrammarState>,
+    mut grammar_state: Option<&mut GrammarState>,
+    penalties: &SamplingParams,
+    history: &[u32],
 ) -> Result<u32> {
-    let Some(gs) = grammar_state else {
-        return sample_token(model, logits, temperature, top_k, top_p, suppress_ids);
-    };
+    // ── FAST PATH (#3, 2026-06-02): on-GPU greedy pick under grammar ──
+    // The MTP bootstrap sample (~1 token/step) otherwise D2Hs + dequants the
+    // full 248k vocab + applies the bitmask on host. When greedy (temp=0 or
+    // ATLAS_FORCE_TEMP_ZERO), penalties neutral, and no suppress list, the
+    // masked-greedy pick == the GPU argmax whenever that argmax is grammar-
+    // allowed (global max ∩ allowed-set = the max). Emit it directly; fall back
+    // to the host path below only when the argmax is grammar-disallowed.
+    // Mirrors the verify-path fast path. Kill-switch ATLAS_DISABLE_FAST_GREEDY=1.
+    if crate::scheduler::verify_pipeline_helper::fast_greedy_grammar_enabled()
+        && suppress_ids.is_empty()
+        && (temperature == 0.0 || crate::scheduler::decode_logits_seq::force_temp_zero_enabled())
+        && penalties.repetition_penalty == 1.0
+        && penalties.presence_penalty == 0.0
+        && penalties.frequency_penalty == 0.0
+        && penalties.lz_penalty == 0.0
+        && penalties.dry_multiplier == 0.0
+    {
+        let top1 = model.argmax_on_device(logits, 0)?;
+        let allowed = match grammar_state.as_mut() {
+            Some(gs) => {
+                if gs.is_terminated() {
+                    true
+                } else {
+                    gs.fill_bitmask();
+                    gs.is_token_allowed(top1)
+                }
+            }
+            None => true,
+        };
+        if allowed {
+            return Ok(top1);
+        }
+    }
+
     let vocab_size = model.vocab_size();
     let mut bf16_buf = vec![0u8; vocab_size * 2];
     model.copy_logits_to_host(logits, &mut bf16_buf)?;
@@ -170,9 +261,14 @@ pub fn sample_token_with_grammar(
             f32_logits[id as usize] = f32::NEG_INFINITY;
         }
     }
-    // Apply grammar bitmask.
-    gs.fill_bitmask();
-    gs.apply_bitmask_to_logits(&mut f32_logits);
+    // Apply grammar bitmask (when a grammar is active).
+    if let Some(gs) = grammar_state {
+        gs.fill_bitmask();
+        gs.apply_bitmask_to_logits(&mut f32_logits);
+    }
+    // SSOT penalties + bias on the post-mask logits, using the seq's
+    // output-token history — identical stage to the non-MTP path.
+    apply_penalties_and_bias(&mut f32_logits, penalties, history);
     if temperature == 0.0 {
         let best = f32_logits
             .iter()
@@ -184,6 +280,9 @@ pub fn sample_token_with_grammar(
     }
     let f32_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, vocab_size * 4) };
+    // Penalties already applied in place above; pass neutral penalty params
+    // to `sample_with_params` (which re-runs the helper with empty history,
+    // a guaranteed no-op) so the stochastic top-k/top-p/min-p pipeline runs.
     Ok(sample_with_params(
         f32_bytes,
         &SamplingParams {

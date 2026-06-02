@@ -428,6 +428,12 @@ pub fn truncate_drafts_at_grammar_boundary(gs: &mut GrammarState, drafts: &[u32]
     if drafts.len() < 2 || gs.is_terminated() {
         return drafts.len();
     }
+    // BUG#3 (2026-06-02): roll back ACTUAL matcher advances (history delta), not
+    // the `accepted` tally. `accept_token` returns true for stop/EOS tokens and
+    // in the terminated state WITHOUT advancing the matcher; counting rollback
+    // from `accepted` over-rewinds when such a token is in the draft span
+    // (corrupt state / rollback panic). `accepted` still drives truncation.
+    let steps_before = gs.num_history_steps();
     let mut accepted = 0usize;
     for &tok in drafts {
         if !gs.accept_token(tok) {
@@ -435,8 +441,9 @@ pub fn truncate_drafts_at_grammar_boundary(gs: &mut GrammarState, drafts: &[u32]
         }
         accepted += 1;
     }
-    if accepted > 0 {
-        gs.rollback(accepted);
+    let advanced = gs.num_history_steps().saturating_sub(steps_before);
+    if advanced > 0 {
+        gs.rollback(advanced);
     }
     if accepted < drafts.len() {
         tracing::warn!(

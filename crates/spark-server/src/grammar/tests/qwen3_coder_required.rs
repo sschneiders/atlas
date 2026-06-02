@@ -69,7 +69,7 @@ fn qwen3_coder_grammar_accepts_canonical_xml_body() {
     let mut engine = GrammarEngine::new(&vocab, &stop_ids).unwrap();
     let tools = exec_tool_def();
     let compiled = engine
-        .compile_qwen3_coder_tool_grammar(&tools, true)
+        .compile_qwen3_coder_tool_grammar(&tools, true, "</parameter>")
         .expect("compile must succeed");
 
     let canonical_xml =
@@ -91,7 +91,7 @@ fn qwen3_coder_grammar_accepts_legacy_json_body() {
     let mut engine = GrammarEngine::new(&vocab, &stop_ids).unwrap();
     let tools = exec_tool_def();
     let compiled = engine
-        .compile_qwen3_coder_tool_grammar(&tools, true)
+        .compile_qwen3_coder_tool_grammar(&tools, true, "</parameter>")
         .expect("compile must succeed");
 
     let json_body =
@@ -129,7 +129,7 @@ fn qwen3_coder_grammar_accepts_multi_xml_params() {
     let stop_ids = vec![130i32];
     let mut engine = GrammarEngine::new(&vocab, &stop_ids).unwrap();
     let compiled = engine
-        .compile_qwen3_coder_tool_grammar(&tools, true)
+        .compile_qwen3_coder_tool_grammar(&tools, true, "</parameter>")
         .expect("compile must succeed");
 
     let multi_param = "<tool_call>\n<function=write>\n<parameter=filePath>/tmp/test-rust-axum-v42/Cargo.toml</parameter>\n<parameter=content>[package]\nname = \"test-rust-axum-v42\"</parameter>\n</function>\n</tool_call>";
@@ -157,7 +157,7 @@ fn qwen3_coder_grammar_rejects_empty_parameter_body() {
     let mut engine = GrammarEngine::new(&vocab, &stop_ids).unwrap();
     let tools = exec_tool_def();
     let compiled = engine
-        .compile_qwen3_coder_tool_grammar(&tools, true)
+        .compile_qwen3_coder_tool_grammar(&tools, true, "</parameter>")
         .expect("compile must succeed");
 
     let empty_body =
@@ -175,7 +175,7 @@ fn qwen3_coder_grammar_rejects_whitespace_only_parameter_body() {
     let mut engine = GrammarEngine::new(&vocab, &stop_ids).unwrap();
     let tools = exec_tool_def();
     let compiled = engine
-        .compile_qwen3_coder_tool_grammar(&tools, true)
+        .compile_qwen3_coder_tool_grammar(&tools, true, "</parameter>")
         .expect("compile must succeed");
 
     let whitespace_body =

@@ -14,7 +14,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::AppState;
 use crate::openai::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, CompletionChunk,
-    CompletionRequest, CompletionResponse, ModelInfo, ModelListResponse, Usage,
+    CompletionRequest, CompletionResponse, ModelInfo, ModelListResponse, PromptInput, Usage,
 };
 use crate::tool_parser;
 
@@ -37,6 +37,69 @@ use super::strip::strip_thinking_tags;
 use super::inference_types::*;
 use super::sanitizer::*;
 
+/// Resolve an OpenAI-compatible `prompt` field into the concrete prompt
+/// token sequence consumed by the scheduler.
+///
+/// Text forms (`Text` / `TextArray`) are tokenized via the same
+/// `tokenizer.encode` path used historically — `encode` calls the HF
+/// tokenizer with `add_special_tokens=false` (see
+/// `tokenizer/chat_impl.rs:74`), so **no BOS / special token is
+/// prepended**. The token-ID forms (`TokenIds` / `TokenIdBatch`) are fed
+/// to the scheduler verbatim and likewise prepend nothing — the caller
+/// supplies the exact IDs. Both paths therefore converge on the same
+/// `Vec<u32>` with identical framing, which is required for exact
+/// cross-engine cosine comparison (any spurious BOS would corrupt it).
+///
+/// Token-ID inputs are range-checked against the tokenizer vocabulary;
+/// an out-of-range ID fails fast with a 400 rather than indexing out of
+/// bounds into the embedding table.
+fn resolve_prompt_tokens(
+    state: &AppState,
+    prompt: &PromptInput,
+) -> Result<Vec<u32>, (StatusCode, String)> {
+    match prompt {
+        PromptInput::Text(s) => state
+            .tokenizer
+            .encode(s)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Tokenization error: {e}"))),
+        PromptInput::TextArray(parts) => {
+            // Join with no separator, matching the prior `Vec<String>`
+            // behavior (`v.join("")`), then tokenize once.
+            let joined = parts.concat();
+            state
+                .tokenizer
+                .encode(&joined)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("Tokenization error: {e}")))
+        }
+        PromptInput::TokenIds(ids) => {
+            validate_token_ids(state, ids)?;
+            Ok(ids.clone())
+        }
+        PromptInput::TokenIdBatch(batch) => {
+            // The legacy single-prompt handler flattens a batch into one
+            // sequence (concatenation), matching how `TextArray` joins
+            // multiple string prompts into one.
+            let flat: Vec<u32> = batch.iter().flatten().copied().collect();
+            validate_token_ids(state, &flat)?;
+            Ok(flat)
+        }
+    }
+}
+
+/// Fail-fast validation that every supplied token ID is within the model
+/// vocabulary. The tokenizer is the authoritative source of vocab size
+/// (SSOT); an OOB ID would index past the embedding table.
+fn validate_token_ids(state: &AppState, ids: &[u32]) -> Result<(), (StatusCode, String)> {
+    let vocab_size = state.tokenizer.inner().get_vocab_size(true) as u32;
+    if let Some(&bad) = ids.iter().find(|&&id| id >= vocab_size) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Token ID {bad} out of range: vocab_size is {vocab_size}"),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn completions(
     State(state): State<Arc<AppState>>,
     req: Result<Json<CompletionRequest>, JsonRejection>,
@@ -50,14 +113,9 @@ pub async fn completions(
             );
         }
     };
-    let prompt_tokens = match state.tokenizer.encode(&req.prompt) {
+    let prompt_tokens = match resolve_prompt_tokens(&state, &req.prompt) {
         Ok(t) => t,
-        Err(e) => {
-            return openai_error_response(
-                StatusCode::BAD_REQUEST,
-                format!("Tokenization error: {e}"),
-            );
-        }
+        Err((status, msg)) => return openai_error_response(status, msg),
     };
 
     let prompt_len = prompt_tokens.len();

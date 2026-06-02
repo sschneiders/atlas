@@ -103,21 +103,50 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     // a clean `write({"content":"hello world","filePath":"…"})` probe.
     update_tool_param_state(a, tok);
 
+    // F2 mirror (Iter 46, 2026-06-02): reset the inter-tool prose budget when
+    // a tool call opens on the MTP/emit path — parity with the non-MTP reset
+    // in `decode_logits_step.rs` (the `tool_call_start_token` branch). Without
+    // this the budget would accrue across the whole response and the MTP-path
+    // budget watchdog (added below) would false-fire after the first
+    // `max_inter_tool_prose` content tokens even across legitimate multi-tool
+    // turns. Keyed identically: tool-call open, not inside `<think>`.
+    if a.tool_call_start_token == Some(tok) && !a.inside_thinking {
+        a.prose_tokens_since_last_tool = 0;
+    }
+
     // Advance grammar state with the emitted token — skip while the
     // sequence is inside `<think>`…`</think>` so the matcher only
     // sees the final-output token stream.
+    let mut disengage_grammar = false;
     if !a.inside_thinking
         && let Some(ref mut gs) = a.grammar_state
     {
         let advanced = gs.accept_token(tok);
         if !advanced {
+            // Grammar/model disagreement (BUG#2 class: e.g. a merged BPE token
+            // like `><` or a `</X` content run the qwen3_coder value rule
+            // forbids, often surfaced via an under-masked MTP draft). The token
+            // is already a legitimate model emission; the matcher is now
+            // desynced. Previously we set `a.finished = true` here — a
+            // CATASTROPHIC cliff that lost the ENTIRE agentic turn on a single
+            // refused token (root cause of the opencode webserver_ok gap).
+            // Instead, DISENGAGE the grammar for the remainder of this response
+            // and continue decoding UNCONSTRAINED — exactly what vLLM (the 10/10
+            // reference) does by parsing tools post-hoc. Atlas's server-side
+            // tool parser still extracts tool calls from the emitted text, so
+            // the structural guarantee is gracefully traded for turn survival.
             tracing::warn!(
                 tok,
                 output_len = a.output_tokens.len(),
-                "gs.accept_token returned false — xgrammar NPDA refused the emitted token; matcher is now desynced from the stream. Ending response to prevent cascading grammar-mask corruption."
+                "gs.accept_token returned false — grammar/model disagreement; disengaging grammar for the remainder of this response (free decode + post-hoc tool parse) instead of aborting the turn."
             );
-            a.finished = true;
+            disengage_grammar = true;
         }
+    }
+    if disengage_grammar {
+        // Drop the matcher: subsequent decode steps see `grammar_state == None`
+        // and decode unconstrained. Set after the `ref mut gs` borrow ends.
+        a.grammar_state = None;
     }
 
     // Accumulate logprobs data for blocking responses.
@@ -199,6 +228,24 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
             numeric_token_mask,
         };
         a.content_tokens = a.content_tokens.saturating_add(1);
+        // F1 (2026-06-02): unconditional per-generation post-think content
+        // cap. Fires regardless of `inside_tool_body` so it bounds the
+        // runaway no matter which heuristic state machine desynced (RC1/
+        // RC2/RC3). Gated on `grammar_state.is_some()` ⇒ only tool-active
+        // requests are ever capped (plain chat attaches no grammar and is
+        // never truncated). Default 100_000 (`MAX_POST_THINK_CONTENT_TOKENS`)
+        // = no-op; Qwen3.6-35B-A3B-FP8 sets 1536 in MODEL.toml.
+        if !disable_watchdogs()
+            && a.grammar_state.is_some()
+            && a.content_tokens > watchdog_params().max_post_think_content_tokens
+        {
+            tracing::warn!(
+                content_tokens = a.content_tokens,
+                max = watchdog_params().max_post_think_content_tokens,
+                "post-think content cap exceeded in MTP/emit path; ending response (tool-active request would otherwise burn to max_tokens)"
+            );
+            a.finished = true;
+        }
         if !disable_watchdogs()
             && enable_loop_watchdog()
             && !a.inside_tool_body
@@ -221,6 +268,42 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
                 CONTENT_LOOP_PERIOD_MAX,
             );
             a.finished = true;
+        }
+
+        // F2 mirror (Iter 46, 2026-06-02): inter-tool PROSE-BUDGET watchdog on
+        // the MTP/emit path. The 2026-05-24 mirror above copied only the
+        // content-LOOP guard; the prose-budget guard (decode_logits_content.rs)
+        // stayed non-MTP-only — so with `--num-drafts ≥ 1` (MTP/verify path),
+        // a turn that wanders WITHOUT producing a parseable tool call had NO
+        // bound and burned the whole `max_tokens` budget (~270s at 30 tok/s),
+        // starving the agent of turns. This was the dominant opencode
+        // `webserver_ok` 360s-timeout cause: at deep context the model flips
+        // its tool opener to Anthropic-XML `<invoke name=…>`, which never
+        // matches the qwen3_coder trigger, so the trigger-gated grammar stays
+        // dormant and the wander is not a tight period-≤64 loop the content
+        // watchdog catches. Same gates as the non-MTP block: free-text only
+        // (`!inside_tool_body`) and grammar attached (`grammar_state.is_some()`
+        // ⇒ a tool request, never plain chat — so a long chat answer is not
+        // truncated). No rollback here: `emit_token` has no `&dyn Model` (the
+        // SSM rewind needs it), so we hard-stop exactly like the content-loop
+        // mirror; the sanitizer + post-hoc tool parser salvage what was emitted.
+        // F4 (2026-06-02): gate on the sticky `tool_request` flag (set at
+        // prefill, survives a graceful grammar disengage) instead of
+        // `grammar_state.is_some()` — otherwise a disengaged tool turn on
+        // the MTP path wanders to `max_tokens` with the budget inert.
+        if !disable_watchdogs() && !a.inside_tool_body && a.tool_request {
+            a.prose_tokens_since_last_tool = a.prose_tokens_since_last_tool.saturating_add(1);
+            let max_prose = watchdog_params().max_inter_tool_prose;
+            if a.prose_tokens_since_last_tool > max_prose {
+                tracing::warn!(
+                    prose_tokens = a.prose_tokens_since_last_tool,
+                    max = max_prose,
+                    output_len = a.output_tokens.len(),
+                    "Inter-tool prose budget exhausted in MTP/emit path; ending response \
+                     (no tool call after budget — would otherwise burn to max_tokens)."
+                );
+                a.finished = true;
+            }
         }
     }
 
@@ -299,6 +382,7 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
 pub fn compile_grammar_state(
     engine: &mut Option<GrammarEngine>,
     grammar_spec: &Option<GrammarSpec>,
+    eos_tokens: &[u32],
 ) -> Option<GrammarState> {
     let spec = grammar_spec.as_ref()?;
     let engine = engine.as_mut()?;
@@ -341,7 +425,10 @@ pub fn compile_grammar_state(
             match GrammarState::new(&grammar, vocab_size) {
                 Ok(state) => {
                     tracing::info!("Grammar constrained decoding active: {label}");
-                    Some(state)
+                    // Exempt the model's stop/EOS tokens from grammar refusal
+                    // so a legitimate end-of-turn token cannot desync the NPDA
+                    // and truncate the response (see GrammarState::accept_token).
+                    Some(state.with_stop_tokens(eos_tokens))
                 }
                 Err(e) => {
                     tracing::warn!("Grammar state creation failed: {e}");

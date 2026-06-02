@@ -39,7 +39,7 @@ fn b1_record_low_margin(margin: f32, top1: u32, top2: u32) {
 /// mitigation (WS1/AM1/WS2/A4/B1/C4) and just returns argmax of raw
 /// logits. Used together with VLLM_FORCE_TEMP_ZERO on vLLM for
 /// apples-to-apples layer-cosine comparison.
-fn force_temp_zero_enabled() -> bool {
+pub(crate) fn force_temp_zero_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
         std::env::var("ATLAS_FORCE_TEMP_ZERO")

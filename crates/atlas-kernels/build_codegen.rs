@@ -174,6 +174,7 @@ pub(super) fn generate_target_ptx_rs(
              \x20               confidence_run_length: {},\n\
              \x20               fuzzy_repeat_tolerance_div: {},\n\
              \x20               max_inter_tool_prose: {},\n\
+             \x20               max_post_think_content_tokens: {},\n\
              \x20               tscg: {},\n\
              \x20               disable_tool_grammar: {},\n\
              \x20               rollback_resteer: {},\n\
@@ -203,6 +204,7 @@ pub(super) fn generate_target_ptx_rs(
             target.behavior_confidence_run_length,
             target.behavior_fuzzy_repeat_tolerance_div,
             target.behavior_max_inter_tool_prose,
+            target.behavior_max_post_think_content_tokens,
             target.behavior_tscg,
             target.behavior_disable_tool_grammar,
             target.behavior_rollback_resteer,

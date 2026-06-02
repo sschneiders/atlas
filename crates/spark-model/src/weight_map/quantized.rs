@@ -234,7 +234,7 @@ pub struct Fp8Weight {
 pub struct Fp8WeightTransposed {
     /// [K, N] FP8 E4M3 transposed weight on GPU.
     pub weight_t: DevicePtr,
-    /// [K/128, N/128] BF16 transposed block scales on GPU.
+    /// [K/128, N/128] FP32 transposed block scales on GPU (widened at load).
     pub scale_t: DevicePtr,
     pub n: u32,
     pub k: u32,
@@ -242,7 +242,8 @@ pub struct Fp8WeightTransposed {
 
 impl Fp8Weight {
     /// Transpose this FP8 weight for coalesced prefill GEMM.
-    /// Allocates new GPU buffers for `B_t[K,N]` and `scale_t[K/128, N/128]`.
+    /// Allocates new GPU buffers for `B_t[K,N]` (FP8 bytes) and
+    /// `scale_t[K/128, N/128]` (FP32; `row_scale` is already FP32).
     pub fn transpose_for_gemm(
         &self,
         gpu: &dyn GpuBackend,
@@ -265,10 +266,13 @@ impl Fp8Weight {
             stream,
         )?;
 
-        // Allocate transposed scale: [K/128, N/128] × 2 bytes (BF16)
+        // Allocate transposed scale: [K/128, N/128] × 4 bytes (FP32).
+        // `row_scale` is now an FP32 block-scale buffer (widened at load), and
+        // `transpose_block_scale` is an FP32→FP32 transpose — see
+        // `load_fp8_block_scaled_as_fp8weight` / `w8a16_gemm_t.cu`.
         let n_blocks = n.div_ceil(128);
         let k_blocks = k.div_ceil(128);
-        let scale_t = gpu.alloc(k_blocks * n_blocks * 2)?;
+        let scale_t = gpu.alloc(k_blocks * n_blocks * 4)?;
         crate::layers::ops::transpose_block_scale(
             gpu,
             transpose_scale_k,

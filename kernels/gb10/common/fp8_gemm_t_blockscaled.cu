@@ -9,7 +9,8 @@
 //   - A_fp8[M, K]      — per-token-per-128 FP8 quant (from `per_token_group_quant_fp8`)
 //   - a_scale[M, K/128] FP32 — output scale of `per_token_group_quant_fp8`
 //   - B_fp8[N, K]      — per-(128, 128) FP8 weight (block-scaled checkpoint)
-//   - b_scale[N/128, K/128] BF16 — block-scaled weight scale (existing checkpoint layout)
+//   - b_scale[N/128, K/128] FP32 — block-scaled weight scale (scale_inv widened
+//                                  to FP32 at load; applied in full FP32)
 //   - C[M, N] BF16
 //
 // MMA: mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 (sm_121 native FP8)
@@ -54,7 +55,7 @@ extern "C" __global__ void fp8_gemm_t_blockscaled(
     const unsigned char* __restrict__ A_fp8,    // [M, K] FP8 E4M3
     const float* __restrict__ a_scale,          // [M, K/128] FP32
     const unsigned char* __restrict__ B_fp8,    // [N, K] FP8 E4M3
-    const __nv_bfloat16* __restrict__ b_scale,  // [N/128, K/128] BF16
+    const float* __restrict__ b_scale,          // [N/128, K/128] FP32
     __nv_bfloat16* __restrict__ C,              // [M, N] BF16
     unsigned int M,
     unsigned int N,
@@ -165,8 +166,7 @@ extern "C" __global__ void fp8_gemm_t_blockscaled(
         k_step_in_block++;
         if (k_step_in_block == K_STEPS_PER_BLOCK) {
             const unsigned int k_block = (k_base - K_STEP_T) / K_BLOCK;
-            const float bs = __bfloat162float(
-                b_scale[n_block_lo * k_groups + k_block]);
+            const float bs = b_scale[n_block_lo * k_groups + k_block];
             const unsigned int r0_global = cta_m + warp_m_offset + group_id;
             const unsigned int r1_global = r0_global + 8;
             const float as0 = (r0_global < M) ? a_scale[r0_global * k_groups + k_block] : 0.0f;
@@ -192,8 +192,7 @@ extern "C" __global__ void fp8_gemm_t_blockscaled(
     // Final fold (full block at the trailing edge).
     {
         const unsigned int k_block = (K - 1) / K_BLOCK;
-        const float bs = __bfloat162float(
-            b_scale[n_block_lo * k_groups + k_block]);
+        const float bs = b_scale[n_block_lo * k_groups + k_block];
         const unsigned int r0_global = cta_m + warp_m_offset + group_id;
         const unsigned int r1_global = r0_global + 8;
         const float as0 = (r0_global < M) ? a_scale[r0_global * k_groups + k_block] : 0.0f;

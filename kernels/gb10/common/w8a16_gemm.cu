@@ -6,7 +6,8 @@
 //
 // FP8-E4M3 weight format (2D block-scaled):
 //   B:           [N, K] uint8 — one byte per weight (FP8 E4M3)
-//   block_scale: [N/128, K/128] BF16 — per-block scale factor
+//   block_scale: [N/128, K/128] FP32 — per-block scale factor (scale_inv
+//                widened to FP32 at load; applied in full FP32 precision)
 //
 // Dequant: bf16_val = E4M3_LUT[byte] * block_scale[n/128, k/128]
 //
@@ -146,12 +147,12 @@ __device__ __forceinline__ void w8a16_mma_and_store(
 
 /// W8A16 GEMM: B[N, K] row-major FP8 E4M3 with 2D block scales.
 ///
-/// block_scale[N/128, K/128] BF16 — one scale per 128x128 weight block.
+/// block_scale[N/128, K/128] FP32 — one scale per 128x128 weight block.
 /// Dequant during B tile load: bf16_val = E4M3_LUT[byte] * block_scale
 extern "C" __global__ void w8a16_gemm(
     const __nv_bfloat16* __restrict__ A,            // [M, K] BF16 activations
     const unsigned char* __restrict__ B,             // [N, K] FP8 E4M3
-    const __nv_bfloat16* __restrict__ block_scale,   // [N/128, K/128] BF16
+    const float* __restrict__ block_scale,           // [N/128, K/128] FP32
     __nv_bfloat16* __restrict__ C,                   // [M, N] BF16 output
     unsigned int M,
     unsigned int N,
@@ -239,7 +240,7 @@ extern "C" __global__ void w8a16_gemm(
         k_step_in_block++;
         if (k_step_in_block == k_steps_per_block) {
             const unsigned int k_block = k_base / FP8_BLOCK;
-            const float scale = __bfloat162float(block_scale[n_block * k_blocks + k_block]);
+            const float scale = block_scale[n_block * k_blocks + k_block];
             #pragma unroll
             for (int i = 0; i < 8; i++) {
                 outer_acc[i][0] += inner_acc[i][0] * scale;
@@ -258,7 +259,7 @@ extern "C" __global__ void w8a16_gemm(
     // but keeps the kernel correct on other configs).
     if (k_step_in_block != 0) {
         const unsigned int k_block = (K - 1) / FP8_BLOCK;
-        const float scale = __bfloat162float(block_scale[n_block * k_blocks + k_block]);
+        const float scale = block_scale[n_block * k_blocks + k_block];
         #pragma unroll
         for (int i = 0; i < 8; i++) {
             outer_acc[i][0] += inner_acc[i][0] * scale;
@@ -288,7 +289,7 @@ extern "C" __global__ void w8a16_gemm(
 /// Each thread handles one FP8 byte → 1 BF16 output.
 extern "C" __global__ void w8a16_dequant(
     const unsigned char* __restrict__ B,             // [N, K] FP8 E4M3
-    const __nv_bfloat16* __restrict__ block_scale,   // [N/128, K/128] BF16
+    const float* __restrict__ block_scale,           // [N/128, K/128] FP32
     __nv_bfloat16* __restrict__ B_bf16,              // [N, K] BF16 output
     unsigned int K,
     unsigned int N
@@ -305,7 +306,7 @@ extern "C" __global__ void w8a16_dequant(
     unsigned int k_blocks = K / FP8_BLOCK;
     unsigned int n_block = n / FP8_BLOCK;
     unsigned int k_block = k / FP8_BLOCK;
-    float scale = __bfloat162float(block_scale[n_block * k_blocks + k_block]);
+    float scale = block_scale[n_block * k_blocks + k_block];
 
     float val = E4M3_LUT[weight_byte] * scale;
     B_bf16[idx] = __float2bfloat16(val);

@@ -34,6 +34,12 @@ impl TransformerModel {
         final_norm: DenseWeight,
         lm_head_weight: DenseWeight,
         lm_head_nvfp4: Option<QuantizedWeight>,
+        // Separate NVFP4 head used ONLY by the MTP draft proposer when the
+        // main head is kept BF16 (`skip_lm_head_quantization()`). `None` for
+        // the NVFP4-main default, in which case the proposer falls back to
+        // `lm_head_nvfp4`. Drafts are always verified by the main BF16 head,
+        // so this approximate head never affects an accepted token.
+        mtp_lm_head_nvfp4: Option<QuantizedWeight>,
         layers: Vec<Box<dyn TransformerLayer>>,
         buffers: BufferArena,
         kv_cache: PagedKvCache,
@@ -72,6 +78,12 @@ impl TransformerModel {
         let profile = std::env::var("ATLAS_PROFILE").is_ok();
         let profile_first = std::env::var("ATLAS_PROFILE_FIRST").is_ok();
 
+        // Pin the split-K attention split count to the configured max batch so
+        // a sequence's attention reduction is invariant to how many other
+        // sequences are co-batched (concurrent-decode determinism — see
+        // tasks/determinism_investigation.md).
+        crate::layers::qwen3_attention::set_max_decode_seqs(max_batch_size as u32);
+
         tracing::info!(
             "TransformerModel: {} layers, vocab={}, hidden={}{}{}",
             layers.len(),
@@ -102,8 +114,13 @@ impl TransformerModel {
         // or lm_head quantization — its K=γ verify path checkpoints SSM state
         // for partial-accept rollback. Force `has_mtp` on whenever DFlash is
         // active so the checkpoint pools exist.
+        //
+        // The MTP proposer needs an NVFP4 vocab head for drafting: either the
+        // main head (NVFP4 default) or the draft-only head built when the main
+        // head is BF16. `draft_lm_head_nvfp4` resolves to whichever is present.
+        let draft_lm_head_nvfp4 = mtp_lm_head_nvfp4.or(lm_head_nvfp4);
         let has_mtp = self_speculative
-            || (use_speculative && !mtp_weights.is_empty() && lm_head_nvfp4.is_some())
+            || (use_speculative && !mtp_weights.is_empty() && draft_lm_head_nvfp4.is_some())
             || dflash_kgamma > 0;
         let num_intermediates = if has_mtp {
             (num_drafts + 1).max(dflash_kgamma)
@@ -170,7 +187,7 @@ impl TransformerModel {
             use_speculative,
             mtp_weights,
             embed_tokens,
-            lm_head_nvfp4,
+            draft_lm_head_nvfp4,
             &config,
             gpu.as_ref(),
             mtp_quant,

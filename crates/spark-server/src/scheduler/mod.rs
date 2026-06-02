@@ -88,7 +88,9 @@ use parking_lot::{Condvar, Mutex};
 use spark_model::traits::{Model, SequenceState};
 use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_spill::KvSpillManager;
-use spark_runtime::sampler::{SamplingParams, sample_with_params, sample_with_params_history};
+use spark_runtime::sampler::{
+    SamplingParams, apply_penalties_and_bias, sample_with_params, sample_with_params_history,
+};
 
 use std::path::PathBuf;
 use std::sync::Arc;

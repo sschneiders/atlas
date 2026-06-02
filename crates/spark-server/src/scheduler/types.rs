@@ -171,6 +171,14 @@ pub(super) struct ActiveSeq {
     /// When true AND grammar_state is None, EOS tokens are suppressed until
     /// `<tool_call>` is generated (legacy fallback).
     pub require_tool_call: bool,
+    /// F4 (2026-06-02): sticky "this is a tool request" flag, set once at
+    /// prefill when a grammar is attached OR the legacy tool-call path is
+    /// active. Unlike `grammar_state.is_some()` it survives a graceful
+    /// grammar disengage (`emit_step` drops `grammar_state` to `None` to
+    /// salvage a turn), so the inter-tool prose-budget watchdog does not
+    /// go inert when the grammar disengages mid-response. Default false ⇒
+    /// no-op for non-tool requests (plain chat is never prose-capped).
+    pub tool_request: bool,
     /// Token ID for `<tool_call>` (legacy fallback when grammar is unavailable).
     pub tool_call_start_token: Option<u32>,
     /// True after `<tool_call>` generated in output (not inside thinking).
@@ -300,6 +308,10 @@ pub(super) struct SwappedSeq {
     pub think_just_ended: bool,
     pub think_skip_count: u32,
     pub require_tool_call: bool,
+    /// F4 (2026-06-02): sticky tool-request flag, preserved across
+    /// snapshot/restore (the grammar state itself is not serializable, so
+    /// this is the only signal that a resumed sequence was tool-active).
+    pub tool_request: bool,
     pub suppress_tool_call: bool,
     /// F60 (2026-04-27): MTP-disable flag preserved across snapshot/restore.
     pub disable_mtp: bool,

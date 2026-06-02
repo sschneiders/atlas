@@ -29,13 +29,25 @@ impl ToolCallParser for Qwen3CoderParser {
         true
     }
 
+    /// qwen3_coder terminates each `<parameter=NAME>VALUE` with `</parameter>`.
+    /// This is the SSOT delimiter consumed by the value-content ladder (BUG#2)
+    /// — see [`ToolCallParser::param_value_close_delim`].
+    fn param_value_close_delim(&self) -> Option<&'static str> {
+        Some("</parameter>")
+    }
+
     fn compile_tool_grammar(
         &self,
         engine: &mut GrammarEngine,
         tools: &[ToolDefinition],
         use_triggers: bool,
     ) -> Option<Result<CompiledGrammar, GrammarError>> {
-        Some(engine.compile_qwen3_coder_tool_grammar(tools, use_triggers))
+        // Pass the format's value-close delimiter (SSOT) into the builder so the
+        // value-content rule is dynamically dispatched, not hard-coded.
+        let value_close = self
+            .param_value_close_delim()
+            .expect("qwen3_coder declares a parameter-value close delimiter");
+        Some(engine.compile_qwen3_coder_tool_grammar(tools, use_triggers, value_close))
     }
 
     fn has_tool_grammar(&self) -> bool {

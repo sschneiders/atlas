@@ -75,13 +75,6 @@ impl Qwen3AttentionLayer {
             return self.prefill_attention_paged_mla(kv_cache, ctx, &args);
         }
 
-        // ── Standard Q/K/V projection (non-MLA models) ──
-        if self.mla.is_none() {
-            self.prefill_attention_paged_qkv(
-                normed, n, h, nkv, hd, q_proj_dim, kv_dim, num_tokens, bf16, ctx, stream,
-            )?;
-        } // end if self.mla.is_none() (standard projection path)
-
         // ── 4+5. Deinterleave Q/Gate + per-head Q/K RMS norms ──
         // v_contiguous must point at where the V GEMM actually wrote
         // (k_contiguous + kv_dim*n). The previous binding to attn_output()
@@ -92,12 +85,31 @@ impl Qwen3AttentionLayer {
         let k_contiguous = ctx.buffers.ssm_qkvz();
         let v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16);
         let q_contiguous = ctx.buffers.ssm_deinterleaved();
-        // Defensive memset (audit fix #B2): clear the V region before any
-        // V-projection GEMM writes here. Historical comment on the
-        // aliasing math notes a prior "stale V on chunk-1+" regression
-        // when the V GEMM under-wrote the region. Zeroing first is
-        // ~5 µs at 9k tokens and rules that class of bug out forever.
+        // Defensive memset (audit fix #B2): clear the V region BEFORE the
+        // V-projection GEMM runs. Historical comment on the aliasing math
+        // notes a prior "stale V on chunk-1+" regression when the V GEMM
+        // under-wrote the region. Zeroing first is ~5 µs at 9k tokens and
+        // rules that class of bug out forever.
+        //
+        // Prefix-cache-recompute fix (iteration 4): this memset MUST precede
+        // `prefill_attention_paged_qkv` — that function runs the V GEMM and
+        // writes V to exactly this `v_contiguous` region (paged_qkv.rs).
+        // When the memset ran AFTER the projection it clobbered the
+        // freshly-projected V with zeros, so every chunk-1+/recompute block
+        // got V≡0 written into the paged cache. Validated via the BF16 KV
+        // checksum probe: recompute-suffix `v_ssq=0` vs cache-OFF `v_ssq≠0`
+        // at the first full-attention layer (L3). On the cache-hit recompute
+        // path this produced nondeterministic turn-3 output (zero-V positions
+        // contribute nothing to attention; combined with the partial boundary
+        // block the result diverged run-to-run).
         ctx.gpu.memset_async(v_contiguous, 0, num_tokens * kv_dim * bf16, stream)?;
+
+        // ── Standard Q/K/V projection (non-MLA models) ──
+        if self.mla.is_none() {
+            self.prefill_attention_paged_qkv(
+                normed, n, h, nkv, hd, q_proj_dim, kv_dim, num_tokens, bf16, ctx, stream,
+            )?;
+        } // end if self.mla.is_none() (standard projection path)
         // B1 fused K-path: save the post-GEMM RAW K to scratch BEFORE k_norm
         // and RoPE mutate `k_contiguous`. After the existing chain writes
         // (incorrectly-triple-rounded K + correct V) to the paged cache, we

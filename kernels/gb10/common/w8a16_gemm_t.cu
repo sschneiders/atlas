@@ -8,7 +8,8 @@
 // This makes the N-dimension contiguous in memory, enabling coalesced 128-byte reads
 // when 128 threads each read one N-element in the same K-row.
 //
-// Block scales: block_scale_t[K/128, N/128] BF16 (also transposed)
+// Block scales: block_scale_t[K/128, N/128] FP32 (also transposed; the
+// scale_inv is widened to FP32 at load and transposed as FP32 here)
 // Dequant: bf16_val = E4M3_LUT[byte] * block_scale_t[k/128, n/128]
 //
 // Uses mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32
@@ -143,14 +144,14 @@ __device__ __forceinline__ void w8a16_mma_and_store_t(
 /// W8A16 GEMM with transposed weight layout for coalesced reads.
 ///
 /// B_t: [K, N] FP8 E4M3 — transposed from checkpoint's [N, K]
-/// block_scale_t: [K/128, N/128] BF16 — transposed block scales
+/// block_scale_t: [K/128, N/128] FP32 — transposed block scales
 ///
 /// Thread mapping: 128 threads load a [16, 64] B-tile where the
 /// 64 N-elements are contiguous in memory → coalesced 128-byte reads.
 extern "C" __global__ void w8a16_gemm_t(
     const __nv_bfloat16* __restrict__ A,               // [M, K] BF16
     const unsigned char* __restrict__ B_t,              // [K, N] FP8 E4M3 transposed
-    const __nv_bfloat16* __restrict__ block_scale_t,   // [K/128, N/128] BF16 transposed
+    const float* __restrict__ block_scale_t,           // [K/128, N/128] FP32 transposed
     __nv_bfloat16* __restrict__ C,                     // [M, N] BF16
     unsigned int M,
     unsigned int N,
@@ -233,8 +234,7 @@ extern "C" __global__ void w8a16_gemm_t(
         if (k_step_in_block == k_steps_per_block) {
             const unsigned int k_block = k_base / FP8_BLOCK;
             // Transposed scale layout: [K/128, N/128]
-            const float scale = __bfloat162float(
-                block_scale_t[k_block * n_scale_blocks + n_block]);
+            const float scale = block_scale_t[k_block * n_scale_blocks + n_block];
             #pragma unroll
             for (int i = 0; i < 8; i++) {
                 outer_acc[i][0] += inner_acc[i][0] * scale;
@@ -252,8 +252,7 @@ extern "C" __global__ void w8a16_gemm_t(
     // for Qwen3.6 hidden=2048 but keeps the kernel general).
     if (k_step_in_block != 0) {
         const unsigned int k_block = (K - 1) / FP8_BLOCK;
-        const float scale = __bfloat162float(
-            block_scale_t[k_block * n_scale_blocks + n_block]);
+        const float scale = block_scale_t[k_block * n_scale_blocks + n_block];
         #pragma unroll
         for (int i = 0; i < 8; i++) {
             outer_acc[i][0] += inner_acc[i][0] * scale;
@@ -297,9 +296,10 @@ extern "C" __global__ void transpose_fp8(
 }
 
 /// Transpose block scales: scale[N/128, K/128] → scale_t[K/128, N/128]
+/// FP32 scales (widened from the checkpoint BF16/FP32 at load time).
 extern "C" __global__ void transpose_block_scale(
-    const __nv_bfloat16* __restrict__ scale,        // [N/128, K/128]
-    __nv_bfloat16* __restrict__ scale_t,            // [K/128, N/128]
+    const float* __restrict__ scale,        // [N/128, K/128] FP32
+    float* __restrict__ scale_t,            // [K/128, N/128] FP32
     unsigned int N_blocks,    // N/128
     unsigned int K_blocks     // K/128
 ) {

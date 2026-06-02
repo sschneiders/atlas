@@ -98,6 +98,9 @@ fn build_active_seq_from_prefill(
     ssm_ring_capacity: usize,
 ) -> ActiveSeq {
     let temperature = p.temperature;
+    // F4: sticky tool-request flag — grammar attached OR legacy tool path.
+    // Computed before `p.grammar_state` is moved into the struct below.
+    let tool_request = p.grammar_state.is_some() || use_legacy_tool_call;
     ActiveSeq {
         seq: p.seq,
         session_hash: p.session_hash,
@@ -165,6 +168,7 @@ fn build_active_seq_from_prefill(
         think_just_ended: false,
         think_skip_count: 0,
         require_tool_call: use_legacy_tool_call,
+        tool_request,
         tool_call_start_token,
         tool_call_opened: false,
         inside_tool_body: false,

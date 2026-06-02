@@ -158,6 +158,43 @@ pub fn build_model(
         Some(q)
     };
 
+    // ── Step 3a: Separate NVFP4 draft head (BF16-main + MTP decouple) ──
+    //
+    // When the main LM head is kept BF16 for argmax precision
+    // (`skip_lm_head_quantization()`), the MTP draft proposer still needs an
+    // NVFP4 vocab projection: `MtpHead::forward_one` hard-wires the final
+    // hidden→vocab projection to `w4a16_gemv` over a `QuantizedWeight`. Build
+    // a SEPARATE NVFP4 copy used ONLY for drafting. This is correctness-safe
+    // because every draft is VERIFIED by the main BF16 `lm_head_batched`
+    // (verify_*.rs) — an approximate draft head only affects acceptance rate,
+    // never an emitted/accepted token. Only built when speculative decoding is
+    // actually active and the checkpoint ships an MTP head; otherwise `None`.
+    //
+    // When the main head is NVFP4 (`lm_head_nvfp4.is_some()`), this stays
+    // `None` and the proposer falls back to the main NVFP4 head — byte-for-byte
+    // unchanged from the pre-decouple behavior.
+    let mtp_lm_head_nvfp4 = if lm_head_nvfp4.is_none()
+        && use_speculative
+        && !mtp_weights.is_empty()
+    {
+        let q = quantize_to_nvfp4(
+            &lm_head,
+            config.vocab_size,
+            config.hidden_size,
+            gpu.as_ref(),
+            absmax_k,
+            quantize_k,
+            stream,
+        )?;
+        tracing::info!(
+            "Draft-only NVFP4 LM head built for MTP (main head stays BF16, vocab={})",
+            config.vocab_size,
+        );
+        Some(q)
+    } else {
+        None
+    };
+
     // ── Step 3b: Post-load MoE prefill transpose (MiniMax EP=2 TTFT fix) ──
     //
     // MiniMax M2.7-NVFP4 EP=2 has ~46 GB free at layer-0 load time but
@@ -355,6 +392,7 @@ pub fn build_model(
         final_norm,
         lm_head,
         lm_head_nvfp4,
+        mtp_lm_head_nvfp4,
         layers,
         buffers,
         kv_cache,

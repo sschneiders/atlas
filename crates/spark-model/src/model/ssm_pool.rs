@@ -186,6 +186,70 @@ impl SsmStatePool {
         self.conv_state_pools[ssm_layer_idx].offset(slot * self.conv_bytes)
     }
 
+    /// DEBUG (env-gated): PER-LAYER fingerprint of h_state + conv_state for a
+    /// pool slot, used to prove restore/recompute state divergence. States are
+    /// FP32 (`ssm_h_state_bytes`/`ssm_conv_state_bytes`). For each SSM layer we
+    /// emit three reductions so per-element divergence cannot cancel:
+    ///   - `sum`   (signed sum — catches gross errors / sign flips)
+    ///   - `ssq`   (sum of squares — magnitude-weighted, cancellation-free)
+    ///   - `sabs`  (sum of absolute values — cancellation-free L1)
+    /// A global `(sum, ssq, sabs)` triple is also logged for a quick gate.
+    pub(super) fn debug_state_checksum(
+        &self,
+        slot: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+        tag: &str,
+    ) {
+        gpu.synchronize(stream).ok();
+        let mut g_h_sum = 0f64;
+        let mut g_h_ssq = 0f64;
+        let mut g_h_sabs = 0f64;
+        let mut g_c_sum = 0f64;
+        let mut g_c_ssq = 0f64;
+        let mut g_c_sabs = 0f64;
+        for i in 0..self.num_ssm_layers {
+            let mut hb = vec![0u8; self.h_bytes];
+            let mut cb = vec![0u8; self.conv_bytes];
+            if gpu.copy_d2h(self.h_state(i, slot), &mut hb).is_err() {
+                return;
+            }
+            if gpu.copy_d2h(self.conv_state(i, slot), &mut cb).is_err() {
+                return;
+            }
+            let (mut h_sum, mut h_ssq, mut h_sabs) = (0f64, 0f64, 0f64);
+            for c in hb.chunks_exact(4) {
+                let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64;
+                h_sum += v;
+                h_ssq += v * v;
+                h_sabs += v.abs();
+            }
+            let (mut c_sum, mut c_ssq, mut c_sabs) = (0f64, 0f64, 0f64);
+            for c in cb.chunks_exact(4) {
+                let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64;
+                c_sum += v;
+                c_ssq += v * v;
+                c_sabs += v.abs();
+            }
+            g_h_sum += h_sum;
+            g_h_ssq += h_ssq;
+            g_h_sabs += h_sabs;
+            g_c_sum += c_sum;
+            g_c_ssq += c_ssq;
+            g_c_sabs += c_sabs;
+            tracing::warn!(
+                "ATLAS_SSM_CKSUM[{tag}] slot={slot} L{i} \
+                 h_sum={h_sum:.6} h_ssq={h_ssq:.6} h_sabs={h_sabs:.6} \
+                 c_sum={c_sum:.6} c_ssq={c_ssq:.6} c_sabs={c_sabs:.6}"
+            );
+        }
+        tracing::warn!(
+            "ATLAS_SSM_CKSUM[{tag}] slot={slot} GLOBAL \
+             h_sum={g_h_sum:.6} h_ssq={g_h_ssq:.6} h_sabs={g_h_sabs:.6} \
+             c_sum={g_c_sum:.6} c_ssq={g_c_ssq:.6} c_sabs={g_c_sabs:.6}"
+        );
+    }
+
     /// Get fixed-address intermediate h_state for K=2/3/4 verify.
     /// `token_idx` is 0..3 (which token in the verify pass).
     pub(super) fn h_intermediate(

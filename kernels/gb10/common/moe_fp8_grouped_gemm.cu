@@ -8,7 +8,8 @@
 // accessed via pointer tables indexed by expert_id. Tokens are sorted by expert
 // so each expert's tokens are contiguous.
 //
-// FP8 weight format: B[N,K] uint8 with block_scale[N/128, K/128] BF16.
+// FP8 weight format: B[N,K] uint8 with block_scale[N/128, K/128] FP32.
+// (scale_inv is widened to FP32 at load; applied in full FP32 precision.)
 // Dequant: bf16_val = E4M3_LUT[byte] * block_scale[n/128, k/128]
 //
 // Numerics SSOT (Phase 2b, 2026-05-24): all f32 -> BF16 conversions in
@@ -160,7 +161,7 @@ __device__ __forceinline__ void fp8_moe_mma(
 extern "C" __global__ void moe_fp8_grouped_gemm(
     const __nv_bfloat16* __restrict__ A,                   // [total_tokens, K] BF16
     const unsigned long long* __restrict__ B_weight_ptrs,   // [num_experts] → [N, K] FP8
-    const unsigned long long* __restrict__ B_scale_ptrs,    // [num_experts] → [N/128, K/128] BF16
+    const unsigned long long* __restrict__ B_scale_ptrs,    // [num_experts] → [N/128, K/128] FP32
     __nv_bfloat16* __restrict__ C,                         // [total_expanded, N] BF16
     const int* __restrict__ expert_offsets,                 // [num_experts + 1]
     const int* __restrict__ sorted_token_ids,              // [total_expanded]
@@ -184,7 +185,7 @@ extern "C" __global__ void moe_fp8_grouped_gemm(
     // Load expert weight/scale pointers from table.
     // mantissa noise from the previous BF16-cast-at-use path.
     const unsigned char* B_exp = (const unsigned char*)B_weight_ptrs[expert_id];
-    const __nv_bfloat16* S_exp = (const __nv_bfloat16*)B_scale_ptrs[expert_id];
+    const float* S_exp = (const float*)B_scale_ptrs[expert_id];
     if (B_exp == 0) return;  // NULL → remote expert under EP
 
     const unsigned int k_blocks = (K + FP8_BLOCK - 1) / FP8_BLOCK;
@@ -274,7 +275,7 @@ extern "C" __global__ void moe_fp8_grouped_gemm(
         unsigned int next_k = k_base + K_STEP;
         if (next_k % K_PROMOTE == 0 || next_k >= K) {
             unsigned int k_block = k_base / FP8_BLOCK;
-            float scale = __bfloat162float(S_exp[n_block * k_blocks + k_block]);
+            float scale = S_exp[n_block * k_blocks + k_block];
             #pragma unroll
             for (int n_tile = 0; n_tile < 8; n_tile++) {
                 #pragma unroll
@@ -360,7 +361,7 @@ extern "C" __global__ void moe_fp8_grouped_gemm_v2(
     const unsigned int cta_n = blockIdx.x * N_TILE;
 
     const unsigned char* B_exp = (const unsigned char*)B_weight_ptrs[expert_id];
-    const __nv_bfloat16* S_exp = (const __nv_bfloat16*)B_scale_ptrs[expert_id];
+    const float* S_exp = (const float*)B_scale_ptrs[expert_id];
     if (B_exp == 0) return;
 
     const unsigned int k_blocks = (K + FP8_BLOCK - 1) / FP8_BLOCK;
@@ -442,7 +443,7 @@ extern "C" __global__ void moe_fp8_grouped_gemm_v2(
         unsigned int next_k = k_base + K_STEP;
         if (next_k % K_PROMOTE == 0 || next_k >= K) {
             unsigned int k_block = k_base / FP8_BLOCK;
-            float scale = __bfloat162float(S_exp[n_block * k_blocks + k_block]);
+            float scale = S_exp[n_block * k_blocks + k_block];
             #pragma unroll
             for (int n_tile = 0; n_tile < 8; n_tile++) {
                 #pragma unroll

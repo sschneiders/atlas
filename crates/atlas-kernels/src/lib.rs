@@ -181,6 +181,15 @@ pub struct ModelBehavior {
     /// Cap on free-text tokens between successive `<tool_call>` opens in
     /// `tool_choice=auto`. Default 384. Agentic coding may want larger.
     pub max_inter_tool_prose: u32,
+    /// Unconditional per-generation cap on post-`</think>` content tokens
+    /// for tool-active requests (grammar attached). Bounds a runaway where
+    /// a grammar-legal-but-never-closing tool value burns to `max_tokens`
+    /// (the dominant opencode `webserver_ok` 360s-timeout cause). Default
+    /// 100_000 — effectively unbounded, the historical no-op — so a model
+    /// that sets nothing is byte-identical to before. Set a small value
+    /// (e.g. 1536) per-model to backstop the runaway. Never caps plain
+    /// chat: the runtime gate also requires `grammar_state.is_some()`.
+    pub max_post_think_content_tokens: u32,
     /// TSCG (Tool-Schema Compilation) enabled — compile tool JSON
     /// schemas to compact function signatures before prompting.
     /// Default `false`; the TAS operator is tokenizer-specific so
@@ -248,6 +257,7 @@ impl Default for ModelBehavior {
             confidence_run_length: 30,
             fuzzy_repeat_tolerance_div: 12,
             max_inter_tool_prose: 384,
+            max_post_think_content_tokens: 100_000,
             tscg: false,
             disable_tool_grammar: false,
             rollback_resteer: true,

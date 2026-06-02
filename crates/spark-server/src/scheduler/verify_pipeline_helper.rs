@@ -51,9 +51,19 @@
 //! best-effort, mirrors greedy unroll.
 
 use crate::scheduler::ActiveSeq;
+use crate::scheduler::decode_logits_seq::force_temp_zero_enabled;
 use crate::scheduler::helpers::bf16_to_f32;
 use crate::scheduler::logit_processors::{LogitsContext, run_pipeline};
 use spark_model::traits::Model;
+use spark_runtime::sampler::apply_penalties_and_bias;
+
+/// Kill-switch for the on-GPU greedy-under-grammar verify fast path (#3).
+/// Default ON; set `ATLAS_DISABLE_FAST_GREEDY=1` to force the full host
+/// pipeline on every verify position (the pre-2026-06-02 behaviour).
+pub(crate) fn fast_greedy_grammar_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("ATLAS_DISABLE_FAST_GREEDY").ok().as_deref() != Some("1"))
+}
 
 /// Per-position verify logits, dequantised + processed through the full
 /// pre-sample pipeline. Returns the chosen token: either the forced
@@ -105,6 +115,22 @@ pub fn verify_pick_with_pipeline(
         return forced;
     }
 
+    // 2b. Apply the sequence's configured penalties (repetition /
+    //     presence / frequency / LZ / DRY) + logit bias on the
+    //     now-masked logits, using the seq's output-token history —
+    //     the SAME SSOT stage the non-MTP `process_seq_logits` path
+    //     runs before sampling. Without this, MTP-VERIFIED tokens were
+    //     decided by a penalty-FREE argmax, so the MODEL.toml
+    //     `repetition_penalty` / `dry_multiplier` never reached the
+    //     dominant decode path and the model degenerated into repeated
+    //     tool-call argument junk. The resulting emission is a
+    //     penalty-aware ARGMAX (greedy) — an intended behavioral delta
+    //     for speculative acceptance. Backward-compatible: a no-op when
+    //     the penalties are neutral (rep==1.0, dry==0.0, etc.), so
+    //     NVFP4/Gemma/Mistral presets are byte-for-byte unchanged.
+    let penalties = crate::scheduler::sample_step::penalty_params_for(a);
+    apply_penalties_and_bias(&mut f32_logits, &penalties, &a.output_tokens);
+
     // 3. Argmax over the (now-masked) vector. `f32::partial_cmp` with
     //    NaN-safe fallback to `Equal` matches the sampler's argmax
     //    branch behaviour.
@@ -138,6 +164,79 @@ pub fn verify_pick_all_with_pipeline(
     if k == 0 {
         return Vec::new();
     }
+
+    // ── FAST PATH (#3, 2026-06-02): on-GPU greedy pick under grammar ──
+    //
+    // Culprit #3 (regression hunt): the slow path below D2H-copies the full
+    // [K, vocab] logits, CPU-dequants 248k BF16→F32 per position, and runs the
+    // 8-stage pipeline + argmax — ~1-3 ms/token of host/PCIe serialization on
+    // the dominant MTP verify path, the structural reason vLLM (GPU sampling)
+    // out-decodes Atlas on tool/grammar workloads.
+    //
+    // But when decoding is GREEDY (temp=0 or ATLAS_FORCE_TEMP_ZERO), penalties
+    // are neutral, and we're not inside <think>, the masked-greedy pick at each
+    // verify position is EXACTLY the GPU argmax (`argmax_ids[i]`, already
+    // computed by decode_verify_graphed*) WHENEVER that argmax is grammar-
+    // allowed — because the global max that is also in the allowed set is, by
+    // definition, the max over the allowed set. So we can emit it directly with
+    // NO D2H/dequant/pipeline. This fires for the bulk of content tokens (the
+    // permissive value ladder allows almost everything). We fall back to the
+    // slow pipeline per-call only when some position's argmax is grammar-
+    // DISALLOWED (structural/forced positions — rare) or the regime isn't
+    // pure-greedy. The speculative matcher advance + history-delta rollback
+    // (BUG#3) are preserved identically to the slow path, so on fallback the
+    // matcher is restored to its exact pre-call state.
+    //
+    // Skipped in this fast path: the WS/AM/think/forced quality nudges. Those
+    // are either no-ops in the content/greedy/neutral regime or acceptable
+    // speed-for-quality trades (we hold a measured accuracy margin over vLLM).
+    // Kill-switch: ATLAS_DISABLE_FAST_GREEDY=1.
+    if fast_greedy_grammar_enabled()
+        && a.grammar_state.is_some()
+        && !a.inside_thinking
+        && (a.temperature == 0.0 || force_temp_zero_enabled())
+        && a.repetition_penalty == 1.0
+        && a.presence_penalty == 0.0
+        && a.frequency_penalty == 0.0
+        && a.lz_penalty == 0.0
+        && a.dry_multiplier == 0.0
+    {
+        let before = a.grammar_state.as_ref().map(|gs| gs.num_history_steps());
+        let mut fast: Vec<u32> = Vec::with_capacity(k);
+        let mut all_allowed = true;
+        for (i, &tok) in argmax_ids.iter().enumerate() {
+            let gs = a.grammar_state.as_mut().expect("grammar_state present (gated above)");
+            let allowed = if gs.is_terminated() {
+                true // no further constraint past grammar completion
+            } else {
+                gs.fill_bitmask();
+                gs.is_token_allowed(tok)
+            };
+            if !allowed {
+                all_allowed = false;
+                break;
+            }
+            fast.push(tok);
+            // Speculatively advance so position i+1's bitmask reflects the
+            // post-emit state (mirrors the slow path). Skip after the last.
+            if i + 1 < k && !gs.is_terminated() {
+                let _ = gs.accept_token(tok);
+            }
+        }
+        // Roll back the speculative advances to the exact pre-call state
+        // (history delta — stop/terminated tokens don't advance; BUG#3).
+        if let (Some(b), Some(gs)) = (before, a.grammar_state.as_mut()) {
+            let adv = gs.num_history_steps().saturating_sub(b);
+            if adv > 0 {
+                gs.rollback(adv);
+            }
+        }
+        if all_allowed && fast.len() == k {
+            return fast; // no D2H, no CPU pipeline — all positions GPU-greedy + grammar-legal
+        }
+        // else: fall through to the slow path (matcher restored above).
+    }
+
     let vocab = model.vocab_size();
     // BF16 always for verify path: `decode_verify_graphed_*` writes BF16
     // to `logits_buffer()`. The FP32-lm_head path (Gemma-4 dense) does
@@ -153,11 +252,13 @@ pub fn verify_pick_all_with_pipeline(
     }
 
     let mut picks: Vec<u32> = Vec::with_capacity(k);
-    // Speculative-advance counter — we rollback this many tokens off
-    // the xgrammar matcher at the end so the real `emit_token` calls
-    // (which run after this helper returns) re-advance with the
-    // verified-or-rejected tokens from a clean state.
-    let mut grammar_advances: usize = 0;
+    // Snapshot the matcher's history depth BEFORE speculative advances so we
+    // roll back exactly the ACTUAL advances afterward. BUG#3 (2026-06-02):
+    // stop/EOS and terminated tokens return true from `accept_token` WITHOUT
+    // advancing the matcher, so a count of `accept_token`→true calls would
+    // over-rewind. `emit_token` (run after this helper) re-advances from the
+    // restored, clean state.
+    let grammar_steps_before = a.grammar_state.as_ref().map(|gs| gs.num_history_steps());
 
     for i in 0..k {
         let slice = &buf[i * vocab * elem_bytes..(i + 1) * vocab * elem_bytes];
@@ -189,17 +290,21 @@ pub fn verify_pick_all_with_pipeline(
                 );
                 break;
             }
-            grammar_advances += 1;
+            // accept_token advanced the matcher as a side effect; the rollback
+            // below counts the ACTUAL advances from matcher history (BUG#3).
         }
     }
 
-    // Roll back all speculative advances so the matcher returns to its
-    // pre-call state. `emit_token` will then re-advance it normally for
-    // the tokens that actually get accepted by the scheduler.
-    if grammar_advances > 0
-        && let Some(ref mut gs) = a.grammar_state
-    {
-        gs.rollback(grammar_advances);
+    // Roll back exactly the ACTUAL speculative advances (history delta) so the
+    // matcher returns to its pre-call state; `emit_token` then re-advances it
+    // normally. BUG#3: counting from accept_token→true calls over-rewinds when
+    // a stop/EOS/terminated token (which returns true WITHOUT advancing) lands
+    // in the verified span.
+    if let (Some(before), Some(gs)) = (grammar_steps_before, a.grammar_state.as_mut()) {
+        let advanced = gs.num_history_steps().saturating_sub(before);
+        if advanced > 0 {
+            gs.rollback(advanced);
+        }
     }
 
     picks

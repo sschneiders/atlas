@@ -11,6 +11,118 @@ use crate::tool_parser::ToolDefinition;
 use super::engine::{GrammarEngine, GrammarError};
 use super::schema::{enforce_min_length_on_required_strings, sanitize_schema_for_grammar};
 
+/// Escape a single char for use inside an EBNF char class `[^ … ]`.
+fn ebnf_class_escape(c: char) -> String {
+    match c {
+        ']' | '\\' | '^' | '-' => format!("\\{c}"),
+        _ => c.to_string(),
+    }
+}
+
+/// Escape a single char for use inside an EBNF double-quoted string literal.
+fn ebnf_literal_escape(c: char) -> String {
+    match c {
+        '"' | '\\' => format!("\\{c}"),
+        _ => c.to_string(),
+    }
+}
+
+/// Generic "match any run of bytes up to (but not including) the literal
+/// `close` delimiter", emitted as a negative-prefix ladder. This is the
+/// REUSABLE primitive — each grammar/format supplies its own close delimiter
+/// via dynamic dispatch (qwen3_coder `</parameter>`, MiniMax XML close, …);
+/// there is no hard-coded per-model ladder.
+///
+/// For `close = c0 c1 … c{n-1}` it produces the alternation
+///   `[^c0] | "c0" [^c1] | "c0c1" [^c2] | … | "c0…c{n-2}" [^c{n-1}]`
+/// so any byte is legal, and any prefix of the close tag is legal UNLESS the
+/// run completes the exact close sequence (each `[^x]` forbids the next close
+/// char). The enclosing rule then consumes the literal close itself.
+///
+/// BUG#2 (2026-06-02): replaces the prior strict `[^<] | "<" [^/]` value rule
+/// that refused `>`,`><`,`</X` content tokens (esp. via under-masked MTP
+/// drafts), which `emit_step` turned into truncated turns — the dominant
+/// opencode webserver_ok gap. NOTE this re-permits `<`-content; BUG#1 graceful
+/// disengage keeps any residual refusal non-fatal, and the live N=10 A/B is the
+/// gate for whether the prior F2 XML-attribute-drift mode returns.
+fn ebnf_until_close_ladder(close: &str) -> String {
+    let chars: Vec<char> = close.chars().collect();
+    debug_assert!(!chars.is_empty(), "close delimiter must be non-empty");
+    let mut alts: Vec<String> = Vec::with_capacity(chars.len().max(1));
+    for k in 0..chars.len() {
+        let neg = ebnf_class_escape(chars[k]);
+        if k == 0 {
+            alts.push(format!("[^{neg}]"));
+        } else {
+            let prefix: String = chars[..k].iter().copied().map(ebnf_literal_escape).collect();
+            alts.push(format!("\"{prefix}\" [^{neg}]"));
+        }
+    }
+    if alts.is_empty() {
+        // Degenerate empty-close guard: accept any single byte.
+        return "[^\\x00]".to_string();
+    }
+    alts.join(" | ")
+}
+
+/// F2-2a (2026-06-02): structural ceiling on a parameter VALUE's `rest`
+/// repetition, applied ONLY when the `ATLAS_GRAMMAR_VALUE_HARDEN` kill-switch
+/// is on. A garbled/merged BPE close token (e.g. `</parameter_002e>`) can leave
+/// the literal-close match unfired, so `rest ::= rest_part*` accepts forever and
+/// the value runs to `max_tokens`. A bounded `rest_part{0,N}` makes an unclosed
+/// value structurally impossible to grow past `N` bytes. ~6000 is far above any
+/// legitimate single tool-arg value (a `write` `content` field) while still
+/// finite. F1's per-generation cap is the primary runaway bound; this is a
+/// grammar-level backstop kept behind the switch because grammar edits have
+/// regressed before (Iter 48) and demand an isolated N=10 A/B.
+const VALUE_REST_MAX_REPEAT: u32 = 6000;
+
+/// Whether the F2 value-hardening kill-switch is on. Read once per call from
+/// `ATLAS_GRAMMAR_VALUE_HARDEN`; OFF unless exactly `"1"`. OFF ⇒ the emitted
+/// grammar is byte-identical to the historical `rest ::= rest_part*`.
+fn value_harden_enabled() -> bool {
+    std::env::var("ATLAS_GRAMMAR_VALUE_HARDEN").as_deref() == Ok("1")
+}
+
+/// Body EBNF for an XML-style `<parameter=NAME>VALUE{value_close}` parameter
+/// block (a `<parameter=…>…{close}` sequence). The VALUE region accepts
+/// arbitrary bytes up to the literal `value_close` via the generic
+/// [`ebnf_until_close_ladder`]. SSOT — used by the primary + json_schema
+/// fallback paths.
+///
+/// `value_close` is NOT hard-coded: each format supplies it through its
+/// [`crate::tool_parser::ToolCallParser::param_value_close_delim`] impl, so the
+/// value-content fix is dynamically dispatched per grammar — any format with a
+/// `<…>VALUE<close>` region gets it, not just qwen3_coder.
+///
+/// F2-2a: when `ATLAS_GRAMMAR_VALUE_HARDEN=1` the `rest` rule is bounded
+/// `rest_part{0,N}` instead of `rest_part*`; OFF (the default) emits the
+/// byte-identical historical Kleene-star form.
+///
+/// TODO(F2-2b, 2026-06-02): also accept a merged-prefix close — the close
+/// delimiter appearing as the leading bytes of a longer (garbled) BPE token —
+/// so a drifted close still terminates the value. Routed through the same
+/// trait-supplied `value_close` (no hard-coded per-model tokens). Deferred:
+/// 2a (this) is the structural backstop; 2b is the next kill-switched step.
+fn xml_param_value_body_ebnf(value_close: &str) -> String {
+    let ladder = ebnf_until_close_ladder(value_close);
+    let rest_rule = if value_harden_enabled() {
+        format!("rest ::= rest_part{{0,{VALUE_REST_MAX_REPEAT}}}")
+    } else {
+        "rest ::= rest_part*".to_string()
+    };
+    format!(
+        r#"root ::= param ("\n" param)*
+param ::= "<parameter=" paramname ">" value "{value_close}"
+paramname ::= [a-zA-Z_] [a-zA-Z_0-9]*
+value ::= first_char rest
+first_char ::= [^ \t\r\n<]
+{rest_rule}
+rest_part ::= {ladder}
+"#
+    )
+}
+
 impl GrammarEngine {
     // ── Tool call grammars ──
 
@@ -162,10 +274,14 @@ impl GrammarEngine {
     ///
     /// Uses XGrammar's `qwen_xml_parameter` content type for native XML parameter support.
     /// Falls back to `json_schema` if `qwen_xml_parameter` is not available in this XGrammar build.
+    /// `value_close` is the literal delimiter that terminates a parameter
+    /// VALUE region, supplied by the caller (the format's `ToolCallParser` via
+    /// `param_value_close_delim()`) so the value-content rule is not hard-coded.
     pub fn compile_qwen3_coder_tool_grammar(
         &mut self,
         tools: &[ToolDefinition],
         use_triggers: bool,
+        value_close: &str,
     ) -> Result<CompiledGrammar, GrammarError> {
         if tools.is_empty() {
             return Err(GrammarError::NoTools);
@@ -249,26 +365,37 @@ impl GrammarEngine {
             // `filePath="..." content="..."` inside what was supposed to
             // be a `<parameter=filePath>` body), creating a worse drift
             // mode than the original "1-char garbage" Epoch-3 failure.
-            // The strict `[^<]*` is restored; legitimate `<` mid-value
-            // is handled via parser-side recovery in
-            // `tool_parser/parse_single_b.rs` and, where structurally
-            // possible, the in-server schema-validation re-roll
-            // (Tier 5c).
-            let body_ebnf = r#"root ::= param ("\n" param)*
-param ::= "<parameter=" paramname ">" value "</parameter>"
-paramname ::= [a-zA-Z_] [a-zA-Z_0-9]*
-value ::= first_char rest
-first_char ::= [^ \t\r\n<]
-rest ::= [^<]*
-"#;
+            // SUPERSEDED by BUG#2 (2026-06-02): the strict `[^<]*` revert was
+            // live until now (the F2-revert comment above is historical). It
+            // refused `>`/`><`/`</X` content tokens (esp. via under-masked MTP
+            // drafts) and emit_step turned each refusal into a lost turn — the
+            // dominant opencode webserver_ok gap. Replaced by the
+            // QWEN3_CODER_VALUE_BODY_EBNF negative-prefix ladder (allows `<`
+            // content up to the literal `</parameter>` close). The F2
+            // XML-attribute-drift risk is re-introduced in principle; BUG#1
+            // graceful disengage keeps any residual refusal non-fatal, and the
+            // live N=10 A/B is the gate for whether the ladder must be reverted.
+            // Parser-side recovery (`tool_parser/parse_single_b.rs`, Tier-5c
+            // re-roll) remains as defense in depth.
+            // BUG#2 (2026-06-02): value EBNF built dynamically from the
+            // trait-supplied `value_close` via ebnf_until_close_ladder() (SSOT,
+            // no hard-coded per-model ladder). Allows `<`/`</X` value content
+            // (real code) up to the literal close, replacing the strict
+            // `[^<]`/`"<" [^/]` rule that refused `>`,`><`,`</X` mid-value.
+            // Value body via the negative-prefix-ladder EBNF (bug#2). NOTE
+            // (2026-06-02): `any_text` was trialled to remove the grammar
+            // "alignment tax" on content but it let the model FREELANCE/ramble
+            // without completing the tool call (finish=length) — the exact
+            // failure the strict structure prevents. Kept the EBNF; the
+            // content-glue it can induce is largely tolerated (Rust is
+            // whitespace-insensitive; SC1 repairs TOML). The real webserver_ok
+            // gap is being re-measured via the harness aggregate, not probes.
+            let body_ebnf = xml_param_value_body_ebnf(value_close);
             let _ = &st.schema;
             tag_entries.push(serde_json::json!({
                 "type": "tag",
                 "begin": begin,
-                "content": {
-                    "type": "grammar",
-                    "grammar": body_ebnf,
-                },
+                "content": {"type": "grammar", "grammar": body_ebnf},
                 "end": end,
             }));
         }
@@ -339,13 +466,7 @@ rest ::= [^<]*
                      emitted at trace level by xgrammar.",
                     tool_names.join(", "),
                 );
-                let body_ebnf = r#"root ::= param ("\n" param)*
-param ::= "<parameter=" paramname ">" value "</parameter>"
-paramname ::= [a-zA-Z_] [a-zA-Z_0-9]*
-value ::= first_char rest
-first_char ::= [^ \t\r\n<]
-rest ::= [^<]*
-"#;
+                let body_ebnf = xml_param_value_body_ebnf(value_close);
                 let tag_entries_fallback: Vec<serde_json::Value> = sanitized_tools
                     .iter()
                     .map(|st| {
@@ -353,10 +474,7 @@ rest ::= [^<]*
                         serde_json::json!({
                             "type": "tag",
                             "begin": format!("<tool_call>\n<function={}>\n", st.name),
-                            "content": {
-                                "type": "grammar",
-                                "grammar": body_ebnf,
-                            },
+                            "content": {"type": "grammar", "grammar": body_ebnf},
                             "end": "\n</function>\n</tool_call>",
                         })
                     })

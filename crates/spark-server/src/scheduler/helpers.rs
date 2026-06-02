@@ -274,6 +274,12 @@ pub struct WatchdogParams {
     /// Cap on free-text tokens between successive `<tool_call>` opens in
     /// `tool_choice=auto`. Default 384 (`MAX_INTER_TOOL_PROSE`).
     pub max_inter_tool_prose: u32,
+    /// Unconditional per-generation cap on post-`</think>` content tokens
+    /// for tool-active requests. Default 100_000
+    /// (`MAX_POST_THINK_CONTENT_TOKENS`) = effectively unbounded, the
+    /// historical no-op. Backstops a grammar-legal-but-never-closing
+    /// runaway that would otherwise burn to `max_tokens`.
+    pub max_post_think_content_tokens: u32,
     /// Phase-C: when a degeneration watchdog fires, roll back to the last
     /// well-formed boundary and re-steer instead of hard-stopping.
     /// Default `true`. See [`super::rollback::rollback_to_boundary`].
@@ -292,6 +298,7 @@ const DEFAULT_WATCHDOG_PARAMS: WatchdogParams = WatchdogParams {
     confidence_run_length: super::confidence::CONFIDENCE_RUN_LIMIT,
     fuzzy_repeat_tolerance_div: 12,
     max_inter_tool_prose: MAX_INTER_TOOL_PROSE,
+    max_post_think_content_tokens: MAX_POST_THINK_CONTENT_TOKENS,
     rollback_resteer: true,
 };
 
@@ -395,6 +402,20 @@ pub fn mid_word_token_mask() -> Option<std::sync::Arc<[bool]>> {
 /// rather than executing it). Counted across non-thinking,
 /// non-tool-body tokens only.
 pub const MAX_INTER_TOOL_PROSE: u32 = 384;
+
+/// F1 (2026-06-02): unconditional per-generation cap on post-`</think>`
+/// content tokens for tool-active requests (`grammar_state.is_some()`).
+/// The SSOT in-code default — 100_000, effectively unbounded — reproduces
+/// the historical no-op so a model that sets nothing in MODEL.toml
+/// `[behavior].max_post_think_content_tokens` is byte-identical to before.
+/// A per-model value (e.g. 1536 on Qwen3.6-35B-A3B-FP8) backstops the
+/// grammar-legal-but-never-closing tool-value runaway — a garbled/merged
+/// BPE close token leaves the value rule unterminated, so the generation
+/// burns to `max_tokens` and starves the agent's wall-clock budget. The
+/// cap fires regardless of which `inside_tool_body` state machine
+/// desynced; the `grammar_state.is_some()` gate ensures plain chat
+/// (which attaches no grammar) is never truncated.
+pub const MAX_POST_THINK_CONTENT_TOKENS: u32 = 100_000;
 
 /// Return `true` iff some contiguous subsequence of length
 /// `p ∈ [THINK_LOOP_PERIOD_MIN, THINK_LOOP_PERIOD_MAX]` appears

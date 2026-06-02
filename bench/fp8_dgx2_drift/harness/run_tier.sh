@@ -157,6 +157,24 @@ run_one() {
     "${PROMPT}" > "${OC_JSON}" 2> "${OC_ERR}" || true
   END_TS=$(date +%s.%N)
 
+  # Reap any server the agent backgrounded (e.g. `cargo run &` to self-test its
+  # /ping endpoint). On the opencode timeout SIGTERM such a process reparents to
+  # init (PPID=1) and KEEPS HOLDING ITS PORT — across runs that leaked a zombie
+  # the scorer's curl then hit, producing false positives/negatives. The scorer
+  # now uses an ephemeral port (so it is already isolated), but we reap the leak
+  # at the source too. Identify victims PRECISELY by working directory == this
+  # run's target dir, so we never touch the Atlas container or anything else.
+  # Same-user processes (opencode runs as us), no sudo needed.
+  if [[ -n "${TARGET}" && -d "${TARGET}" ]]; then
+    _tdir_real=$(readlink -f "${TARGET}" 2>/dev/null || echo "${TARGET}")
+    for _pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+      _cwd=$(readlink -f "/proc/${_pid}/cwd" 2>/dev/null) || continue
+      case "${_cwd}" in
+        "${_tdir_real}"|"${_tdir_real}"/*) kill -9 "${_pid}" 2>/dev/null || true ;;
+      esac
+    done
+  fi
+
   # Atlas log window for THIS run only (local only).
   if [[ "${label}" == "local" ]]; then
     START_TS_INT=${START_TS%.*}
@@ -227,4 +245,10 @@ else
   done
 fi
 
-echo "=== tier ${TIER} complete (N=${N}). Run aggregate.py next. ===" >&2
+echo "=== tier ${TIER} complete (N=${N}). Aggregating... ===" >&2
+# Exit code = total failure count (cargo + webserver) for this tier, so a clean
+# 10/10 run exits 0 and `run_tier.sh ... && echo PASS` gates correctly.
+python3 "${HARNESS_DIR}/aggregate.py" --tier "${TIER}" >&2
+agg_rc=$?
+echo "=== tier ${TIER}: exit code ${agg_rc} (total cargo+webserver failures; 0 = all green) ===" >&2
+exit "${agg_rc}"

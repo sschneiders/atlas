@@ -57,7 +57,7 @@ pub fn prefill_request(
     let req_top_logprobs = req.top_logprobs();
     let req_timeout_at = req.timeout_at();
     let grammar_spec = req.take_grammar_spec();
-    let grammar_state = compile_grammar_state(grammar_engine, &grammar_spec);
+    let grammar_state = compile_grammar_state(grammar_engine, &grammar_spec, eos_tokens);
     let (prompt_tokens, max_tokens, mut sink, image_pixels, temperature, cancel_flag) = match req {
         InferenceRequest::Streaming {
             prompt_tokens,
@@ -167,6 +167,9 @@ pub fn prefill_request(
     // When grammar is active, disable legacy require_tool_call (grammar handles EOS).
     let use_legacy_tool_call =
         req_require_tool_call && grammar_state.is_none() && tool_call_start_token.is_some();
+    // F4: sticky tool-request flag — grammar attached OR legacy tool path.
+    // Computed before `grammar_state` is moved into the ActiveSeq below.
+    let tool_request = grammar_state.is_some() || use_legacy_tool_call;
 
     let now = Instant::now();
     let cached_prompt_tok = seq.cached_prefix_tokens as u32;
@@ -216,6 +219,7 @@ pub fn prefill_request(
             think_just_ended: false,
             think_skip_count: 0,
             require_tool_call: use_legacy_tool_call,
+            tool_request,
             suppress_tool_call: req_suppress_tool_call,
             disable_mtp: req_disable_mtp,
             content_started: false,
@@ -297,6 +301,7 @@ pub fn prefill_request(
         think_just_ended: false,
         think_skip_count: 0,
         require_tool_call: use_legacy_tool_call,
+        tool_request,
         suppress_tool_call: req_suppress_tool_call,
         disable_mtp: req_disable_mtp,
         content_started: false,

@@ -139,6 +139,7 @@ pub(super) struct ParsedBehavior {
     pub confidence_run_length: u32,
     pub fuzzy_repeat_tolerance_div: u32,
     pub max_inter_tool_prose: u32,
+    pub max_post_think_content_tokens: u32,
     pub tscg: bool,
     pub disable_tool_grammar: bool,
     pub rollback_resteer: bool,
@@ -164,6 +165,7 @@ impl Default for ParsedBehavior {
             confidence_run_length: 30,
             fuzzy_repeat_tolerance_div: 12,
             max_inter_tool_prose: 384,
+            max_post_think_content_tokens: 100_000,
             tscg: false,
             disable_tool_grammar: false,
             rollback_resteer: true,
@@ -256,6 +258,11 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.as_integer())
         .map(|v| v as u32)
         .unwrap_or(384);
+    let max_post_think_content_tokens = b
+        .and_then(|v| v.get("max_post_think_content_tokens"))
+        .and_then(|v| v.as_integer())
+        .map(|v| v as u32)
+        .unwrap_or(100_000);
     let tscg = b
         .and_then(|v| v.get("tscg"))
         .and_then(|v| v.as_bool())
@@ -293,6 +300,7 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         confidence_run_length,
         fuzzy_repeat_tolerance_div,
         max_inter_tool_prose,
+        max_post_think_content_tokens,
         tscg,
         disable_tool_grammar,
         rollback_resteer,

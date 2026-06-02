@@ -200,19 +200,44 @@ def count_tool_calls(events: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _free_port() -> int:
+    """Acquire an OS-assigned ephemeral port that is free *right now*.
+
+    Bind 127.0.0.1:0, read the assigned port, close. The scorer then runs
+    the agent's server on this port and curls it. Using a fresh per-run port
+    (instead of a fixed 3001) is what makes the webserver test self-isolating:
+    a leaked/zombie server from a prior run can never occupy it, so the scorer
+    can never (a) collide and EADDRINUSE-panic its own server while (b) a stale
+    holder answers curl — the false-positive/false-negative bug that
+    contaminated every prior webserver_ok number. SO_REUSEADDR is NOT set, so
+    a port still actively held is not handed out.
+    """
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+    finally:
+        s.close()
+
+
 def webserver_test(target: pathlib.Path, port: int, timeout_s: int = 15) -> dict[str, Any]:
     """Build + run the just-written Axum project and verify /ping → 'pong'.
 
     Steps:
-      1. Run `cargo build --release` in the target dir (must succeed).
-      2. Spawn `cargo run --release` as background process with
+      1. Acquire a fresh ephemeral port (self-isolating — see `_free_port`).
+         The passed `port` is advisory only; the OS-assigned port is
+         authoritative and recorded in `port_used`.
+      2. Run `cargo build --release` in the target dir (must succeed).
+      3. Spawn `cargo run --release` as background process with
          ATLAS_HARNESS_PORT={port} env. The prompt instructed the model
          to read this env var; if the model misread the instruction the
          server binds elsewhere and /ping curl fails — that's a valid
          "webserver_ok=false" signal.
-      3. Poll `http://localhost:{port}/ping` for up to `timeout_s`s.
-      4. Assert response body contains "pong".
-      5. Kill the server (and any cargo subprocesses).
+      4. Poll `http://127.0.0.1:{port}/ping` for up to `timeout_s`s.
+      5. Assert response body contains "pong".
+      6. Kill the server process group (and any cargo subprocesses).
 
     Returns the test verdict + diagnostic strings. The build step is
     the expensive part (~30-60s); skip via webserver_ok=false if
@@ -220,6 +245,7 @@ def webserver_test(target: pathlib.Path, port: int, timeout_s: int = 15) -> dict
     """
     import os
     import signal
+    import tempfile
     import time
     out: dict[str, Any] = {
         "webserver_ok": False,
@@ -228,10 +254,16 @@ def webserver_test(target: pathlib.Path, port: int, timeout_s: int = 15) -> dict
         "bind_ok": False,
         "ping_ok": False,
         "ping_response": "",
+        "port_used": 0,
+        "server_stderr": "",
     }
     if not (target / "Cargo.toml").exists() or not (target / "src").exists():
         out["build_error"] = "no Cargo.toml or src/ — skipping webserver test"
         return out
+
+    # Phase 0: self-isolating ephemeral port (overrides the advisory `port`).
+    port = _free_port()
+    out["port_used"] = port
 
     # Phase 1: build
     try:
@@ -255,19 +287,26 @@ def webserver_test(target: pathlib.Path, port: int, timeout_s: int = 15) -> dict
         return out
     out["build_ok"] = True
 
-    # Phase 2: spawn server in background
+    # Phase 2: spawn server in background. Capture stderr to a temp file so a
+    # bind panic (e.g. EADDRINUSE / "Address already in use") is recorded as a
+    # distinct, diagnosable failure instead of being silently swallowed and
+    # mislabeled as a generic "didn't respond" timeout.
     env = {**os.environ, "ATLAS_HARNESS_PORT": str(port), "RUST_LOG": "warn"}
+    server_err = tempfile.NamedTemporaryFile(
+        mode="w+", prefix="atlas-ws-stderr-", suffix=".log", delete=False
+    )
     try:
         server = subprocess.Popen(
             ["cargo", "run", "--release"],
             cwd=str(target),
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=server_err,
             env=env,
             preexec_fn=os.setsid,  # so we can kill the whole process group
         )
     except Exception as e:
         out["build_error"] = f"cargo run launch error: {e}"
+        server_err.close()
         return out
 
     try:
@@ -307,6 +346,24 @@ def webserver_test(target: pathlib.Path, port: int, timeout_s: int = 15) -> dict
                 os.killpg(os.getpgid(server.pid), signal.SIGKILL)
         except Exception:
             pass
+        # Collect the server's stderr (bind panics etc.) for diagnosis.
+        try:
+            server_err.flush()
+            server_err.seek(0)
+            err_txt = server_err.read()
+            out["server_stderr"] = err_txt[-800:]
+            if not out["bind_ok"] and (
+                "Address already in use" in err_txt or "EADDRINUSE" in err_txt
+            ):
+                out["build_error"] = (out.get("build_error") or "") + " | server bind failed (port in use)"
+        except Exception:
+            pass
+        finally:
+            try:
+                server_err.close()
+                os.unlink(server_err.name)
+            except Exception:
+                pass
     return out
 
 

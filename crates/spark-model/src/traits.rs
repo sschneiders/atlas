@@ -107,6 +107,18 @@ pub struct SequenceState {
     /// the scheduler to populate `usage.prompt_tokens_details.cached_tokens`.
     /// 0 when prefix caching is disabled or the prompt had no cache match.
     pub cached_prefix_tokens: usize,
+    /// Contiguous prefix length (in tokens, from position 0) whose paged KV is
+    /// guaranteed fully written for THIS sequence — either reused from a valid
+    /// prefix-cache match or written by a real prefill pass this turn. Updated
+    /// per chunk in `prefill_b_proc_range`. The prefix-cache insert path caps
+    /// the cached complete-block count to `kv_valid_tokens / block_size` so a
+    /// block whose K/V was never written (e.g. the `proc_count==1` decode
+    /// shortcut skips an entire trailing chunk) is NEVER inserted with stale V.
+    /// Without this cap, stale (donor/zeroed) V in trailing complete blocks
+    /// gets cached and read by the next turn's full-attention layers, making
+    /// cache-ON decode nondeterministic at temperature 0 (see fix/in-think-
+    /// tool-call-leak prefix-cache stale-V diagnosis).
+    pub kv_valid_tokens: usize,
     /// Original prompt token count, set at the first prefill and never
     /// mutated by decode. Used by `cache_sequence` to split seq.tokens into
     /// prompt (already inserted + ref-bumped by prefill) vs generated
