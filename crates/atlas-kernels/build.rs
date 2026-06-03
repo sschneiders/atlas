@@ -419,6 +419,18 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
     {
         println!("cargo:rustc-env=ATLAS_HW_FORCE_BR32=true");
     }
+    // Disable the native-FP8 SSM in_proj/out_proj prefill GEMM on targets
+    // whose kernel set lacks the cp.async-based `fp8_gemm_n128` path
+    // (e.g. gfx1151/RDNA3.5, which has no cp.async). Such targets keep the
+    // NVFP4 SSM dispatch (the proven path for the Fp8Dequanted variant).
+    // Absent on NVIDIA/GB10 → option_env! None → native-FP8 prefill unchanged.
+    if hw_toml["hardware"]
+        .get("disable_fp8_ssm_prefill")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        println!("cargo:rustc-env=ATLAS_HW_DISABLE_FP8_SSM_PREFILL=true");
+    }
 
     // Expand model wildcard (exclude the `common/` shared-kernel dir,
     // which has no MODEL.toml).

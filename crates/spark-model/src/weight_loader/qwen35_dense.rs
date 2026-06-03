@@ -73,7 +73,12 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
         // Originally env-gated `ATLAS_FP8_SSM_PREFILL=1`; promoted to
         // unconditional 2026-05-20 after live verification (commit
         // dfb4e8a era, tokens_to_first_degeneration 1,196 → 16,968).
-        let fp8_ssm_prefill = matches!(variant, Nvfp4Variant::Fp8Dequanted);
+        // HIP targets without cp.async (gfx1151) cannot build/dispatch the
+        // native-FP8 SSM prefill GEMM (`fp8_gemm_n128`); ATLAS_HW_DISABLE_FP8_SSM_PREFILL
+        // (set by build.rs from HARDWARE.toml) forces the NVFP4 SSM path there.
+        // Absent on NVIDIA/GB10 → option_env! None → native-FP8 prefill unchanged.
+        let fp8_ssm_prefill = matches!(variant, Nvfp4Variant::Fp8Dequanted)
+            && option_env!("ATLAS_HW_DISABLE_FP8_SSM_PREFILL").is_none();
         let bf16_to_fp8_k = if fp8_ssm_prefill {
             tracing::info!(
                 "SSM in_proj_qkv + out_proj via native FP8 prefill GEMM \
