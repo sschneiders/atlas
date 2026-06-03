@@ -95,7 +95,7 @@ top_p = 0.95
 top_k = 20
 presence_penalty = 0.0
 frequency_penalty = 0.0
-repetition_penalty = 1.1
+repetition_penalty = 1.0
 dry_multiplier = 0.5
 
 [sampling.thinking_coding]
@@ -104,7 +104,14 @@ top_p = 0.95
 top_k = 20
 presence_penalty = 0.0
 frequency_penalty = 0.0
-repetition_penalty = 1.1
+# 2026-06-03: rep_penalty 1.1->1.0. At temp=0 (opencode) the 1.1 freq-penalty over a
+# 256-tok window suppresses the MOST recurrent code tokens (newline id198, `::` id476)
+# and FLIPS low-margin greedy picks -> collapsed-newline/`::`-split/wander/runaway.
+# Proven temp=0 A/B: 1.1=mangled TOML finish=length; 1.0=clean newlined code finish=stop.
+# vLLM serves penalty-free greedy. dry_multiplier kept (catches verbatim filename runaway,
+# the documented reason the earlier full removal was reverted). Atlas-vs-BF16 cosine 0.995
+# > vLLM 0.985 => NOT a precision floor.
+repetition_penalty = 1.0
 dry_multiplier = 0.5
 
 [sampling.non_thinking]
@@ -113,7 +120,7 @@ top_p = 0.8
 top_k = 20
 presence_penalty = 0.0
 frequency_penalty = 0.0
-repetition_penalty = 1.1
+repetition_penalty = 1.0
 dry_multiplier = 0.5
 
 # Tool-calling preset: Qwen team recommends temperature=0.6 for coding tasks.
@@ -124,7 +131,8 @@ top_p = 0.95
 top_k = 20
 presence_penalty = 0.0
 frequency_penalty = 0.0
-repetition_penalty = 1.1
+# 2026-06-03: rep_penalty 1.1->1.0 (see [sampling.thinking_coding] note). dry kept.
+repetition_penalty = 1.0
 dry_multiplier = 0.5
 
 # Model-specific behavior overrides. These control server-side hacks that

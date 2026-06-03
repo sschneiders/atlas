@@ -20,6 +20,19 @@ pub(super) struct LoopDetectOut {
     pub(super) tool_call_repeat_count: usize,
 }
 
+/// BW1/SPINFIX relaxation (Iter 52, 2026-06-02): the loop detector hard-masks
+/// the `<tool_call>` token (Suppress verdict + spinning) after only ~3 similar
+/// turns. During legitimate agentic coding the agent repeats commands
+/// (`ls`/`cargo check`/`cargo run` while iterating), trips this at turns>=3,
+/// and gets its next tool call BLOCKED — forcing a content/`<response>`
+/// fast-fail. vLLM applies no such mask. With `ATLAS_LOOP_NO_SUPPRESS=1` the
+/// verdict is still detected, logged, and metered, but the `<tool_call>`
+/// hard-mask is NOT applied (the benign Hint path is unaffected). Default OFF
+/// ⇒ byte-identical to today; additive, model-agnostic.
+fn loop_suppress_disabled() -> bool {
+    std::env::var("ATLAS_LOOP_NO_SUPPRESS").as_deref() == Ok("1")
+}
+
 pub(super) fn check_loops(
     req: &ChatCompletionRequest,
     tools_active: bool,
@@ -102,7 +115,7 @@ pub(super) fn check_loops(
                 channel = channel.name(),
                 "Loop detector → SUPPRESS: hard-mask <tool_call> for one turn"
             );
-            suppress_tool_call = true;
+            suppress_tool_call = !loop_suppress_disabled();
             tool_call_repeat_count = *run_length;
             crate::metrics::LOOP_DETECTOR_VERDICTS
                 .with_label_values(&["suppress", channel.name(), if spinning { "1" } else { "0" }])
@@ -135,7 +148,7 @@ pub(super) fn check_loops(
             recent_short,
             "Spinning detection fired — suppressing <tool_call>"
         );
-        suppress_tool_call = true;
+        suppress_tool_call = !loop_suppress_disabled();
     }
 
     LoopDetectOut {

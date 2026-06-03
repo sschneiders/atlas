@@ -250,6 +250,13 @@ Example:\n\
                 // worth the legitimate-call regression risk.
                 "<>",
                 "<param=",
+                // L3 (2026-06-02): empirically-observed hallucinated
+                // pseudo-tool-exchange openers — suppressed/recovered
+                // exactly like the existing orphan openers above.
+                "<response>",
+                "<_call>",
+                "<_output>",
+                "<_use_error>",
             ],
             close: &[
                 "</parameter>",
@@ -259,6 +266,12 @@ Example:\n\
                 "</function_results>",
                 "</result>",
                 "</tool_use>",
+                // L3 (2026-06-02): closers for the hallucinated markers added
+                // to `orphan_open` above.
+                "</response>",
+                "</_call>",
+                "</_output>",
+                "</_use_error>",
             ],
             envelope_open: &[],
             envelope_close: &[],

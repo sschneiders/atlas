@@ -84,6 +84,14 @@ fn value_harden_enabled() -> bool {
     std::env::var("ATLAS_GRAMMAR_VALUE_HARDEN").as_deref() == Ok("1")
 }
 
+/// Whether the SHORT shared `<tool_call>` trigger is forced under
+/// `tool_choice="auto"`. Read once per call from `ATLAS_TOOL_SHORT_TRIGGER`;
+/// OFF unless exactly `"1"`. OFF ⇒ the auto-mode triggers are byte-identical to
+/// the historical per-tool LATE `<tool_call>\n<function=NAME` set.
+fn short_tool_trigger_enabled() -> bool {
+    std::env::var("ATLAS_TOOL_SHORT_TRIGGER").as_deref() == Ok("1")
+}
+
 /// Body EBNF for an XML-style `<parameter=NAME>VALUE{value_close}` parameter
 /// block (a `<parameter=…>…{close}` sequence). The VALUE region accepts
 /// arbitrary bytes up to the literal `value_close` via the generic
@@ -427,7 +435,12 @@ impl GrammarEngine {
         //   `<tool_call><tool_call>…` lockup is unreachable by
         //   construction. Mirrors compile_minimax_xml_tool_grammar's F67
         //   fix for the same xgrammar behaviour pattern.
-        let triggers: Vec<String> = if use_triggers {
+        // ATLAS_TOOL_SHORT_TRIGGER=1 (kill-switch, default OFF): under auto mode,
+        // engage the grammar the moment `<tool_call>` is sampled (SHORT shared
+        // trigger) instead of the LATE per-tool `<tool_call>\n<function=NAME`
+        // prefix — same xgrammar behaviour the F67 note above relies on. OFF ⇒
+        // byte-identical to the historical per-tool LATE triggers.
+        let triggers: Vec<String> = if use_triggers && !short_tool_trigger_enabled() {
             sanitized_tools
                 .iter()
                 .map(|st| format!("<tool_call>\n<function={}", st.name))
