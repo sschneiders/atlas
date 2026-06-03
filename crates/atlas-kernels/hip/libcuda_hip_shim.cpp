@@ -84,4 +84,27 @@ int cuGraphDestroy(void* graph)         { return hipGraphDestroy((hipGraph_t)gra
 
 int cuGraphInstantiateWithFlags(void** pexec, void* graph, unsigned long long flags){ return hipGraphInstantiateWithFlags((hipGraphExec_t*)pexec,(hipGraph_t)graph,flags); }
 
+int cuMemcpyHtoD_v2(unsigned long long d,const void*s,size_t n){return hipMemcpyHtoD((hipDeviceptr_t)d,(void*)s,n);}
+int cuMemcpyDtoH_v2(void*d,unsigned long long s,size_t n){return hipMemcpyDtoH(d,(hipDeviceptr_t)s,n);}
+int cuMemcpyDtoD_v2(unsigned long long d,unsigned long long s,size_t n){return hipMemcpyDtoD((hipDeviceptr_t)d,(hipDeviceptr_t)s,n);}
+int cuMemsetD8_v2(unsigned long long d,unsigned char v,size_t n){return hipMemsetD8((hipDeviceptr_t)d,v,n);}
+int cuMemsetD32_v2(unsigned long long d,unsigned int v,size_t n){return hipMemsetD32((hipDeviceptr_t)d,v,n);}
+int cuMemHostAlloc(void**p,size_t n,unsigned int f){return hipHostMalloc(p,n,f);}
+
+// --- CudaContext::new path (cuDeviceGetAttribute maps CUDA enum NUMBERS to sane values, bypassing HIP enum mismatch) ---
+int cuInit(unsigned int f){return hipInit(f);}
+int cuDriverGetVersion(int*v){return hipDriverGetVersion(v);}
+int cuDeviceGet(int*d,int o){return hipDeviceGet(d,o);}
+int cuDeviceGetCount(int*c){return hipGetDeviceCount(c);}
+int cuDeviceTotalMem_v2(size_t*b,int d){return hipDeviceTotalMem(b,d);}
+int cuDevicePrimaryCtxRetain(void**c,int d){return hipDevicePrimaryCtxRetain((hipCtx_t*)c,d);}
+int cuDevicePrimaryCtxRelease_v2(int d){return hipDevicePrimaryCtxRelease(d);}
+int cuCtxSynchronize(void){return hipDeviceSynchronize();}
+int cuCtxGetDevice(int*d){return hipGetDevice(d);}
+int cuDeviceGetName(char*n,int len,int d){ if(len>0){const char*s="AMD-gfx1151"; int i=0; for(;i<len-1 && s[i];i++) n[i]=s[i]; n[i]=0;} return 0;}
+int cuDeviceGetAttribute(int*v,int attr,int dev){ (void)dev; switch(attr){ case 75:*v=12;break; case 76:*v=1;break; case 16:*v=40;break; case 1:*v=1024;break; case 10:*v=32;break; case 8:*v=65536;break; case 18:*v=1;break; case 19:*v=1;break; case 41:*v=1;break; case 36:*v=1500;break; default:*v=0;break;} return 0;}
+
+int cuStreamDestroy_v2(void*s){return hipStreamDestroy((hipStream_t)s);}
+int cuStreamDestroy(void*s){return hipStreamDestroy((hipStream_t)s);}
+
 } // extern "C"
