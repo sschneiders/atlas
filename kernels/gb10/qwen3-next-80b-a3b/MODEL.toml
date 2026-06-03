@@ -13,23 +13,33 @@ q_heads = 16
 kv_heads = 2
 
 # Qwen3-Next — older architecture, no official thinking mode.
+# 2026-05-24 empirical band-aid (same as Qwen3.6-35B-A3B post-revert).
+# Instruct-only model — keep Qwen instruct top_p=0.8. Drop pres=1.5
+# (caused max_tokens wandering on Qwen3.6 sibling); use rep_pen=1.1 +
+# dry=0.5 for loop suppression instead.
 [sampling.thinking_text]
 temperature = 0.7
-top_p = 0.95
+top_p = 0.8
 top_k = 20
 presence_penalty = 0.0
+repetition_penalty = 1.1
+dry_multiplier = 0.5
 
 [sampling.thinking_coding]
 temperature = 0.6
 top_p = 0.95
 top_k = 20
 presence_penalty = 0.0
+repetition_penalty = 1.1
+dry_multiplier = 0.5
 
 [sampling.non_thinking]
 temperature = 0.7
-top_p = 0.95
+top_p = 0.8
 top_k = 20
 presence_penalty = 0.0
+repetition_penalty = 1.1
+dry_multiplier = 0.5
 
 [[model_types]]
 model_type = "qwen3_next"
@@ -53,7 +63,7 @@ thinking_in_tools = true
 # `thinking.budget_tokens` still wins below this; CLI
 # `--max-thinking-budget` overrides this entirely.
 max_thinking_budget = 4096
-thinking_default = false
+thinking_default = true  # Sweep 2026-05-20: thinking on by default for all Qwen reasoning-tier models.
 # Benchmarked 2026-04-11: K=2 (1 draft) is the sweet spot for the
 # 80B-A3B MoE — verify overhead at K=3 wipes out acceptance gains.
 default_num_drafts = 1

@@ -8,8 +8,17 @@
 // accessed via pointer tables indexed by expert_id. Tokens are sorted by expert
 // so each expert's tokens are contiguous.
 //
-// FP8 weight format: B[N,K] uint8 with block_scale[N/128, K/128] BF16.
+// FP8 weight format: B[N,K] uint8 with block_scale[N/128, K/128] FP32.
+// (scale_inv is widened to FP32 at load; applied in full FP32 precision.)
 // Dequant: bf16_val = E4M3_LUT[byte] * block_scale[n/128, k/128]
+//
+// Numerics SSOT (Phase 2b, 2026-05-24): all f32 -> BF16 conversions in
+// this file use `__float2bfloat16(x)`, which on sm_80+ lowers to
+// `cvt.rn.bf16.f32` (round-to-nearest-even). This matches the
+// load-time CPU dequant in `weight_map::fp8_lut::f32_to_bf16` and
+// `atlas_quant::fp8::f32_to_bf16`, so the routed-expert kernel-side
+// dequant agrees byte-exact with the shared-expert load-time dequant
+// AND with PyTorch's `torch.float32 -> torch.bfloat16` reference.
 //
 // Grid: (ceil(N/64), max_m_tiles, num_experts)  Block: (128, 1, 1)
 
@@ -20,6 +29,12 @@
 #define K_STEP 16
 #define PAD 2
 #define FP8_BLOCK 128
+// Inner-promotion stride. Smaller than FP8_BLOCK applies the same scale at
+// finer granularity within a scale-block — mathematically identical for
+// FP32 accumulators ((a+b)*s == a*s + b*s), but matches DeepGEMM's
+// "4 WGMMA per promote" structure and exposes any subtle two-level path
+// bugs more frequently. Must divide FP8_BLOCK evenly.
+#define K_PROMOTE 64
 
 __device__ __constant__ float E4M3_LUT_GMOE[256] = {
     0.0f, 0.001953125f, 0.00390625f, 0.005859375f,
@@ -146,7 +161,7 @@ __device__ __forceinline__ void fp8_moe_mma(
 extern "C" __global__ void moe_fp8_grouped_gemm(
     const __nv_bfloat16* __restrict__ A,                   // [total_tokens, K] BF16
     const unsigned long long* __restrict__ B_weight_ptrs,   // [num_experts] → [N, K] FP8
-    const unsigned long long* __restrict__ B_scale_ptrs,    // [num_experts] → [N/128, K/128] BF16
+    const unsigned long long* __restrict__ B_scale_ptrs,    // [num_experts] → [N/128, K/128] FP32
     __nv_bfloat16* __restrict__ C,                         // [total_expanded, N] BF16
     const int* __restrict__ expert_offsets,                 // [num_experts + 1]
     const int* __restrict__ sorted_token_ids,              // [total_expanded]
@@ -167,9 +182,10 @@ extern "C" __global__ void moe_fp8_grouped_gemm(
 
     const unsigned int cta_n = blockIdx.x * N_TILE;
 
-    // Load expert weight/scale pointers from table
+    // Load expert weight/scale pointers from table.
+    // mantissa noise from the previous BF16-cast-at-use path.
     const unsigned char* B_exp = (const unsigned char*)B_weight_ptrs[expert_id];
-    const __nv_bfloat16* S_exp = (const __nv_bfloat16*)B_scale_ptrs[expert_id];
+    const float* S_exp = (const float*)B_scale_ptrs[expert_id];
     if (B_exp == 0) return;  // NULL → remote expert under EP
 
     const unsigned int k_blocks = (K + FP8_BLOCK - 1) / FP8_BLOCK;
@@ -183,12 +199,30 @@ extern "C" __global__ void moe_fp8_grouped_gemm(
     __shared__ __nv_bfloat16 smem_A[M_TILE][K_STEP + PAD];
     __shared__ __nv_bfloat16 smem_B[K_STEP][N_TILE + PAD];
 
-    float acc[8][4];
+    // Two-level FP32 accumulation (DeepGEMM pattern, A5/A10 2026-05-25):
+    //   inner_acc accumulates unscaled BF16×BF16 products within one
+    //     scale-block (K=128). E4M3_LUT[byte] cast to BF16 is LOSSLESS
+    //     because FP8 E4M3 has only 3 mantissa bits and BF16 has 7.
+    //   outer_acc accumulates scale * inner_acc per K-block.
+    // Decouples the BF16-scale-truncation from per-element multiplication:
+    // previously every product was `BF16(LUT * scale)` so the scale's
+    // 7-bit mantissa truncated each dequanted weight. Now the scale is
+    // applied ONCE to the FP32-accumulated K=128 sum, preserving the
+    // full LUT precision through the inner reduction.
+    float outer_acc[8][4];
+    float inner_acc[8][4];
     #pragma unroll
     for (int i = 0; i < 8; i++) {
-        acc[i][0] = 0.0f; acc[i][1] = 0.0f;
-        acc[i][2] = 0.0f; acc[i][3] = 0.0f;
+        outer_acc[i][0] = 0.0f; outer_acc[i][1] = 0.0f;
+        outer_acc[i][2] = 0.0f; outer_acc[i][3] = 0.0f;
+        inner_acc[i][0] = 0.0f; inner_acc[i][1] = 0.0f;
+        inner_acc[i][2] = 0.0f; inner_acc[i][3] = 0.0f;
     }
+
+    // N_TILE=64 < FP8_BLOCK=128, cta_n always aligned to N_TILE — so all
+    // 64 N-cols of this CTA fall within a single N-block and share one
+    // scale per K-block.
+    const unsigned int n_block = cta_n / FP8_BLOCK;
 
     for (unsigned int k_base = 0; k_base < K; k_base += K_STEP) {
         // Load A tile: gather from sorted token positions
@@ -212,7 +246,9 @@ extern "C" __global__ void moe_fp8_grouped_gemm(
             }
         }
 
-        // Dequant B tile: FP8 E4M3 → BF16 via LUT × block_scale
+        // Dequant B tile: FP8 E4M3 → BF16 via LUT (NO scale — applied
+        // post-MMA to inner_acc). Lossless because FP8 has 3-bit
+        // mantissa, BF16 has 7-bit mantissa.
         {
             #pragma unroll
             for (unsigned int i = 0; i < 8; i++) {
@@ -224,11 +260,7 @@ extern "C" __global__ void moe_fp8_grouped_gemm(
 
                 if (gk < K && gn < N) {
                     unsigned char weight_byte = B_exp[(unsigned long long)gn * K + gk];
-                    unsigned int n_block = gn / FP8_BLOCK;
-                    unsigned int k_block = gk / FP8_BLOCK;
-                    float scale = __bfloat162float(S_exp[n_block * k_blocks + k_block]);
-                    float dequant_val = E4M3_LUT_GMOE[weight_byte] * scale;
-                    smem_B[k][n] = __float2bfloat16(dequant_val);
+                    smem_B[k][n] = __float2bfloat16(E4M3_LUT_GMOE[weight_byte]);
                 } else {
                     smem_B[k][n] = __float2bfloat16(0.0f);
                 }
@@ -236,11 +268,26 @@ extern "C" __global__ void moe_fp8_grouped_gemm(
         }
 
         __syncthreads();
-        fp8_moe_mma(smem_A, smem_B, acc, warp_m_offset, group_id, tid);
+        fp8_moe_mma(smem_A, smem_B, inner_acc, warp_m_offset, group_id, tid);
         __syncthreads();
+
+        // End-of-K-block: scale inner_acc, accumulate to outer_acc, reset.
+        unsigned int next_k = k_base + K_STEP;
+        if (next_k % K_PROMOTE == 0 || next_k >= K) {
+            unsigned int k_block = k_base / FP8_BLOCK;
+            float scale = S_exp[n_block * k_blocks + k_block];
+            #pragma unroll
+            for (int n_tile = 0; n_tile < 8; n_tile++) {
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    outer_acc[n_tile][j] += inner_acc[n_tile][j] * scale;
+                    inner_acc[n_tile][j] = 0.0f;
+                }
+            }
+        }
     }
 
-    // Store C tile — write to sorted position in output
+    // Store C tile — write to sorted position in output (from outer_acc)
     #pragma unroll
     for (int n_tile = 0; n_tile < 8; n_tile++) {
         unsigned int base_n = cta_n + n_tile * 8;
@@ -251,13 +298,13 @@ extern "C" __global__ void moe_fp8_grouped_gemm(
 
         if (row0 < (unsigned int)M_expert) {
             unsigned int out_row = m_start + row0;
-            if (col0 < N) C[(unsigned long long)out_row * N + col0] = __float2bfloat16(acc[n_tile][0]);
-            if (col1 < N) C[(unsigned long long)out_row * N + col1] = __float2bfloat16(acc[n_tile][1]);
+            if (col0 < N) C[(unsigned long long)out_row * N + col0] = __float2bfloat16(outer_acc[n_tile][0]);
+            if (col1 < N) C[(unsigned long long)out_row * N + col1] = __float2bfloat16(outer_acc[n_tile][1]);
         }
         if (row1 < (unsigned int)M_expert) {
             unsigned int out_row = m_start + row1;
-            if (col0 < N) C[(unsigned long long)out_row * N + col0] = __float2bfloat16(acc[n_tile][2]);
-            if (col1 < N) C[(unsigned long long)out_row * N + col1] = __float2bfloat16(acc[n_tile][3]);
+            if (col0 < N) C[(unsigned long long)out_row * N + col0] = __float2bfloat16(outer_acc[n_tile][2]);
+            if (col1 < N) C[(unsigned long long)out_row * N + col1] = __float2bfloat16(outer_acc[n_tile][3]);
         }
     }
 }
@@ -314,7 +361,7 @@ extern "C" __global__ void moe_fp8_grouped_gemm_v2(
     const unsigned int cta_n = blockIdx.x * N_TILE;
 
     const unsigned char* B_exp = (const unsigned char*)B_weight_ptrs[expert_id];
-    const __nv_bfloat16* S_exp = (const __nv_bfloat16*)B_scale_ptrs[expert_id];
+    const float* S_exp = (const float*)B_scale_ptrs[expert_id];
     if (B_exp == 0) return;
 
     const unsigned int k_blocks = (K + FP8_BLOCK - 1) / FP8_BLOCK;
@@ -335,12 +382,20 @@ extern "C" __global__ void moe_fp8_grouped_gemm_v2(
     const unsigned int k_offset     = threadIdx.x & 15;      // 0..K_STEP-1 (K_STEP=16)
     const unsigned int row_base     = thread_group * 8;      // 0, 8, 16, ..., 56
 
-    float acc[8][4];
+    // Two-level FP32 accumulation (DeepGEMM pattern, see v1 above for
+    // rationale): inner accumulates unscaled BF16(LUT) products within
+    // one K=128 scale-block, outer applies scale per block.
+    float outer_acc[8][4];
+    float inner_acc[8][4];
     #pragma unroll
     for (int i = 0; i < 8; i++) {
-        acc[i][0] = 0.0f; acc[i][1] = 0.0f;
-        acc[i][2] = 0.0f; acc[i][3] = 0.0f;
+        outer_acc[i][0] = 0.0f; outer_acc[i][1] = 0.0f;
+        outer_acc[i][2] = 0.0f; outer_acc[i][3] = 0.0f;
+        inner_acc[i][0] = 0.0f; inner_acc[i][1] = 0.0f;
+        inner_acc[i][2] = 0.0f; inner_acc[i][3] = 0.0f;
     }
+
+    const unsigned int n_block = cta_n / FP8_BLOCK;
 
     for (unsigned int k_base = 0; k_base < K; k_base += K_STEP) {
         const unsigned int gk = k_base + k_offset;
@@ -366,34 +421,41 @@ extern "C" __global__ void moe_fp8_grouped_gemm_v2(
             }
         }
 
-        // Dequant B tile [K_STEP=16 rows][N_TILE=64 cols].
-        // smem_B[k_offset][n_local] where n_local = row_base + i is the
-        // column within the N_TILE. Global B addr = B_exp[gn * K + gk]
-        // with gn = cta_n + n_local. Within a warp, 16 threads of the same
-        // thread_group share one (gn, k_base) row and vary gk 0..15 →
-        // one coalesced 16-byte load per group.
+        // Dequant B tile [K_STEP=16 rows][N_TILE=64 cols] — NO scale (applied
+        // post-MMA per K-block to inner_acc; see v1 above for rationale).
         #pragma unroll
         for (unsigned int i = 0; i < 8; i++) {
             unsigned int n_local = row_base + i;
             unsigned int gn = cta_n + n_local;
             if (gk < K && gn < N) {
                 unsigned char weight_byte = B_exp[(unsigned long long)gn * K + gk];
-                unsigned int n_block = gn / FP8_BLOCK;
-                unsigned int k_block = gk / FP8_BLOCK;
-                float scale = __bfloat162float(S_exp[n_block * k_blocks + k_block]);
-                float dequant_val = E4M3_LUT_GMOE[weight_byte] * scale;
-                smem_B[k_offset][n_local] = __float2bfloat16(dequant_val);
+                smem_B[k_offset][n_local] = __float2bfloat16(E4M3_LUT_GMOE[weight_byte]);
             } else {
                 smem_B[k_offset][n_local] = __float2bfloat16(0.0f);
             }
         }
 
         __syncthreads();
-        fp8_moe_mma(smem_A, smem_B, acc, warp_m_offset, group_id, tid);
+        fp8_moe_mma(smem_A, smem_B, inner_acc, warp_m_offset, group_id, tid);
         __syncthreads();
+
+        // End-of-K-block: scale inner_acc → outer_acc, reset inner.
+        unsigned int next_k = k_base + K_STEP;
+        if (next_k % K_PROMOTE == 0 || next_k >= K) {
+            unsigned int k_block = k_base / FP8_BLOCK;
+            float scale = S_exp[n_block * k_blocks + k_block];
+            #pragma unroll
+            for (int n_tile = 0; n_tile < 8; n_tile++) {
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    outer_acc[n_tile][j] += inner_acc[n_tile][j] * scale;
+                    inner_acc[n_tile][j] = 0.0f;
+                }
+            }
+        }
     }
 
-    // Store C tile — write to sorted position in output. Identical to v1.
+    // Store C tile from outer_acc (DeepGEMM-style scaled FP32 sum).
     #pragma unroll
     for (int n_tile = 0; n_tile < 8; n_tile++) {
         unsigned int base_n = cta_n + n_tile * 8;
@@ -404,13 +466,13 @@ extern "C" __global__ void moe_fp8_grouped_gemm_v2(
 
         if (row0 < (unsigned int)M_expert) {
             unsigned int out_row = m_start + row0;
-            if (col0 < N) C[(unsigned long long)out_row * N + col0] = __float2bfloat16(acc[n_tile][0]);
-            if (col1 < N) C[(unsigned long long)out_row * N + col1] = __float2bfloat16(acc[n_tile][1]);
+            if (col0 < N) C[(unsigned long long)out_row * N + col0] = __float2bfloat16(outer_acc[n_tile][0]);
+            if (col1 < N) C[(unsigned long long)out_row * N + col1] = __float2bfloat16(outer_acc[n_tile][1]);
         }
         if (row1 < (unsigned int)M_expert) {
             unsigned int out_row = m_start + row1;
-            if (col0 < N) C[(unsigned long long)out_row * N + col0] = __float2bfloat16(acc[n_tile][2]);
-            if (col1 < N) C[(unsigned long long)out_row * N + col1] = __float2bfloat16(acc[n_tile][3]);
+            if (col0 < N) C[(unsigned long long)out_row * N + col0] = __float2bfloat16(outer_acc[n_tile][2]);
+            if (col1 < N) C[(unsigned long long)out_row * N + col1] = __float2bfloat16(outer_acc[n_tile][3]);
         }
     }
 }

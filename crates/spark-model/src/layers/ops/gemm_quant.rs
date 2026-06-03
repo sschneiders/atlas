@@ -223,6 +223,76 @@ pub fn w8a16_gemm(
         .launch(stream)
 }
 
+/// Per-token-per-128-K-group FP8 activation quantization. Output: A_fp8
+/// [M, K] FP8 E4M3 + a_scale [M, K/128] FP32. Matches vLLM's
+/// `per_token_group_quant_fp8`.
+///
+/// Grid: (K/128, M, 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn per_token_group_quant_fp8(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input_bf16: DevicePtr,
+    output_fp8: DevicePtr,
+    a_scale: DevicePtr,
+    m: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    // Grid: (M, K/128, 1). Putting M on grid X (max 2^31-1) avoids the
+    // 65535 limit on grid Y for large MoE total_expanded counts.
+    KernelLaunch::new(gpu, kernel)
+        .grid([m, k / 128, 1])
+        .block([128, 1, 1])
+        .arg_ptr(input_bf16)
+        .arg_ptr(output_fp8)
+        .arg_ptr(a_scale)
+        .arg_u32(m)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// W8A8 + FP32 epilogue GEMM with per-token activation scales and
+/// per-block weight scales — vLLM-equivalent FP8 numerics.
+///
+///   C[M, N] = bf16( Σ_g (FP8 MMA over K-group g) × a_scale[M, g] × b_scale[N/128, g] )
+///
+/// Inputs:
+///   - `a_fp8`     [M, K] FP8 E4M3
+///   - `a_scale`   [M, K/128] FP32 (from per_token_group_quant_fp8)
+///   - `b_fp8`     [N, K] FP8 E4M3
+///   - `b_scale`   [N/128, K/128] BF16 (existing checkpoint layout)
+///   - `output`    [M, N] BF16
+///
+/// Grid: (ceil(N/128), ceil(M/64), 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_t_blockscaled(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_fp8: DevicePtr,
+    a_scale: DevicePtr,
+    b_fp8: DevicePtr,
+    b_scale: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 128), div_ceil(m, 64), 1])
+        .block([128, 1, 1])
+        .arg_ptr(a_fp8)
+        .arg_ptr(a_scale)
+        .arg_ptr(b_fp8)
+        .arg_ptr(b_scale)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// Fused gate GEMV + topK softmax for M=1 decode.
 ///
 /// Single kernel that computes `gate[num_experts] = A[K] @ B_gate[num_experts, K]`
@@ -298,6 +368,81 @@ pub fn moe_fp8_grouped_gemm(
         .launch(stream)
 }
 
+/// W8A8 + FP32 epilogue grouped MoE GEMM (vLLM-equivalent).
+///
+/// A_fp8 must be pre-quantized via `per_token_group_quant_fp8`. Both
+/// `a_scale` (per-token, FP32) and `b_scale` (per-block, BF16) are applied
+/// in the FP32 epilogue per K=128 block.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_w8a8_grouped_gemm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_fp8: DevicePtr,             // [total_tokens, K] FP8 E4M3
+    a_scale: DevicePtr,           // [total_tokens, K/128] FP32
+    weight_ptrs: DevicePtr,       // [num_experts] → [N, K] FP8
+    scale_ptrs: DevicePtr,        // [num_experts] → [N/128, K/128] BF16
+    output: DevicePtr,            // [total_expanded, N] BF16
+    expert_offsets: DevicePtr,    // [num_experts + 1]
+    sorted_token_ids: DevicePtr,  // [total_expanded] or NULL
+    num_experts: u32,
+    n: u32,
+    k: u32,
+    max_m_tiles: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), max_m_tiles, num_experts])
+        .block([128, 1, 1])
+        .arg_ptr(a_fp8)
+        .arg_ptr(a_scale)
+        .arg_ptr(weight_ptrs)
+        .arg_ptr(scale_ptrs)
+        .arg_ptr(output)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// BF16 grouped GEMM for sorted MoE prefill (FP8-dequant-on-load path).
+///
+/// BF16 activations × BF16 expert weights via pointer table. No scale.
+/// Used when expert weights have been dequanted from FP8 to BF16 at load
+/// time (ATLAS_FP8_DEQUANT_MOE_TO_BF16=1). Eliminates the per-layer 0.989
+/// cosine ceiling that comes from FP8 quantization itself.
+///
+/// Grid: (ceil(N/64), max_m_tiles, num_experts)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_bf16_grouped_gemm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,            // [total_tokens, K] BF16
+    weight_ptrs: DevicePtr,      // [num_experts] → [N, K] BF16
+    output: DevicePtr,           // [total_expanded, N] BF16
+    expert_offsets: DevicePtr,   // [num_experts + 1]
+    sorted_token_ids: DevicePtr, // [total_expanded] or NULL
+    num_experts: u32,
+    n: u32,
+    k: u32,
+    max_m_tiles: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), max_m_tiles, num_experts])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight_ptrs)
+        .arg_ptr(output)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// W8A16 Transposed GEMM: `C[M,N] = A[M,K] @ dequant(B_t[K,N])` with coalesced reads.
 ///
 /// Uses transposed FP8 weights `B_t[K,N]` and `block_scale_t[K/128, N/128]` for
@@ -348,6 +493,31 @@ pub fn transpose_fp8(
         .arg_ptr(dst)
         .arg_u32(n)
         .arg_u32(k)
+        .launch(stream)
+}
+
+/// Widen an FP8 block-scale tensor to FP32 on the GPU.
+///
+/// `src` is `[total]` BF16 (`in_is_fp32 == false`) or FP32 (`in_is_fp32 ==
+/// true`); `dst` is `[total]` FP32. Lossless BF16→FP32 widen / straight copy.
+/// Run once at load so downstream FP8 block-scale kernels read `const float*`.
+/// Grid: (ceil(total/256), 1, 1)  Block: (256, 1, 1)
+pub fn widen_block_scale_f32(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    src: DevicePtr,
+    dst: DevicePtr,
+    total: u32,
+    in_is_fp32: bool,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(total, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(src)
+        .arg_ptr(dst)
+        .arg_u32(total)
+        .arg_u32(in_is_fp32 as u32)
         .launch(stream)
 }
 

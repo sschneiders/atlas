@@ -54,27 +54,15 @@ impl TransformerModel {
         }
     }
 
-    /// Scale in-place embeddings by config.embed_scale. Picks the kernel
-    /// matching `data`'s actual dtype:
-    ///   - when `use_fp32_residual()` is true, `hidden` is FP32 and we
-    ///     dispatch `embed_scale::f32_scale_inplace`
-    ///   - otherwise (`hidden` is BF16) we dispatch the usual
-    ///     `embed_scale::bf16_scale_inplace`
-    ///
-    /// For the rare case of scaling a BF16 buffer while FP32 residual is
-    /// ALSO active (e.g. the decode embed() scratch which is deliberately
-    /// BF16 before a bf16_to_f32 cast), use `scale_embeddings_bf16`.
+    /// Scale in-place embeddings by config.embed_scale. The residual stream
+    /// is always BF16, so this dispatches `embed_scale::bf16_scale_inplace`.
     pub(super) fn scale_embeddings(
         &self,
         data: DevicePtr,
         num_tokens: usize,
         stream: u64,
     ) -> Result<()> {
-        if self.config.use_fp32_residual() {
-            self.scale_embeddings_fp32(data, num_tokens, stream)
-        } else {
-            self.scale_embeddings_bf16(data, num_tokens, stream)
-        }
+        self.scale_embeddings_bf16(data, num_tokens, stream)
     }
 
     pub(super) fn scale_embeddings_bf16(
@@ -89,24 +77,6 @@ impl TransformerModel {
         use spark_runtime::kernel_args::KernelLaunch;
         let n = (num_tokens * self.config.hidden_size) as u32;
         KernelLaunch::new(self.gpu.as_ref(), self.embed_scale_kernel)
-            .grid([n.div_ceil(256), 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(data)
-            .arg_u32(n)
-            .arg_f32(self.config.embed_scale)
-            .launch(stream)
-    }
-
-    pub(super) fn scale_embeddings_fp32(
-        &self,
-        data: DevicePtr,
-        num_tokens: usize,
-        stream: u64,
-    ) -> Result<()> {
-        use spark_runtime::kernel_args::KernelLaunch;
-        let kernel = self.gpu.kernel("embed_scale", "f32_scale_inplace")?;
-        let n = (num_tokens * self.config.hidden_size) as u32;
-        KernelLaunch::new(self.gpu.as_ref(), kernel)
             .grid([n.div_ceil(256), 1, 1])
             .block([256, 1, 1])
             .arg_ptr(data)

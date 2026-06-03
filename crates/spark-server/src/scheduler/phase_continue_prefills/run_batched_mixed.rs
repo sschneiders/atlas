@@ -32,9 +32,9 @@ pub(super) fn run_batched_mixed_step(
     t0_step: Instant,
     think_end_token: Option<u32>,
     think_start_token: Option<u32>,
+    code_fence_token: Option<u32>,
     tool_call_start_token: Option<u32>,
     tool_call_end_token: Option<u32>,
-    reflection_suppress_ids: &[u32],
     adaptive_sampling: bool,
     did_mixed_step: &mut bool,
 ) {
@@ -154,9 +154,9 @@ pub(super) fn run_batched_mixed_step(
             t0_step,
             think_end_token,
             think_start_token,
+            code_fence_token,
             tool_call_start_token,
             tool_call_end_token,
-            reflection_suppress_ids,
             adaptive_sampling,
         );
     }

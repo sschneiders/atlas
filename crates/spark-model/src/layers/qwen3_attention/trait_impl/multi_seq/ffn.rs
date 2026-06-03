@@ -34,7 +34,20 @@ impl Qwen3AttentionLayer {
             )?;
             return Ok(());
         }
-        if n == 3 {
+        // MLA models (Mistral-Small-4) route the FFN through the
+        // sequential per-token branch below, NOT the fused `forward_k2`
+        // / `forward_k3` batched-MoE kernels. The batched-MoE K=2/K=3
+        // path has a pre-existing crash for Mistral-Small-4's MoE config
+        // (illegal address in `moe_expert_silu_down_shared_batch2`) — it
+        // was never exercised because Mistral always ran at batch=1. The
+        // sequential branch calls `FfnComponent::forward` (the proven
+        // single-token MoE path used by `decode()`), processing each
+        // sequence's normed input independently, so the batched MLA
+        // attention path (issue #84) gets correct, isolated FFN output
+        // without depending on the buggy batched-MoE kernels. Fixing the
+        // batched-MoE kernel is tracked separately (out of #84 scope).
+        let force_seq_ffn = self.mla.is_some();
+        if n == 3 && !force_seq_ffn {
             let normed2 = fwd.buffers.norm_output();
             ops::residual_add_rms_norm(
                 fwd.gpu,
@@ -59,7 +72,7 @@ impl Qwen3AttentionLayer {
                 (3 * h) as u32,
                 stream,
             )?;
-        } else if n == 2 {
+        } else if n == 2 && !force_seq_ffn {
             let normed2 = fwd.buffers.norm_output();
             ops::residual_add_rms_norm(
                 fwd.gpu,
@@ -86,16 +99,11 @@ impl Qwen3AttentionLayer {
             )?;
         } else {
             // CONCURRENT-DECODE BUG (sibling of qwen3_ssm.rs:1102 fix):
-            // the per-seq hidden/residual stride must match the actual
-            // residual element size. When `use_fp32_residual()` is false
-            // (BF16 hidden — GB10 default via HARDWARE.toml
-            // ATLAS_HW_FP32_RESIDUAL=false), hardcoded `i * h * 4` would
-            // over-stride into the wrong batch slot for i>=1.
-            let residual_elem = if fwd.config.use_fp32_residual() {
-                4usize
-            } else {
-                2usize
-            };
+            // the per-seq hidden/residual stride must match the residual
+            // element size. The residual stream is always BF16, so the stride
+            // is `i * h * 2`; a hardcoded `i * h * 4` would over-stride into
+            // the wrong batch slot for i>=1.
+            let residual_elem = 2usize;
             for i in 0..n {
                 let hidden_i = hidden.offset(i * h * residual_elem);
                 let o_out_i = o_out.offset(i * h * bf16); // BF16 attn output

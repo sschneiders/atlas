@@ -49,12 +49,7 @@ impl MoeLayer {
                 .kernel("moe_shared_expert_fused", "moe_expert_silu_down_shared")?,
             moe_topk: gpu.kernel("moe_topk", "moe_topk_softmax")?,
             moe_weighted_sum_blend: gpu.kernel("moe_expert_gemv", "moe_weighted_sum_blend")?,
-            residual_add: if config.use_fp32_residual() {
-                gpu.kernel("norm", "f32_residual_add")
-                    .or_else(|_| gpu.kernel("residual_add", "bf16_residual_add"))?
-            } else {
-                gpu.kernel("residual_add", "bf16_residual_add")?
-            },
+            residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
             moe_topk_batched: gpu.kernel("moe_topk", "moe_topk_softmax_batched")?,
             moe_expert_gate_up_shared_batch2: gpu
                 .kernel("moe_fused_batch2", "moe_expert_gate_up_shared_batch2")?,
@@ -98,9 +93,46 @@ impl MoeLayer {
                 "moe_fp8_grouped_gemm",
                 "moe_fp8_grouped_gemm_v2",
             ),
+            moe_w8a8_grouped_gemm_k: super::super::try_kernel(
+                gpu,
+                "moe_w8a8_grouped_gemm",
+                "moe_w8a8_grouped_gemm",
+            ),
+            per_token_group_quant_fp8_k: super::super::try_kernel(
+                gpu,
+                "per_token_group_quant_fp8",
+                "per_token_group_quant_fp8",
+            ),
+            fp8_gemm_t_blockscaled_k: super::super::try_kernel(
+                gpu,
+                "fp8_gemm_t_blockscaled",
+                "fp8_gemm_t_blockscaled",
+            ),
+            moe_bf16_grouped_gemm_k: super::super::try_kernel(
+                gpu,
+                "moe_bf16_grouped_gemm",
+                "moe_bf16_grouped_gemm",
+            ),
+            moe_expert_gate_up_shared_bf16_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_bf16",
+                "moe_expert_gate_up_shared_bf16",
+            ),
+            moe_expert_silu_down_shared_bf16_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_bf16",
+                "moe_expert_silu_down_shared_bf16",
+            ),
+            // 2026-05-20: default-ON. v1 had documented coalescing-perf bug;
+            // verified that v1 also has *numerical* bug for some
+            // (token, expert) tile combinations — chunk-4 last-token
+            // expert-200 up_proj output 2.4× too large vs v2 on
+            // Qwen3.6-35B-A3B-FP8 (matches HF reference). Drives long-context
+            // residual amplification at the prefill-chunk-4 boundary.
+            // Override via ATLAS_FP8_MOE_COALESCED=0 to restore v1.
             fp8_moe_coalesced_enabled: std::env::var("ATLAS_FP8_MOE_COALESCED")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
+                .unwrap_or(true),
             w8a16_gemm_k: super::super::try_kernel(gpu, "w8a16_gemm", "w8a16_gemm"),
             moe_gate_topk_fused_k: super::super::try_kernel(
                 gpu,
@@ -226,6 +258,12 @@ impl MoeLayer {
             fp8_gate_weight_ptrs: None,
             fp8_up_weight_ptrs: None,
             fp8_down_weight_ptrs: None,
+            bf16_gate_weight_ptrs: None,
+            bf16_up_weight_ptrs: None,
+            bf16_down_weight_ptrs: None,
+            bf16_shared_gate: None,
+            bf16_shared_up: None,
+            bf16_shared_down: None,
             fp8_shared_expert: None,
             // Phase 2.7 Tier C — set by loader after construction (qwen35.rs).
             is_dflash_capture_layer: false,

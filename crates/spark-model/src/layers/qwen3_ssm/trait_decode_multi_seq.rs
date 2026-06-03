@@ -32,23 +32,15 @@ impl Qwen3SsmLayer {
         let h = ctx.config.hidden_size;
         let bf16 = 2usize;
 
-        // CONCURRENT-DECODE BUG FIX: per-seq stride must match the ACTUAL
-        // hidden/residual element size, not always FP32 (4 bytes). When
-        // `use_fp32_residual()` is false (BF16 hidden — the default for
-        // GB10 LPDDR5X bandwidth-limited systems via HARDWARE.toml), the
-        // hardcoded `i * h * 4` skipped to position 2 of the BF16 buffer
-        // for `i=1`, leaving seq-1's actual position-1 slice UNTOUCHED by
-        // every SSM layer. Result: seq 1 only got modifications from the
-        // attention layers (which use the correct n>=2 batched indexing
-        // internally), producing the position-specific gibberish that
-        // reproduced even with identical prompts. Use the same `fp32`
-        // bytes-per-element computation the dispatcher uses at
-        // model.rs:4250.
-        let residual_elem = if ctx.config.use_fp32_residual() {
-            4usize
-        } else {
-            2usize
-        };
+        // CONCURRENT-DECODE BUG FIX: per-seq stride must match the
+        // hidden/residual element size. The residual stream is always BF16
+        // (2 bytes); a hardcoded `i * h * 4` skipped to position 2 of the
+        // BF16 buffer for `i=1`, leaving seq-1's actual position-1 slice
+        // UNTOUCHED by every SSM layer. Result: seq 1 only got modifications
+        // from the attention layers (which use the correct n>=2 batched
+        // indexing internally), producing the position-specific gibberish
+        // that reproduced even with identical prompts.
+        let residual_elem = 2usize;
 
         // Delegate to per-sequence single decode (proven correct, no buffer aliasing).
         let mut _stub_disk = Vec::<u32>::new();
@@ -331,11 +323,7 @@ impl Qwen3SsmLayer {
         // offsets, producing either silent gibberish (small N) or CUDA-700
         // illegal memory access (large per-seq offsets exceeding allocated
         // buffer region). See project_batch_decode_corruption.md memory.
-        let residual_elem = if ctx.config.use_fp32_residual() {
-            4usize
-        } else {
-            2usize
-        };
+        let residual_elem = 2usize;
         for i in 0..n {
             let hidden_i = hidden.offset(i * h * residual_elem);
             let ssm_out_i = ssm_out_safe.offset(i * h * bf16);

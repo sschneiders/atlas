@@ -46,6 +46,7 @@ pub fn prefill_request(
     let req_session_hash = req.session_hash();
     let req_enable_thinking = req.enable_thinking();
     let req_thinking_budget = req.thinking_budget();
+    let req_repetition_detection = req.repetition_detection();
     if req_enable_thinking {
         tracing::info!("Thinking enabled, budget={:?}", req_thinking_budget);
     }
@@ -56,14 +57,15 @@ pub fn prefill_request(
     let req_top_logprobs = req.top_logprobs();
     let req_timeout_at = req.timeout_at();
     let grammar_spec = req.take_grammar_spec();
-    let grammar_state = compile_grammar_state(grammar_engine, &grammar_spec);
-    let (prompt_tokens, max_tokens, mut sink, image_pixels, temperature) = match req {
+    let grammar_state = compile_grammar_state(grammar_engine, &grammar_spec, eos_tokens);
+    let (prompt_tokens, max_tokens, mut sink, image_pixels, temperature, cancel_flag) = match req {
         InferenceRequest::Streaming {
             prompt_tokens,
             max_tokens,
             temperature,
             token_tx,
             image_pixels,
+            cancel_flag,
             ..
         } => (
             prompt_tokens,
@@ -71,6 +73,7 @@ pub fn prefill_request(
             ResponseSink::Streaming(token_tx),
             image_pixels,
             temperature,
+            Some(cancel_flag),
         ),
         InferenceRequest::Blocking {
             prompt_tokens,
@@ -85,6 +88,7 @@ pub fn prefill_request(
             ResponseSink::Blocking(Some(response_tx)),
             image_pixels,
             temperature,
+            None,
         ),
     };
 
@@ -163,6 +167,9 @@ pub fn prefill_request(
     // When grammar is active, disable legacy require_tool_call (grammar handles EOS).
     let use_legacy_tool_call =
         req_require_tool_call && grammar_state.is_none() && tool_call_start_token.is_some();
+    // F4: sticky tool-request flag — grammar attached OR legacy tool path.
+    // Computed before `grammar_state` is moved into the ActiveSeq below.
+    let tool_request = grammar_state.is_some() || use_legacy_tool_call;
 
     let now = Instant::now();
     let cached_prompt_tok = seq.cached_prefix_tokens as u32;
@@ -178,6 +185,7 @@ pub fn prefill_request(
             eos_tokens: eos_tokens.to_vec(),
             finished: true,
             sink,
+            cancel_flag: cancel_flag.clone(),
             temperature,
             top_k,
             top_p,
@@ -197,30 +205,35 @@ pub fn prefill_request(
             inside_thinking: req_enable_thinking && think_end_token.is_some(),
             enable_thinking: req_enable_thinking,
             thinking_budget: req_thinking_budget,
+            repetition_detection: req_repetition_detection,
             spontaneous_think_budget,
             thinking_tokens: 0,
             cached_prompt_tokens: cached_prompt_tok,
             force_end_thinking: false,
+            sentence_defer_count: 0,
             consecutive_confident: 0,
+            in_code_fence: false,
             think_end_token,
             think_start_token,
             think_ended: !req_enable_thinking && think_end_token.is_some(),
             think_just_ended: false,
             think_skip_count: 0,
             require_tool_call: use_legacy_tool_call,
+            tool_request,
             suppress_tool_call: req_suppress_tool_call,
             disable_mtp: req_disable_mtp,
             content_started: false,
             content_tokens: 0,
             prose_tokens_since_last_tool: 0,
             think_watchdog_fires: 0,
-            entropy_collapse_streak: 0,
-            f27_fingerprint_ring: std::collections::VecDeque::with_capacity(F27_RING_CAP),
-            f27_attractor_streak: 0,
-            f27_last_emitted_token: 0,
+            rollback_count: 0,
+            ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
             tool_call_start_token,
             tool_call_opened: false,
             inside_tool_body: false,
+            tool_body_streak_tokens: 0,
+            inside_parameter_body: false,
+            param_body_chars_emitted: 0,
             tool_call_end_token,
             grammar_state,
             last_token_time: now,
@@ -246,6 +259,7 @@ pub fn prefill_request(
         eos_tokens: eos_tokens.to_vec(),
         finished: false,
         sink,
+        cancel_flag,
         temperature,
         top_k,
         top_p,
@@ -269,11 +283,14 @@ pub fn prefill_request(
         } else {
             req_thinking_budget
         },
+        repetition_detection: req_repetition_detection,
         spontaneous_think_budget,
         thinking_tokens: 0,
         cached_prompt_tokens: cached_prompt_tok,
         force_end_thinking: false,
+        sentence_defer_count: 0,
         consecutive_confident: 0,
+        in_code_fence: false,
         think_end_token,
         think_start_token,
         think_ended: if spontaneous_think {
@@ -284,19 +301,21 @@ pub fn prefill_request(
         think_just_ended: false,
         think_skip_count: 0,
         require_tool_call: use_legacy_tool_call,
+        tool_request,
         suppress_tool_call: req_suppress_tool_call,
         disable_mtp: req_disable_mtp,
         content_started: false,
         content_tokens: 0,
         prose_tokens_since_last_tool: 0,
         think_watchdog_fires: 0,
-        entropy_collapse_streak: 0,
-        f27_fingerprint_ring: std::collections::VecDeque::with_capacity(F27_RING_CAP),
-        f27_attractor_streak: 0,
-        f27_last_emitted_token: 0,
+        rollback_count: 0,
+        ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
         tool_call_start_token,
         tool_call_opened: false,
         inside_tool_body: false,
+        tool_body_streak_tokens: 0,
+        inside_parameter_body: false,
+        param_body_chars_emitted: 0,
         tool_call_end_token,
         grammar_state,
         last_token_time: now,

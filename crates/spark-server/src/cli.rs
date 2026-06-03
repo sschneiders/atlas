@@ -95,6 +95,24 @@ pub struct ServeArgs {
     #[arg(long)]
     pub max_thinking_budget: Option<u32>,
 
+    /// Override MODEL.toml's `[behavior].disable_tool_grammar`.
+    /// When true, the server skips XGrammar structural-tag enforcement on
+    /// `tool_choice="auto"` requests; tools are still parsed from output
+    /// post-hoc by the tool_call_parser. Matches vLLM's default behaviour
+    /// in auto mode (vLLM only grammar-constrains when tool_choice="required").
+    #[arg(long)]
+    pub disable_tool_grammar: Option<bool>,
+
+    /// Default chat template kwargs applied when the client sends no
+    /// thinking parameters (no `reasoning.effort`, `chat_template_kwargs`,
+    /// or `enable_thinking` in the request body). A JSON object with
+    /// optional keys: `enable_thinking` (bool), `thinking_budget` (u32).
+    ///
+    /// Precedence (highest wins): request body → this flag → MODEL.toml.
+    /// Example: `--default-chat-template-kwargs '{"enable_thinking":true}'`
+    #[arg(long, value_name = "JSON")]
+    pub default_chat_template_kwargs: Option<String>,
+
     /// Currently slower than regular decode for hybrid SSM models.
     #[arg(long, default_value_t = false)]
     pub speculative: bool,
@@ -147,9 +165,12 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 8)]
     pub max_batch_size: usize,
 
-    /// MTP head weight precision: nvfp4 (fastest, recommended — uses fused
-    /// device-side expert dispatch), fp8 (balanced but slower due to D2H sync
-    /// in MoE), bf16 (highest accuracy, most memory).
+    /// MTP head weight precision: bf16 (default, highest acceptance rate
+    /// = highest end-to-end throughput; the MTP head is small so the memory
+    /// cost is modest), fp8 (1 byte/weight, balanced; slower draft due to
+    /// a D2H sync in MoE dispatch), nvfp4 (0.5 byte/weight, fastest draft
+    /// forward but lossier projections → lower acceptance rate, so end-to-
+    /// end throughput is usually worse than bf16).
     #[arg(long, default_value = "bf16")]
     pub mtp_quantization: String,
 
@@ -305,7 +326,16 @@ pub struct ServeArgs {
 
     /// Default min-p for sampling (keep tokens with prob >= min_p * max_prob).
     /// 0.0 = disabled. Recommended: 0.05-0.1.
-    #[arg(long, default_value_t = 0.0)]
+    ///
+    /// A5 (2026-05-26): default raised from 0.0 → 0.08 per the
+    /// `research3_quantization_sampler.md` recommendation #3. On FP8
+    /// models the long noisy tail of the logit distribution gets
+    /// truncated, preventing low-probability tokens from winning under
+    /// FP8 quantization noise. BF16 models pay essentially nothing for
+    /// the floor (their distributions are already concentrated).
+    /// Override via `--default-min-p 0.0` if a deployment specifically
+    /// needs to disable.
+    #[arg(long, default_value_t = 0.08)]
     pub default_min_p: f32,
 
     /// Swap space in GB for KV cache overflow to disk. When GPU blocks are

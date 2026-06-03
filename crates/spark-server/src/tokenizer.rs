@@ -234,4 +234,115 @@ mod tests {
             "not valid json {"
         );
     }
+
+    /// Regression: Gemma-4's bundled template calls `text.split('<channel|>')`
+    /// inside its `strip_thinking` macro. minijinja has no `.split()` *method*
+    /// on strings, so before the unknown-method bridge every assistant
+    /// (model-role) turn raised `string has no method named split` and the
+    /// whole chat request 400'd. A null-content tool message is part of the
+    /// same conversation shape (coherence test "null content / tool role").
+    #[test]
+    fn render_gemma4_template_with_assistant_and_null_tool_content() {
+        let template_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../jinja-templates/gemma4.jinja"
+        );
+        let raw = std::fs::read_to_string(template_path)
+            .expect("bundled gemma4.jinja must be present in the repo");
+        let converted = super::jinja_helpers::convert_python_jinja_to_minijinja(&raw);
+        let env = super::jinja_helpers::build_jinja_env(&converted).expect("template compiles");
+        let tmpl = env.get_template("chat").unwrap();
+        // The exact shape of the "null content / tool role" coherence case:
+        // an assistant turn (exercises strip_thinking → .split) plus a
+        // tool-role message whose content is null.
+        let messages = vec![
+            json!({"role": "user", "content": "What time is it?"}),
+            json!({"role": "assistant", "content": "I'll check."}),
+            json!({"role": "tool", "content": null}),
+            json!({"role": "user", "content": "Thanks."}),
+        ];
+        let messages_val = minijinja::Value::from_serialize(&messages);
+        let ctx = minijinja::context! {
+            messages => messages_val,
+            tools => minijinja::Value::UNDEFINED,
+            add_generation_prompt => true,
+            enable_thinking => false,
+            bos_token => "<bos>",
+        };
+        let rendered = tmpl
+            .render(ctx)
+            .expect("Gemma-4 template must render assistant + null-content tool message");
+        // The assistant content survived strip_thinking's .split() round-trip.
+        assert!(
+            rendered.contains("I'll check."),
+            "expected assistant content in render: {rendered}"
+        );
+    }
+
+    /// Byte-match guard: the `{{ tool | tojson }}` filter used by the
+    /// `<tools>` block in jinja-templates/openai/qwen3_5_moe.jinja must
+    /// produce EXACTLY what transformers' jinja2 `tojson` does, which is
+    /// `json.dumps(x, ensure_ascii=False, sort_keys=False)` — spaces
+    /// after `:`/`,` and keys in insertion/declaration order. Without
+    /// this Atlas fed the model a compact, key-sorted `<tools>` block
+    /// (~26% fewer tokens), diverging from vLLM at the first `:`.
+    ///
+    /// The fixture and expected string mirror the Python reference:
+    ///   json.dumps({"type":"function","function":{"name":"bash",
+    ///     "description":"Execute a bash command","parameters":{...}}},
+    ///     ensure_ascii=False, sort_keys=False)
+    #[test]
+    fn tojson_filter_byte_matches_python_json_dumps() {
+        // Production path step 1 (api/chat/template.rs:85):
+        // `serde_json::to_value(ToolDefinition)`. ToolDefinition's serde
+        // field order is {type, function} and FunctionDefinition's is
+        // {name, description, parameters} (tool_parser.rs:27-41), so the
+        // `to_value` output is byte-equivalent to the literal below.
+        // We build the Value directly here so the test stays in the
+        // `--lib` target (which does not re-export `tool_parser`); the
+        // filter under test is identical either way. With serde_json's
+        // `preserve_order`, this literal key order is preserved.
+        let tool_value = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Execute a bash command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The command to run"
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        });
+
+        // Production path step 2 (tokenizer/chat_impl.rs:197):
+        // minijinja::Value::from_serialize over the tool list. With
+        // minijinja's `preserve_order`, the map is an IndexMap, so key
+        // order survives into the filter.
+        let mini_val = minijinja::Value::from_serialize(&tool_value);
+
+        // Production path step 3: the `tojson` filter registered in
+        // build_jinja_env. Render via the same env the server uses.
+        let env = super::jinja_helpers::build_jinja_env("{{ tool | tojson }}")
+            .expect("inline template compiles");
+        let tmpl = env.get_template("chat").unwrap();
+        let rendered = tmpl
+            .render(minijinja::context! { tool => mini_val })
+            .expect("tojson render");
+
+        // Ground truth: Python `json.dumps(tool, ensure_ascii=False,
+        // sort_keys=False)` of the identical structure (verified with
+        // python3 against this exact fixture — len 234).
+        let expected = "{\"type\": \"function\", \"function\": {\"name\": \"bash\", \"description\": \"Execute a bash command\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\", \"description\": \"The command to run\"}}, \"required\": [\"command\"]}}}";
+
+        assert_eq!(
+            rendered, expected,
+            "\nAtlas tojson:\n{rendered}\nPython json.dumps:\n{expected}\n"
+        );
+    }
 }

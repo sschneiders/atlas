@@ -12,10 +12,8 @@ use std::sync::Arc;
 
 use crate::AppState;
 use crate::openai::ChatCompletionRequest;
-use crate::tool_parser;
 
 use super::super::compact::{compact_messages, openai_error_response};
-use super::super::failures::strip_xml_leaks_from_assistant_content;
 use super::msg_entry::MsgEntry;
 
 /// Outputs of [`render_template`]. Threaded into the streaming /
@@ -42,19 +40,9 @@ pub(super) fn render_template(
     let template_thinking = enable_thinking;
 
     // Build JSON messages with structured tool_calls for Jinja.
-    let stripper_tools: &[tool_parser::ToolDefinition] = req.tools.as_deref().unwrap_or(&[]);
     let json_messages: Vec<serde_json::Value> = messages
         .iter()
         .map(|m| {
-            let effective_content = if m.role == "assistant"
-                && m.tool_calls.as_ref().is_some_and(|tcs| !tcs.is_empty())
-                && !stripper_tools.is_empty()
-                && m.image_count == 0
-            {
-                strip_xml_leaks_from_assistant_content(&m.content, stripper_tools)
-            } else {
-                m.content.clone()
-            };
             let content_val = if m.image_count > 0 {
                 let mut items: Vec<serde_json::Value> = Vec::with_capacity(m.image_count + 1);
                 for _ in 0..m.image_count {
@@ -65,24 +53,41 @@ pub(super) fn render_template(
                 }
                 serde_json::Value::Array(items)
             } else {
-                serde_json::Value::String(effective_content)
+                serde_json::Value::String(m.content.clone())
             };
             let mut msg = serde_json::json!({"role": m.role, "content": content_val});
             if let Some(ref tcs) = m.tool_calls {
                 msg["tool_calls"] = serde_json::Value::Array(tcs.clone());
             }
+            // F1: forward historical reasoning trace to the Jinja
+            // template. The template at qwen3_5_moe.jinja:90-104
+            // reads `message.reasoning_content` and rehydrates the
+            // `<think>` block for the historical assistant turns.
+            // Without this, every historical assistant message
+            // rendered an empty `<think>\n\n</think>\n\n` wrapper
+            // (empty-think poisoning, → premature `<|im_end|>`).
+            if let Some(ref rc) = m.reasoning_content {
+                msg["reasoning_content"] = serde_json::Value::String(rc.clone());
+            }
             msg
         })
         .collect();
-    let jinja_tools: Option<Vec<serde_json::Value>> = if tools_active {
-        req.tools.as_ref().map(|ts| {
-            ts.iter()
-                .map(|t| serde_json::to_value(t).unwrap_or_default())
-                .collect()
-        })
-    } else {
-        None
-    };
+    // When TSCG is enabled the parser's `system_prompt()` has already
+    // placed the compact tool signatures into messages[0]; passing
+    // `tools` to Jinja as well would re-render the full JSON schema and
+    // defeat the compaction. Pass `None` so the template's `{% if tools
+    // %}` branch falls through — the tool-call format instructions
+    // still come from `system_prompt()`.
+    let jinja_tools: Option<Vec<serde_json::Value>> =
+        if tools_active && !crate::tscg::tscg_enabled() {
+            req.tools.as_ref().map(|ts| {
+                ts.iter()
+                    .map(|t| serde_json::to_value(t).unwrap_or_default())
+                    .collect()
+            })
+        } else {
+            None
+        };
 
     // Progressive auto-compact (DISABLED BY DEFAULT 2026-04-25 —
     // see project_no_auto_compaction memory feedback).
