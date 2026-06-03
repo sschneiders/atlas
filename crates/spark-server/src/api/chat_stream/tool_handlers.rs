@@ -84,33 +84,6 @@ pub(super) fn handle_complete_tool_call(
     if let Some(ref cwd) = ctx.cwd_for_normalize {
         tool_parser::normalize_paths(std::slice::from_mut(tc), cwd);
     }
-    // A2-AO (2026-05-26): always-on fuzzy repair against prompt vocab.
-    // Closes drift #1 (path 1-byte mutation) by substituting any field
-    // word with an unambiguous Lev≤2 match in the prompt vocabulary.
-    // Logged per-fire at info level so harness scoring can count.
-    super::super::chat::tool_retry::apply_fuzzy_repair_inplace(
-        std::slice::from_mut(tc),
-        &ctx.prompt_vocab,
-    );
-    // SC1 (2026-05-26, /loop iter 2): TOML auto-repair on write tool
-    // calls. Identical logic to chat_blocking.rs:362 — see there for
-    // rationale.
-    if tc.function.name == "write" {
-        if let Ok(serde_json::Value::Object(map)) =
-            serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
-            && let Some(path) = map.get("filePath").or_else(|| map.get("path")).and_then(|v| v.as_str())
-            && path.to_ascii_lowercase().ends_with(".toml")
-            && let Some(content) = map.get("content").and_then(|v| v.as_str())
-            && let Some(repaired) = crate::toml_repair::try_repair_toml(content)
-        {
-            let mut new_map = map.clone();
-            new_map.insert(
-                "content".to_string(),
-                serde_json::Value::String(repaired),
-            );
-            tc.function.arguments = serde_json::Value::Object(new_map).to_string();
-        }
-    }
     let validation = tool_parser::validate_single_tool_call(tc, &ctx.tool_defs_for_backfill);
     let is_soft = validation
         .as_ref()

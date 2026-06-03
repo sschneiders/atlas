@@ -181,4 +181,141 @@ fn run_pipeline_signature_is_stable() {
     // arg list, mutability, or return type fails to compile here.
     type RunPipelineFn = fn(&mut [f32], &mut ActiveSeq, &LogitsContext) -> Option<u32>;
     let _ptr: RunPipelineFn = run_pipeline;
+    // The unified per-position post-processor and the labelled driver must
+    // also keep their signatures stable — both decode paths call them.
+    type ProcessPositionFn = fn(
+        &mut [f32],
+        &mut ActiveSeq,
+        &LogitsContext,
+        &spark_runtime::sampler::SamplingParams,
+        crate::scheduler::sample_step::PositionKind,
+    ) -> Option<u32>;
+    let _pp: ProcessPositionFn = process_position_logits;
+    type RunPipelineWithPathFn =
+        fn(&mut [f32], &mut ActiveSeq, &LogitsContext, &'static str) -> Option<u32>;
+    let _rpp: RunPipelineWithPathFn = run_pipeline_with_path;
+}
+
+/// STEP 6 guard (a): `decode_logits_seq.rs` (the non-MTP path) must NOT
+/// re-grow an inline fork of the pipeline. The whole point of the
+/// unification is that BOTH decode paths route through `run_pipeline*` +
+/// `process_position_logits`. If a future change re-inlines a mask, a
+/// penalty literal, or a per-stage block into the non-MTP path, this test
+/// fails — forcing the change into the SSOT module instead.
+///
+/// We assert the source no longer contains:
+///   * `f32::NEG_INFINITY` — every hard-mask now lives in a pipeline stage.
+///   * the per-stage marker comments the inline monolith used.
+///   * an inline `SamplingParams {` penalty literal (the builder is SSOT).
+///   * the inline A4 (`MIN_REASONING_TOKENS`) and B1 (`b1_record_low_margin`)
+///     remnants and the dead `if false && low_margin_in_body` C4v1 block.
+/// And it MUST still call the unified entry point.
+#[test]
+fn non_mtp_path_has_no_inline_pipeline_fork() {
+    const SRC: &str = include_str!("../decode_logits_seq.rs");
+
+    // No hard-masks inline — they belong to the pipeline stages.
+    assert!(
+        !SRC.contains("f32::NEG_INFINITY"),
+        "decode_logits_seq.rs must not hard-mask inline; masking belongs in logit_processors stages"
+    );
+    // No inline penalty literal — `penalty_params_for` is the SSOT builder.
+    assert!(
+        !SRC.contains("repetition_penalty: a.repetition_penalty"),
+        "decode_logits_seq.rs must not inline the SamplingParams penalty literal; use penalty_params_for"
+    );
+    // No inline A4 / B1 / C4v1 remnants.
+    assert!(
+        !SRC.contains("MIN_REASONING_TOKENS"),
+        "A4 floor must live only in penalty_params_for, not inline in decode_logits_seq.rs"
+    );
+    assert!(
+        !SRC.contains("b1_record_low_margin") && !SRC.contains("low_margin_in_body"),
+        "B1 margin detector must live only in logit_processors::b1_margin, not inline"
+    );
+    assert!(
+        !SRC.contains("if false && "),
+        "the dead C4v1 `if false && low_margin_in_body` block must be deleted"
+    );
+    // No per-stage marker comments from the pre-unification monolith.
+    for marker in [
+        "Mid-word `</think>` defer",
+        "one-shot pin-to-tool-call-start",
+        "Forced-token fast-path (xgrammar Tier 3b",
+        "Apply grammar bitmask BEFORE sampling",
+    ] {
+        assert!(
+            !SRC.contains(marker),
+            "stale inline per-stage block `{marker}` still present in decode_logits_seq.rs"
+        );
+    }
+    // Positive: the non-MTP path MUST route through the unified fn.
+    assert!(
+        SRC.contains("process_position_logits"),
+        "decode_logits_seq.rs must call the unified process_position_logits"
+    );
+}
+
+/// STEP 6 guard (b): the A4 floor and B1 observer reached by the unified
+/// `process_position_logits` must stay in their SSOT homes. A4 lives in
+/// `sample_step::penalty_params_for` and applies on BOTH kinds (the
+/// intended delta: it now reaches the MTP verify path). B1 lives in
+/// `logit_processors::b1_margin` and is gated to `FinalDecode`. This test
+/// pins both so removing/relocating them is a visible CI failure, and pins
+/// that the verify path no longer carries the inline penalty/argmax fork.
+#[test]
+fn unified_fn_includes_a4_and_b1_stages() {
+    // A4 floor is in the penalty-params builder (SSOT) and unconditional on
+    // kind (reaches verify too).
+    const SAMPLE_STEP_SRC: &str = include_str!("../sample_step.rs");
+    assert!(
+        SAMPLE_STEP_SRC.contains("A4_MIN_REASONING_TOKENS")
+            && SAMPLE_STEP_SRC.contains("a.think_end_token"),
+        "A4 POST_THINK_MIN_REASONING floor must live in penalty_params_for"
+    );
+
+    // B1 observer is in its own module and is FinalDecode-gated by the
+    // unified fn.
+    const B1_SRC: &str = include_str!("b1_margin.rs");
+    assert!(
+        B1_SRC.contains("fn observe") && B1_SRC.contains("LOW_MARGIN_THRESHOLD"),
+        "B1 margin observer must live in logit_processors::b1_margin"
+    );
+    const MOD_SRC: &str = include_str!("mod.rs");
+    assert!(
+        MOD_SRC.contains("b1_margin::observe") && MOD_SRC.contains("PositionKind::FinalDecode"),
+        "process_position_logits must call B1 observe gated on FinalDecode"
+    );
+    assert!(
+        MOD_SRC.contains("force_temp_zero_enabled") && MOD_SRC.contains("apply_penalties_and_bias"),
+        "process_position_logits must own the force-temp-zero bypass and penalties+bias"
+    );
+
+    // The verify path must route through the unified fn, not its own
+    // pipeline+argmax fork.
+    const VERIFY_SRC: &str = include_str!("../verify_pipeline_helper.rs");
+    assert!(
+        VERIFY_SRC.contains("process_position_logits"),
+        "verify_pick_with_pipeline must call the unified process_position_logits"
+    );
+}
+
+/// R1 guard: the unified `process_position_logits` MUST NOT advance or roll
+/// back the grammar matcher — matcher ownership stays with the callers (the
+/// verify K-loop and `decode_logits_step` after sampling). The idempotent
+/// `fill_bitmask` inside the grammar-bitmask STAGE is fine, but the unified
+/// fn body itself must never call `accept_token` / `rollback`. We scope the
+/// check to the `process_position_logits` fn body so the (legitimate)
+/// references elsewhere in `mod.rs` docs don't trip it.
+#[test]
+fn unified_fn_does_not_advance_matcher() {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    let start = MOD_SRC
+        .find("pub fn process_position_logits")
+        .expect("process_position_logits must exist in mod.rs");
+    let body = &MOD_SRC[start..];
+    assert!(
+        !body.contains(".accept_token(") && !body.contains(".rollback("),
+        "process_position_logits must not call gs.accept_token / gs.rollback (R1: caller-owned)"
+    );
 }

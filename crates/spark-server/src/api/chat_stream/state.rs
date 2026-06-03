@@ -134,23 +134,18 @@ pub(super) struct StreamState {
     /// True iff the reasoning/`<think>` phase has finished. Starts
     /// `true` when the request did not enable thinking.
     pub(super) thinking_done: bool,
-    /// Tier 5c (2026-05-26): when `ATLAS_TOOL_RETRY=1`, tool_call SSE
-    /// chunks are BUFFERED per `oa_idx` instead of streamed in real
-    /// time. At end-of-tool-call we validate the full args; if valid we
-    /// flush the buffer to the client, otherwise we discard the buffer
-    /// and record a `pending_retry` to be handled at `handle_done`.
-    /// Empty when tool_retry is disabled.
+    /// Dead after the tool-call retry stack was removed (`tool_retry_enabled`
+    /// is now constant `false`, so chunks are always streamed in real time
+    /// and this map stays empty). Retained so the buffering helpers in
+    /// `tool_handlers.rs` still type-check.
     pub(super) buffered_tool_chunks: std::collections::HashMap<usize, Vec<String>>,
-    /// Tier 5c: when a buffered tool call fails validation, this records
-    /// the context that `handle_done` needs to fire the retry inference
-    /// (failed output tokens are pulled from `all_toks`, original prompt
-    /// tokens come from `ctx.prompt_tokens`).
+    /// Dead after the tool-call retry stack was removed; never set now that
+    /// `tool_retry_enabled` is constant `false`.
     pub(super) pending_retry: Option<PendingRetry>,
 }
 
-/// Tier 5c — accumulated state from a failed tool call's validation,
-/// passed from the per-token handler to `handle_done` so the post-stream
-/// retry can fire with the correct failed-attempt context.
+/// Carrier for the (now-removed) tool-call retry path. Never constructed
+/// anymore, but retained so `pending_retry`'s type still resolves.
 pub(super) struct PendingRetry {
     pub(super) errors_summary: String,
     pub(super) failed_idx: usize,

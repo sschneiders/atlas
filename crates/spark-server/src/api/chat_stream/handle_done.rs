@@ -9,7 +9,7 @@ use crate::openai::{ChatCompletionChunk, Usage};
 use crate::tool_parser;
 
 use super::super::sanitizer::sanitize_content_chunk;
-use super::super::stream_guards::{bump_f12_tool_call_count, flush_content_sanitizer};
+use super::super::stream_guards::flush_content_sanitizer;
 use super::ctx::StreamCtx;
 use super::state::StreamState;
 use super::tool_handlers::{
@@ -192,40 +192,6 @@ pub(super) fn handle_done(
         time_to_first_token_ms,
         response_tokens_per_second: tps,
     };
-
-    // ── Last-resort tool salvage ────────────────────────────────────
-    if !state.salvaged_tool_call && !state.detector.as_ref().is_some_and(|d| d.has_tool_calls()) {
-        let salvaged =
-            crate::tool_salvage::salvage(&state.refusal_scan_buf, &ctx.tool_defs_for_backfill);
-        for (idx, tc) in salvaged.iter().enumerate() {
-            tracing::warn!(
-                tool = %tc.function.name,
-                block_index = idx,
-                "tool_salvage: emitting synthetic tool_call from prose",
-            );
-            bump_f12_tool_call_count(
-                &mut state.tool_calls_emitted_count,
-                ctx.max_tool_calls_per_response,
-                &mut state.stop_string_triggered,
-            );
-            let start = ChatCompletionChunk::tool_call_start_chunk(&ctx.model, &ctx.id, tc, idx);
-            sse_events.push(Ok(
-                Event::default().data(serde_json::to_string(&start).unwrap_or_default())
-            ));
-            let frag = ChatCompletionChunk::tool_call_args_fragment(
-                &ctx.model,
-                &ctx.id,
-                idx,
-                &tc.function.arguments,
-            );
-            sse_events.push(Ok(
-                Event::default().data(serde_json::to_string(&frag).unwrap_or_default())
-            ));
-        }
-        if !salvaged.is_empty() {
-            state.salvaged_tool_call = true;
-        }
-    }
 
     let fr = if state.tool_loop_capped {
         // A tool-call loop guard (Bug-2 name-run cap, F11 within-dedup,

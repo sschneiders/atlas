@@ -305,15 +305,9 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         Some(std::path::Path::new(".")), // repo root for override templates
     )?;
 
-    // WS1 (2026-05-26): scan vocab for whitespace-only tokens. Hot
-    // paths in scheduler use the result instead of the historical
-    // 5-token literal mask (which covered only 5 of ~440 in Qwen3.6).
-    crate::whitespace_mask::init(tokenizer.inner());
-
-    // AM1 (2026-05-26): register known FP8 drift attractor tokens
-    // (drift catalog #7 — the `lean://` prefix attractor). The
-    // scheduler biases these tokens down at param-body position 0.
-    crate::attractor_mask::init(tokenizer.inner());
+    // (AM1 attractor-mask registration removed 2026-06-03 — see
+    // decode_logits_seq.rs / compile_tools.rs; `lean` was an Atlas-only
+    // decode artifact, now fixed at the grammar `first_char` rule.)
 
     // Tokenizer-derived runtime: vocab cap, reasoning parser, think tokens,
     // im_start hard-stop, tool-call open/close tokens, and the XGrammar

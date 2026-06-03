@@ -51,7 +51,13 @@ pub fn step_mtp(
         // non-MTP path applies — the root-cause fix for repetition_penalty /
         // dry_multiplier never reaching MTP-emitted tokens. Cloned before the
         // mutable `grammar_state` borrow to satisfy the borrow checker.
-        let penalties = crate::scheduler::sample_step::penalty_params_for(a);
+        let penalties = crate::scheduler::sample_step::penalty_params_for(
+            a,
+            crate::scheduler::sample_step::PositionKind::Verify,
+            0.0,
+            None,
+            Vec::new(),
+        );
         let history = a.output_tokens.clone();
         let tok = match sample_token_with_grammar(
             model,

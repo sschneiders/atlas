@@ -4,31 +4,101 @@
 
 use super::*;
 
-/// Build the penalty/bias-carrying [`SamplingParams`] for one sequence,
-/// mirroring the non-MTP `decode_logits_seq::process_seq_logits` site so
-/// the MTP bootstrap + verify paths apply the SAME penalties the non-MTP
-/// path does (the root-cause fix for repetition_penalty/dry never reaching
-/// MTP-emitted tokens).
+/// Which decode position a [`penalty_params_for`] /
+/// [`crate::scheduler::logit_processors::process_position_logits`] call is
+/// building for. The single discriminant that distinguishes the non-MTP
+/// final-decode site (`decode_logits_seq::process_seq_logits`) from the MTP
+/// verify / bootstrap sites — replacing the two divergent inline
+/// `SamplingParams { .. }` literals (and the two divergent stage blocks)
+/// with one SSOT.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum PositionKind {
+    FinalDecode,
+    Verify,
+}
+
+impl PositionKind {
+    /// AdaDec diagnostic path label — only tags the env-gated
+    /// `ATLAS_ADADEC_DIAGNOSTIC` JSONL record; never alters a transform.
+    pub(super) fn adadec_label(self) -> &'static str {
+        match self {
+            PositionKind::FinalDecode => "decode",
+            PositionKind::Verify => "verify",
+        }
+    }
+}
+
+/// Build the penalty/bias-carrying [`SamplingParams`] for one sequence —
+/// the SINGLE source of truth for the repetition / presence / frequency /
+/// LZ / DRY penalty gates + the A4 floor shared by the non-MTP decode path
+/// and the MTP bootstrap + verify paths (the root-cause fix for
+/// repetition_penalty / dry never reaching MTP-emitted tokens).
 ///
 /// SSOT: the in-tool DRY gate (`dry_multiplier` zeroed inside a tool body)
 /// and the grammar LZ gate (`lz_penalty` zeroed when a grammar is active)
-/// match `process_seq_logits` exactly. `temperature` is forced to 0.0:
-/// the MTP verify/bootstrap emission is a penalty-aware ARGMAX (greedy),
-/// so only the penalty + bias stages of `sample_with_params_*` matter.
+/// are computed once here and match the pre-unification `process_seq_logits`
+/// literal exactly.
 ///
-/// `logit_bias` is left empty here — the verify path's bias is the WS1/
-/// AM1/WS2/A4 param-body masking which is state-derived per position and
-/// is NOT replicated on the speculative path; the bootstrap path mirrors
-/// the non-MTP first-decode-token state (no param body open yet → no bias).
-pub(super) fn penalty_params_for(a: &ActiveSeq) -> SamplingParams {
+/// Position-specific inputs:
+///  * `FinalDecode` → the caller passes the effective `temperature`, the
+///    per-token `seed` and the base `logit_bias` (`ActiveSeq.logit_bias`,
+///    cloned) it computed for this step.
+///  * `Verify` → the MTP verify/bootstrap emission is a penalty-aware
+///    greedy ARGMAX, so callers pass `temperature = 0.0`, `seed = None`,
+///    empty base bias.
+pub(super) fn penalty_params_for(
+    a: &ActiveSeq,
+    kind: PositionKind,
+    temperature: f32,
+    seed: Option<u64>,
+    base_logit_bias: Vec<(u32, f32)>,
+) -> SamplingParams {
+    // `Verify` positions are a penalty-aware greedy ARGMAX, so the contract
+    // is temperature 0.0, no seed, no caller-supplied base bias. Pin it so a
+    // future caller can't silently pass stochastic params on the speculative
+    // path. The A4 floor below is appended for BOTH kinds (intended delta).
+    debug_assert!(
+        kind != PositionKind::Verify
+            || (temperature == 0.0 && seed.is_none() && base_logit_bias.is_empty()),
+        "Verify positions must pass temperature=0.0, seed=None, empty base bias"
+    );
     let in_tool = a.inside_tool_body && !a.inside_thinking;
+    let mut logit_bias = base_logit_bias;
+
+    // A4 (2026-05-26) POST_THINK_MIN_REASONING floor — moved here from the
+    // inline `process_seq_logits` block (STEP 3). Suppress the `</think>`
+    // token until at least MIN_REASONING_TOKENS thinking tokens have been
+    // emitted, closing the reasoning-collapse cascade documented in
+    // research2_probe_forensics.md (reasoning_content length decays 233→0
+    // chars over 14 assistant turns). When the model emits a vanishingly
+    // short `<think>` block, the downstream tool emission lacks planning
+    // context and drifts to phantom paths / leaked control characters.
+    //
+    // Bias is -8.0 (firm but not infinite). If `reasoning_budget` is set
+    // very small (<16) the request opted out of meaningful thinking and the
+    // floor doesn't apply.
+    //
+    // R3: A4 is appended as a `logit_bias` ENTRY (NOT a pre-penalty direct
+    // mask) so the `apply_penalties_and_bias` ordering stays byte-identical
+    // on the non-MTP path. INTENDED DELTA: because the builder is now the
+    // SSOT for BOTH paths, A4 is ALSO active on the MTP verify path (where
+    // it was previously dead — the verify path never ran the inline floor).
+    const A4_MIN_REASONING_TOKENS: u32 = 16;
+    if a.inside_thinking
+        && a.thinking_tokens < A4_MIN_REASONING_TOKENS
+        && a.thinking_budget.unwrap_or(A4_MIN_REASONING_TOKENS) >= A4_MIN_REASONING_TOKENS
+        && let Some(end_tok) = a.think_end_token
+    {
+        logit_bias.push((end_tok, -8.0f32));
+    }
+
     SamplingParams {
-        temperature: 0.0,
+        temperature,
         top_k: a.top_k,
         top_p: a.top_p,
         top_n_sigma: a.top_n_sigma,
         min_p: a.min_p,
-        logit_bias: Vec::new(),
+        logit_bias,
         // A1: full penalty INSIDE tool body too (stops attractor patterns:
         // mismatched-paren runaway, `lean://` prefix loop, same-tool-call
         // repetition). Matches `process_seq_logits`.
@@ -49,7 +119,7 @@ pub(super) fn penalty_params_for(a: &ActiveSeq) -> SamplingParams {
         dry_sequence_breakers: a.dry_sequence_breakers.clone(),
         max_tokens: 0,
         stop_token_ids: Vec::new(),
-        seed: None,
+        seed,
     }
 }
 

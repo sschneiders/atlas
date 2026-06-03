@@ -38,8 +38,12 @@
 //! also downstream.
 
 use crate::scheduler::ActiveSeq;
+use crate::scheduler::decode_logits_seq::force_temp_zero_enabled;
+use crate::scheduler::sample_step::PositionKind;
+use spark_runtime::sampler::{SamplingParams, apply_penalties_and_bias};
 
 pub mod adadec_diag;
+mod b1_margin;
 pub mod f2_confidence;
 pub mod forced_think_end;
 pub mod forced_token;
@@ -102,12 +106,33 @@ pub trait LogitsProcessor: Send + Sync {
 /// Run the canonical pipeline. Returns `Some(token)` when any stage
 /// short-circuited via [`ProcessorOutcome::EmitToken`]; `None`
 /// otherwise (caller proceeds to sampling).
+///
+/// The post-pipeline AdaDec diagnostic is logged with the `"verify"`
+/// path label (this is the MTP/verify entry point). The non-MTP decode
+/// path uses [`run_pipeline_with_path`] with `"decode"` so its
+/// `ATLAS_ADADEC_DIAGNOSTIC` records keep their pre-unification label.
 pub fn run_pipeline(
     logits: &mut [f32],
     seq: &mut ActiveSeq,
     ctx: &LogitsContext,
 ) -> Option<u32> {
-    let stages: [&dyn LogitsProcessor; 9] = [
+    run_pipeline_with_path(logits, seq, ctx, "verify")
+}
+
+/// Canonical pipeline driver with an explicit AdaDec diagnostic path
+/// label. SSOT for the per-stage transform order: both the non-MTP
+/// decode path (`decode_logits_seq::process_seq_logits`, label
+/// `"decode"`) and the MTP verify path (`run_pipeline`, label
+/// `"verify"`) route through this one function. `path` only tags the
+/// env-gated `ATLAS_ADADEC_DIAGNOSTIC` JSONL record — it never alters
+/// any logit transform.
+pub fn run_pipeline_with_path(
+    logits: &mut [f32],
+    seq: &mut ActiveSeq,
+    ctx: &LogitsContext,
+    path: &'static str,
+) -> Option<u32> {
+    let stages: [&dyn LogitsProcessor; 8] = [
         &f2_confidence::F2ConfidenceEarlyStop,
         &mid_word::MidWordThinkEndMask,
         &post_close::PostCloseThinkMask,
@@ -116,10 +141,6 @@ pub fn run_pipeline(
         &pin_tool_call::PinToToolCallStart,
         &forced_token::ForcedTokenFastPath,
         &grammar_bitmask::GrammarBitmaskApply,
-        // AdaDec Phase 1 diagnostic — observes the post-grammar-bitmask
-        // distribution, never mutates. No-op when ATLAS_ADADEC_DIAGNOSTIC
-        // env var is unset.
-        &adadec_diag::AdaDecDiagnostic,
     ];
     for stage in stages.iter() {
         match stage.apply(logits, seq, ctx) {
@@ -127,5 +148,81 @@ pub fn run_pipeline(
             ProcessorOutcome::EmitToken(tok) => return Some(tok),
         }
     }
+    // AdaDec Phase 1 diagnostic — observes the post-grammar-bitmask
+    // distribution, never mutates. No-op when ATLAS_ADADEC_DIAGNOSTIC is
+    // unset. Called directly (not as a pipeline stage) so the caller's
+    // path label is preserved byte-identically across both decode paths.
+    adadec_diag::log_step(logits, seq, path);
+    None
+}
+
+/// Unified per-position logit post-processing — the SINGLE function both
+/// the non-MTP final-decode path (`decode_logits_seq::process_seq_logits`)
+/// and the MTP verify path (`verify_pipeline_helper::verify_pick_with_pipeline`)
+/// call. Replaces the two divergent inline blocks.
+///
+/// Stages, in order:
+///  1. **ATLAS_FORCE_TEMP_ZERO bypass** (eligible on BOTH kinds): when the
+///     diagnostic flag is set, return the raw-logit argmax with no pipeline,
+///     no penalties, no bias — matching vLLM at temperature 0 for
+///     apples-to-apples layer-cosine comparison. Returned as the emitted
+///     token (`Some`).
+///  2. **`run_pipeline`** (the 8 masking stages + AdaDec diagnostic). A
+///     `Some(tok)` return is the forced-token fast-path short-circuit; the
+///     caller emits it directly.
+///  3. **B1 margin observer** — `FinalDecode` only (risk R6): observes the
+///     post-mask top-1/top-2 gap. Pure observability, never mutates.
+///  4. **`apply_penalties_and_bias`** — the repetition / presence /
+///     frequency / LZ / DRY penalties + logit_bias (incl. the A4 floor)
+///     carried in `penalties`, applied with the seq's token history.
+///
+/// Returns `Some(token)` ONLY for the force-temp-zero bypass or the
+/// forced-token fast-path (caller emits directly, no argmax/sample). On
+/// `None` the caller samples / argmaxes the now-masked-and-penalised
+/// `logits`.
+///
+/// **R1 (matcher ownership):** this fn NEVER calls `gs.accept_token` /
+/// `gs.rollback`. Matcher advancement stays caller-owned — the K-loop in
+/// the verify path and `decode_logits_step` after sampling for the non-MTP
+/// path. The idempotent `gs.fill_bitmask()` inside `GrammarBitmaskApply`
+/// is the only grammar mutation and is safe to repeat.
+pub fn process_position_logits(
+    logits: &mut [f32],
+    seq: &mut ActiveSeq,
+    ctx: &LogitsContext,
+    penalties: &SamplingParams,
+    kind: PositionKind,
+) -> Option<u32> {
+    // 1. ATLAS_FORCE_TEMP_ZERO: pure argmax on raw logits — no pipeline, no
+    //    penalties, no bias. Eligible on both kinds (the diagnostic's point
+    //    is an identical bypass everywhere).
+    if force_temp_zero_enabled() {
+        let mut best_idx: u32 = 0;
+        let mut best_val: f32 = f32::NEG_INFINITY;
+        for (j, &v) in logits.iter().enumerate() {
+            if v > best_val {
+                best_val = v;
+                best_idx = j as u32;
+            }
+        }
+        return Some(best_idx);
+    }
+
+    // 2. Canonical pre-sample pipeline (+ AdaDec diagnostic under this
+    //    position's path label). Short-circuit returns the forced token.
+    if let Some(forced) = run_pipeline_with_path(logits, seq, ctx, kind.adadec_label()) {
+        return Some(forced);
+    }
+
+    // 3. B1 margin observer — FINAL decode position only (risk R6). Reads
+    //    the post-mask distribution; never mutates.
+    if kind == PositionKind::FinalDecode {
+        b1_margin::observe(logits, seq);
+    }
+
+    // 4. Penalties + bias (incl. A4) on the now-masked logits, using the
+    //    seq's output-token history — the SSOT stage shared by both paths.
+    apply_penalties_and_bias(logits, penalties, &seq.output_tokens);
+
     None
 }

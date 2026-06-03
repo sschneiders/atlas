@@ -82,8 +82,17 @@ pub struct SequenceState {
     /// Per-sequence state for speculative decoding proposer (None if no proposer).
     pub proposer_state: Option<Box<dyn ProposerState>>,
     /// SSM state pool slot index. Used for CUDA graph stability — all sequences
-    /// at the same slot_idx use the same fixed GPU addresses.
+    /// at the same slot_idx use the same fixed GPU addresses. Derived from
+    /// `ssm_slot` at claim time (the guard is the authority on release
+    /// responsibility; this index is the authority on pool-offset math).
     pub slot_idx: usize,
+    /// RAII guard that returns `slot_idx` to the SSM pool's free list on drop.
+    /// Guarantees the slot is released on EVERY sequence-exit path — including
+    /// abort/cancel, decode error, swap-out failure, and panic/unwind — not
+    /// just the explicit `free_sequence`/`compact_sequence` sites, which
+    /// `take()`/`migrate()` the guard so the release happens EXACTLY once.
+    /// `None` for models without an SSM pool (e.g. the unit-test mock).
+    pub(crate) ssm_slot: Option<crate::model::ssm_pool::SlotGuard>,
     /// Marconi: token position up to which SSM state is valid from a snapshot.
     /// Set on chunk 0's prefix cache lookup, read by subsequent chunks to skip
     /// computation for tokens already covered by the snapshot + KV cache.

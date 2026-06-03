@@ -299,6 +299,9 @@ impl Model for TransformerModel {
     fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<()> {
         self.compact_sequence_dispatch(seq, new_slot)
     }
+    fn detach_slot_for_reuse(&self, seq: &mut SequenceState) {
+        self.detach_slot_for_reuse_dispatch(seq)
+    }
     fn save_sequence_state(
         &self,
         seq: &SequenceState,

@@ -119,12 +119,33 @@ fn xml_param_value_body_ebnf(value_close: &str) -> String {
     } else {
         "rest ::= rest_part*".to_string()
     };
+    // Content-start rule: allow a leading whitespace run (INCLUDING `\n`),
+    // then REQUIRE at least one non-whitespace char that is NOT `<`, `=`, or
+    // `>` before the rest. Two distinct boundary bugs are closed here:
+    //  - `<` exclusion + the `leading_ws*` split: the old `[^ \t\r\n<]`
+    //    masked the model's genuine top-1 at content-start (a leading `\n`)
+    //    and — under FP8 long-ctx drift — forced the argmax onto a wrong
+    //    identifier runner-up (`lean`/`cargo`). The split unmasks `\n` while
+    //    keeping the non-empty guard.
+    //  - `=`/`>` exclusion (2026-06-03, diag agent acb6cb1): the param key
+    //    closes with `>` and the tokenizer has ~198 `>X` MERGE tokens
+    //    (`>=`=9628, `>>`, …). At the `<parameter=KEY>`→value boundary the
+    //    model can emit the merged token `>=` (id 9628) — the `>` satisfies
+    //    the `">"` literal and the glued `=` lands as the value's first char,
+    //    producing `=axum::serve(...)` (the phantom-`=` that broke `edit`
+    //    oldString matches and stalled the agent). Excluding `=`/`>` from
+    //    `first_content` makes xgrammar's mask REJECT token 9628 at the
+    //    boundary, forcing a standalone `>` (id 29) + a real content token.
+    //    Legit `>a`/`>{`/`>"` merges stay legal (2nd byte passes); only a
+    //    value that genuinely starts with `=`/`>` is disallowed (rare for
+    //    code/TOML edit args). Parser is innocent; this is NOT numerics.
     format!(
         r#"root ::= param ("\n" param)*
 param ::= "<parameter=" paramname ">" value "{value_close}"
 paramname ::= [a-zA-Z_] [a-zA-Z_0-9]*
-value ::= first_char rest
-first_char ::= [^ \t\r\n<]
+value ::= leading_ws first_content rest
+leading_ws ::= [ \t\r\n]*
+first_content ::= [^ \t\r\n<=>]
 {rest_rule}
 rest_part ::= {ladder}
 "#

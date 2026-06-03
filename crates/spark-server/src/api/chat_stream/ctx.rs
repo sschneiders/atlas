@@ -19,24 +19,15 @@ pub(super) struct StreamCtx {
     pub(super) tool_defs_for_backfill: Vec<tool_parser::ToolDefinition>,
     pub(super) cwd_for_normalize: Option<String>,
     pub(super) stop_strings: Vec<String>,
-    /// Tier 5c (2026-05-26): original-request context needed by
-    /// `handle_done` to fire the post-stream retry. `tool_retry_enabled`
-    /// is cached from `ATLAS_TOOL_RETRY` at request setup (avoid the
-    /// env-var lookup per token); `prompt_tokens` is the rendered chat
-    /// prompt (used as the base for the retry prompt); `grammar_spec`
-    /// keeps the retry under the same xgrammar tag constraints as the
-    /// original generation.
+    /// Now-constant `false`: the tool-call retry/repair stack was removed.
+    /// Retained so the streaming chunk buffering helpers in
+    /// `tool_handlers.rs` still type-check; the buffering branches are dead.
     pub(super) tool_retry_enabled: bool,
-    /// Arc-wrapped so the per-event closure + spawned retry task can
-    /// share the read-only token slice without duplicating ~40 KB of
-    /// `Vec<u32>` on every refresh. `attempt_tool_retry` takes `&[u32]`
-    /// so deref-coercion through Arc → Vec → slice is free at the call
-    /// site.
+    /// Rendered chat prompt tokens, Arc-shared to avoid duplicating the
+    /// ~40 KB `Vec<u32>`. Currently unused after the retry stack removal.
     pub(super) prompt_tokens: Arc<Vec<u32>>,
-    /// A2-AO (2026-05-26, /loop iter 1): cached prompt vocabulary
-    /// (~identifiers from the rendered chat prompt) for always-on
-    /// fuzzy repair in `handle_tool_call_delta`. Computed once per
-    /// request from the decoded prompt tokens; cheap reads per call.
+    /// Now an empty set after the fuzzy-repair stack was removed. Retained
+    /// so `tool_handlers.rs` field accesses still type-check.
     pub(super) prompt_vocab: Arc<HashSet<String>>,
     pub(super) grammar_spec: Option<crate::api::inference_types::GrammarSpec>,
     pub(super) max_tokens: usize,

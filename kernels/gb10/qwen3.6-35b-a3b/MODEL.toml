@@ -89,6 +89,12 @@ effective_context = 24576
 # tool arguments — runaway repetition attractor that DRY catches.
 # Phase-1's MODEL.toml had these penalties across the board and shipped
 # clean opencode sessions; matching that exactly.
+# 2026-06-03: dry_multiplier 0.5->0.0 in ALL presets. With rep_penalty
+# now 1.0 (not 0) the filename-runaway DRY guarded against may no longer
+# occur; zeroing dry ALSO unlocks the on-GPU fast-greedy path (gated on
+# rep==1.0 && dry==0.0), removing the per-verify-token blocking D2H + host
+# argmax. PENDING VALIDATION: confirm the verbatim filename-runaway
+# (`Cargo.toml.new.tmp...`) does NOT return at rep=1.0 before shipping.
 [sampling.thinking_text]
 temperature = 0.6
 top_p = 0.95
@@ -96,7 +102,7 @@ top_k = 20
 presence_penalty = 0.0
 frequency_penalty = 0.0
 repetition_penalty = 1.0
-dry_multiplier = 0.5
+dry_multiplier = 0.0
 
 [sampling.thinking_coding]
 temperature = 0.6
@@ -108,11 +114,11 @@ frequency_penalty = 0.0
 # 256-tok window suppresses the MOST recurrent code tokens (newline id198, `::` id476)
 # and FLIPS low-margin greedy picks -> collapsed-newline/`::`-split/wander/runaway.
 # Proven temp=0 A/B: 1.1=mangled TOML finish=length; 1.0=clean newlined code finish=stop.
-# vLLM serves penalty-free greedy. dry_multiplier kept (catches verbatim filename runaway,
-# the documented reason the earlier full removal was reverted). Atlas-vs-BF16 cosine 0.995
-# > vLLM 0.985 => NOT a precision floor.
+# vLLM serves penalty-free greedy. dry_multiplier 0.5->0.0 2026-06-03 (was kept to catch
+# verbatim filename runaway; re-validating at rep=1.0 — see top-of-section note). Atlas-vs-BF16
+# cosine 0.995 > vLLM 0.985 => NOT a precision floor.
 repetition_penalty = 1.0
-dry_multiplier = 0.5
+dry_multiplier = 0.0
 
 [sampling.non_thinking]
 temperature = 0.7
@@ -121,7 +127,7 @@ top_k = 20
 presence_penalty = 0.0
 frequency_penalty = 0.0
 repetition_penalty = 1.0
-dry_multiplier = 0.5
+dry_multiplier = 0.0
 
 # Tool-calling preset: Qwen team recommends temperature=0.6 for coding tasks.
 # Greedy (0.0) causes self-reinforcement repetition loops at long context.
@@ -131,9 +137,9 @@ top_p = 0.95
 top_k = 20
 presence_penalty = 0.0
 frequency_penalty = 0.0
-# 2026-06-03: rep_penalty 1.1->1.0 (see [sampling.thinking_coding] note). dry kept.
+# 2026-06-03: rep_penalty 1.1->1.0 + dry_multiplier 0.5->0.0 (see [sampling.thinking_coding] note).
 repetition_penalty = 1.0
-dry_multiplier = 0.5
+dry_multiplier = 0.0
 
 # Model-specific behavior overrides. These control server-side hacks that
 # compensate for model quirks. Defaults are sane for most models; override

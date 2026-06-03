@@ -75,6 +75,18 @@ pub fn process_decode_logits(
                 }
                 return;
             }
+            // SSOT: build the same `LogitsContext` the verify path passes
+            // into `run_pipeline`, so `process_seq_logits` and the MTP
+            // verify path share one pipeline-stage signature instead of
+            // two divergent arg lists. `think_start_token` lives on the
+            // per-seq `ActiveSeq` (read inside the pipeline stages), so it
+            // is intentionally not carried in the context.
+            let ctx = crate::scheduler::logit_processors::LogitsContext {
+                think_end_token,
+                think_start_token,
+                tool_call_start_token,
+                tool_call_end_token,
+            };
             active
                 .iter_mut()
                 .enumerate()
@@ -87,10 +99,7 @@ pub fn process_decode_logits(
                         vocab_size,
                         elem_bytes,
                         logits_fp32,
-                        think_end_token,
-                        think_start_token,
-                        tool_call_start_token,
-                        tool_call_end_token,
+                        &ctx,
                         adaptive_sampling,
                     )
                 })
@@ -397,9 +406,8 @@ pub fn process_decode_logits(
             // SM1 (2026-05-26): drive the tool-body / parameter-body
             // state machine from the non-spec decode path. Previously
             // only spec/verify paths called this (via emit_token),
-            // leaving every dependent gate (close-tag mask, WS1 pos-0
-            // mask, WS2, AM1, B1, A1) silently dead under
-            // `mtp=false`.
+            // leaving every dependent gate (close-tag mask, AM1, B1,
+            // A1) silently dead under `mtp=false`.
             crate::scheduler::emit_step::update_tool_param_state(a, tok);
             // Phase-C: if this committed token is a content-phase
             // boundary token (sentence end / newline) and the model is

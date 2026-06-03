@@ -148,6 +148,7 @@ impl Model for MockModel {
             layer_states: Vec::new(),
             proposer_state: None,
             slot_idx: 0,
+            ssm_slot: None,
             marconi_skip_to: 0,
             marconi_exact_snap: None,
             session_hash: 0,
@@ -241,6 +242,14 @@ impl Model for MockModel {
     fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<()> {
         seq.slot_idx = new_slot;
         Ok(())
+    }
+
+    fn detach_slot_for_reuse(&self, seq: &mut SequenceState) {
+        // Mock has no SSM pool/guard; mirror the production sentinel only.
+        if let Some(g) = seq.ssm_slot.as_mut() {
+            let _ = g.take();
+        }
+        seq.slot_idx = usize::MAX;
     }
 
     fn decode_verify_graphed(

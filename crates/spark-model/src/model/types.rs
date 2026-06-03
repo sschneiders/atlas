@@ -69,7 +69,12 @@ pub struct TransformerModel {
     /// Cached CUDA graphs for batched decode, keyed by padded batch size.
     pub(super) batch_decode_graphs: Mutex<HashMap<usize, GraphHandle>>,
     /// Pre-allocated SSM state pool for stable GPU addresses across graph replays.
-    pub(super) ssm_pool: SsmStatePool,
+    /// `Arc` so each `SequenceState` can hold a `SlotGuard` that releases its
+    /// claimed slot on drop — guaranteeing the slot returns to the free list on
+    /// EVERY sequence-exit path (normal finish, abort, error, swap-out failure,
+    /// panic/unwind), not just the explicit `free_sequence`/`compact_sequence`
+    /// sites. See `SsmStatePool::claim_guarded` / `SlotGuard`.
+    pub(super) ssm_pool: Arc<SsmStatePool>,
     /// SSM state snapshot pool for Marconi prefix caching.
     pub(super) ssm_snapshots: SsmSnapshotPool,
     /// Fixed max blocks per sequence (max_seq_len / block_size + 1).

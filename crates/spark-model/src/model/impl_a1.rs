@@ -127,13 +127,13 @@ impl TransformerModel {
         } else {
             0
         };
-        let ssm_pool = SsmStatePool::new(
+        let ssm_pool = std::sync::Arc::new(SsmStatePool::new(
             &config,
             max_batch_size,
             has_mtp,
             num_intermediates,
             gpu.as_ref(),
-        )?;
+        )?);
 
         // SSM snapshot pool: Marconi prefix-cache slots + Phase-C
         // decode-rollback ring. The decode-rollback region is only sized

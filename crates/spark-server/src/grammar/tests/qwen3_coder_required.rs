@@ -80,12 +80,21 @@ fn qwen3_coder_grammar_accepts_canonical_xml_body() {
     );
 }
 
-/// The legacy JSON body shape is still accepted by `any_text` — the
-/// parser's JSON fallback at `parse_single_b.rs:137-148` keeps
-/// JSON-shaped tool calls working. Pins that the grammar loosening
-/// did not narrow either supported shape.
+/// 2026-06-03: the qwen3_coder grammar intentionally enforces NATIVE XML
+/// `<parameter=KEY>VALUE</parameter>` bodies and REJECTS a JSON-shaped body
+/// (`<function=exec>{...}</function>`). The 2026-06-02 change
+/// (compile_tools.rs:407) reverted an `any_text`/loose-body trial back to
+/// the strict value EBNF *precisely because* the loose body let the model
+/// freelance/ramble to finish=length — the runaway we are fighting.
+/// Qwen3.6 emits native XML; MiniMax has its own grammar
+/// (`compile_minimax_xml_tool_grammar`, also XML `<parameter name=>`, not
+/// JSON). The JSON-shaped body remains supported by the PARSER fallback
+/// (`parse_single_b.rs`) only when the grammar is disabled
+/// (`--disable-tool-grammar`) — never by this grammar. (Was previously
+/// `qwen3_coder_grammar_accepts_legacy_json_body`, an obsolete "supports
+/// both shapes" contract superseded by the freelance fix.)
 #[test]
-fn qwen3_coder_grammar_accepts_legacy_json_body() {
+fn qwen3_coder_grammar_rejects_json_body_enforces_xml() {
     let vocab = test_vocab();
     let stop_ids = vec![130i32];
     let mut engine = GrammarEngine::new(&vocab, &stop_ids).unwrap();
@@ -97,8 +106,9 @@ fn qwen3_coder_grammar_accepts_legacy_json_body() {
     let json_body =
         "<tool_call>\n<function=exec>\n{\"command\": \"ls /tmp\"}\n</function>\n</tool_call>";
     assert!(
-        grammar_accepts(&compiled, json_body),
-        "legacy JSON-shaped body must still be accepted; input: {json_body:?}"
+        !grammar_accepts(&compiled, json_body),
+        "grammar must enforce native XML <parameter=>; the JSON body is parser-fallback \
+         (grammar-off) only. input: {json_body:?}"
     );
 }
 
@@ -183,5 +193,54 @@ fn qwen3_coder_grammar_rejects_whitespace_only_parameter_body() {
     assert!(
         !grammar_accepts(&compiled, whitespace_body),
         "whitespace-only parameter body must be REJECTED. Input: {whitespace_body:?}"
+    );
+}
+
+/// 2026-06-03: the content-start rule now ACCEPTS a leading newline before
+/// real content (the model's genuine top-1 at the start of a write body).
+/// The prior `first_char ::= [^ \t\r\n<]` masked `\n`, forcing the argmax
+/// onto a drift runner-up (`lean`/`cargo`) under FP8 long-context. The
+/// `leading_ws* first_content rest` rule permits the newline while still
+/// requiring at least one real (non-ws) char (see the two reject tests).
+#[test]
+fn qwen3_coder_grammar_accepts_leading_newline_content() {
+    let vocab = test_vocab();
+    let stop_ids = vec![130i32];
+    let mut engine = GrammarEngine::new(&vocab, &stop_ids).unwrap();
+    let tools = exec_tool_def();
+    let compiled = engine
+        .compile_qwen3_coder_tool_grammar(&tools, true, "</parameter>")
+        .expect("compile must succeed");
+
+    let leading_nl =
+        "<tool_call>\n<function=exec>\n<parameter=command>\nls /tmp</parameter>\n</function>\n</tool_call>";
+    assert!(
+        grammar_accepts(&compiled, leading_nl),
+        "a leading newline before real content must be ACCEPTED. Input: {leading_nl:?}"
+    );
+}
+
+/// 2026-06-03 (diag agent acb6cb1): the param key closes with `>` and the
+/// tokenizer fuses it with the value's first byte into a single `>X` merge
+/// token (`>=`=id 9628). At the boundary the model can emit `>=`, depositing
+/// a phantom `=` as the value's first char (`=axum::serve(...)`) — which
+/// broke `edit` oldString matches and stalled the agent. `first_content`
+/// now excludes `=`/`>`, so a value STARTING with `=` (the `>=`-merge
+/// symptom) must be REJECTED by the grammar, forcing a clean `>`+content.
+#[test]
+fn qwen3_coder_grammar_rejects_eq_value_start() {
+    let vocab = test_vocab();
+    let stop_ids = vec![130i32];
+    let mut engine = GrammarEngine::new(&vocab, &stop_ids).unwrap();
+    let tools = exec_tool_def();
+    let compiled = engine
+        .compile_qwen3_coder_tool_grammar(&tools, true, "</parameter>")
+        .expect("compile must succeed");
+
+    let eq_start =
+        "<tool_call>\n<function=exec>\n<parameter=command>=ls /tmp</parameter>\n</function>\n</tool_call>";
+    assert!(
+        !grammar_accepts(&compiled, eq_start),
+        "a value starting with `=` (the `>=`-merge artifact) must be REJECTED. Input: {eq_start:?}"
     );
 }

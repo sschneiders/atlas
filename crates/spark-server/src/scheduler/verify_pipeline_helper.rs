@@ -53,9 +53,8 @@
 use crate::scheduler::ActiveSeq;
 use crate::scheduler::decode_logits_seq::force_temp_zero_enabled;
 use crate::scheduler::helpers::bf16_to_f32;
-use crate::scheduler::logit_processors::{LogitsContext, run_pipeline};
+use crate::scheduler::logit_processors::LogitsContext;
 use spark_model::traits::Model;
-use spark_runtime::sampler::apply_penalties_and_bias;
 
 /// Kill-switch for the on-GPU greedy-under-grammar verify fast path (#3).
 /// Default ON; set `ATLAS_DISABLE_FAST_GREEDY=1` to force the full host
@@ -109,31 +108,44 @@ pub fn verify_pick_with_pipeline(
             .collect()
     };
 
-    // 2. Run the canonical pipeline. Short-circuit returns the forced
-    //    token directly — no argmax scan needed.
-    if let Some(forced) = run_pipeline(&mut f32_logits, a, ctx) {
-        return forced;
+    // 2. Build this position's penalty/bias params (Verify kind: greedy,
+    //    seed-free, no caller bias — the builder still appends the A4 floor
+    //    and the rep/presence/freq/LZ/DRY gates from `a`). Cloned before the
+    //    `&mut a` borrow in `process_position_logits`.
+    //
+    //    Without these penalties MTP-VERIFIED tokens were decided by a
+    //    penalty-FREE argmax, so the MODEL.toml `repetition_penalty` /
+    //    `dry_multiplier` never reached the dominant decode path and the
+    //    model degenerated into repeated tool-call argument junk. The
+    //    resulting emission is a penalty-aware ARGMAX (greedy) — an intended
+    //    behavioral delta for speculative acceptance. Backward-compatible: a
+    //    no-op when the penalties are neutral (rep==1.0, dry==0.0, etc.).
+    let penalties = crate::scheduler::sample_step::penalty_params_for(
+        a,
+        crate::scheduler::sample_step::PositionKind::Verify,
+        0.0,
+        None,
+        Vec::new(),
+    );
+
+    // 3. Unified per-position post-processing (SSOT shared with the non-MTP
+    //    path): force-temp-zero bypass → pipeline (forced-token short
+    //    circuit) → penalties+bias. A `Some(tok)` return is the forced /
+    //    bypass token — emit directly, no argmax scan. R1: this does NOT
+    //    advance the grammar matcher; the K-loop in
+    //    `verify_pick_all_with_pipeline` owns `accept_token` / `rollback`.
+    if let Some(tok) = crate::scheduler::logit_processors::process_position_logits(
+        &mut f32_logits,
+        a,
+        ctx,
+        &penalties,
+        crate::scheduler::sample_step::PositionKind::Verify,
+    ) {
+        return tok;
     }
 
-    // 2b. Apply the sequence's configured penalties (repetition /
-    //     presence / frequency / LZ / DRY) + logit bias on the
-    //     now-masked logits, using the seq's output-token history —
-    //     the SAME SSOT stage the non-MTP `process_seq_logits` path
-    //     runs before sampling. Without this, MTP-VERIFIED tokens were
-    //     decided by a penalty-FREE argmax, so the MODEL.toml
-    //     `repetition_penalty` / `dry_multiplier` never reached the
-    //     dominant decode path and the model degenerated into repeated
-    //     tool-call argument junk. The resulting emission is a
-    //     penalty-aware ARGMAX (greedy) — an intended behavioral delta
-    //     for speculative acceptance. Backward-compatible: a no-op when
-    //     the penalties are neutral (rep==1.0, dry==0.0, etc.), so
-    //     NVFP4/Gemma/Mistral presets are byte-for-byte unchanged.
-    let penalties = crate::scheduler::sample_step::penalty_params_for(a);
-    apply_penalties_and_bias(&mut f32_logits, &penalties, &a.output_tokens);
-
-    // 3. Argmax over the (now-masked) vector. `f32::partial_cmp` with
-    //    NaN-safe fallback to `Equal` matches the sampler's argmax
-    //    branch behaviour.
+    // 4. Argmax over the (now-masked-and-penalised) vector. Matches the
+    //    sampler's argmax branch behaviour.
     let mut best_id: u32 = 0;
     let mut best_val: f32 = f32::NEG_INFINITY;
     for (i, &v) in f32_logits.iter().enumerate() {

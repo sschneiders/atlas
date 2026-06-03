@@ -96,11 +96,10 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     // state was ONLY updated when `emit_token` ran — which happens from
     // spec/verify paths but NOT from `process_decode_logits`. With
     // mtp=false (Qwen3.6 baseline), the state machine never ran and
-    // every dependent gate (close-tag mask, WS1 position-0 mask, A1
-    // penalty toggle, AM1 attractor suppression, WS2 digit-context
-    // gate, B1 margin detector) was silently dead code. Live-confirmed
-    // 2026-05-26: the `ws1/am1 mask active` info log NEVER fired across
-    // a clean `write({"content":"hello world","filePath":"…"})` probe.
+    // every dependent gate (A1 rep-penalty toggle, B1 margin detector)
+    // was silently dead code. (The pos-0 close-tag/AM1 logit-bias that
+    // also depended on this state was removed 2026-06-03; the state is
+    // still required for A1/B1 and the adadec_diag dump.)
     update_tool_param_state(a, tok);
 
     // F2 mirror (Iter 46, 2026-06-02): reset the inter-tool prose budget when
@@ -461,9 +460,9 @@ pub enum StartPrefillResult {
 /// path (`decode_logits_step::process_decode_logits`) call this on
 /// every emitted token so the state machine stays in sync with
 /// `a.output_tokens`. The previous inline version was unreachable
-/// from the non-spec path, leaving the close-tag mask, WS1 position-0
-/// mask, AM1 attractor suppression, WS2 digit-context gate, B1 margin
-/// detector, and A1 penalty toggle all silently dead.
+/// from the non-spec path, leaving the close-tag mask, AM1 attractor
+/// suppression, B1 margin detector, and A1 penalty toggle all silently
+/// dead.
 ///
 /// **Slice semantics**: this function does NOT assume `tok` has been
 /// pushed onto `a.output_tokens` or that it has not. It auto-detects
@@ -479,7 +478,7 @@ pub enum StartPrefillResult {
 ///  - `a.inside_tool_body`         set on `<tool_call>`, cleared on `</tool_call>`
 ///  - `a.tool_body_streak_tokens`  ++ per body token, reset on enter/exit
 ///  - `a.inside_parameter_body`    set on `<parameter=KEY>` close `>`, cleared on `</`
-///  - `a.param_body_chars_emitted` ++ per non-whitespace body token
+///  - `a.param_body_chars_emitted` ++ per non-close body token
 ///  - `a.finished`                 forced when stuck >MAX_TOOL_BODY_TOKENS
 ///
 /// Token IDs are Qwen3.6 byte-level BPE (verified via /tokenize 2026-05-25):
@@ -525,17 +524,12 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
             a.inside_parameter_body = false;
             a.param_body_chars_emitted = 0;
         } else {
-            // WS1 (2026-05-26): vocab-scanned whitespace check. Must
-            // stay synchronized with the position-0 mask in
-            // `decode_logits_seq.rs` — any token the bias suppresses
-            // MUST NOT bump the counter or the close-tag gate would
-            // unlock one token too early.
-            let is_whitespace_token =
-                crate::whitespace_mask::is_whitespace(tok);
-            if !is_whitespace_token {
-                a.param_body_chars_emitted =
-                    a.param_body_chars_emitted.saturating_add(1);
-            }
+            // Any non-close body token advances the counter. The
+            // position-0 mask in `decode_logits_seq.rs` (close-tag +
+            // AM1 attractor) fires only while this counter is 0, so it
+            // deactivates after the first emitted body token.
+            a.param_body_chars_emitted =
+                a.param_body_chars_emitted.saturating_add(1);
         }
         return;
     }
@@ -585,5 +579,5 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
 
 // SM1 unit tests deferred: ActiveSeq has 60+ fields and no public
 // constructor; building a test instance requires more boilerplate
-// than the state machine itself. Live-verification post-deploy via
-// the "ws1/am1 mask active" INFO log is the integration test.
+// than the state machine itself. Live-verification post-deploy is via
+// the A1 rep-penalty toggle / B1 margin-detector behaviour.

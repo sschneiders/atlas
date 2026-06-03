@@ -528,38 +528,10 @@ fn process_detector_content(
             .cancel_flag
             .store(true, std::sync::atomic::Ordering::Release);
 
-        let salvaged =
-            crate::tool_salvage::salvage(&state.loop_scan_buf, &ctx.tool_defs_for_backfill);
-        let mut events: SseVec = Vec::new();
-        for (idx, tc) in salvaged.iter().enumerate() {
-            tracing::warn!(
-                tool = %tc.function.name,
-                block_index = idx,
-                "watchdog salvage: emitting synthetic tool_call",
-            );
-            bump_f12_tool_call_count(
-                &mut state.tool_calls_emitted_count,
-                ctx.max_tool_calls_per_response,
-                &mut state.stop_string_triggered,
-            );
-            let start = ChatCompletionChunk::tool_call_start_chunk(&ctx.model, &ctx.id, tc, idx);
-            events.push(Ok(
-                Event::default().data(serde_json::to_string(&start).unwrap_or_default())
-            ));
-            let frag = ChatCompletionChunk::tool_call_args_fragment(
-                &ctx.model,
-                &ctx.id,
-                idx,
-                &tc.function.arguments,
-            );
-            events.push(Ok(
-                Event::default().data(serde_json::to_string(&frag).unwrap_or_default())
-            ));
-        }
-        if !salvaged.is_empty() {
-            state.salvaged_tool_call = true;
-        }
-        return Some(events);
+        // Watchdog fired: short-circuit the stream with no further
+        // content. The model emitted a degenerate loop; we end the
+        // response here rather than salvaging a synthetic tool call.
+        return Some(SseVec::new());
     }
 
     if !sanitized.is_empty() {

@@ -167,7 +167,7 @@ pub fn handle_content_token(a: &mut ActiveSeq, model: &dyn Model) {
                     matched_period = period,
                     matched_repeats = repeats,
                     ?reason,
-                    "Content-loop watchdog fired (period-{}…{} repeat); ending response early (rollback declined). Last-resort tool_salvage will run on the post-sanitizer content via handle_done.",
+                    "Content-loop watchdog fired (period-{}…{} repeat); ending response early (rollback declined).",
                     CONTENT_LOOP_PERIOD_MIN,
                     CONTENT_LOOP_PERIOD_MAX,
                 );

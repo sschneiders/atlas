@@ -88,7 +88,16 @@ impl TransformerModel {
     }
 
     pub(super) fn alloc_sequence_dispatch(&self) -> Result<SequenceState> {
-        let slot = self.ssm_pool.claim_slot()?;
+        // Claim via the RAII guard so the slot is returned to the pool on EVERY
+        // sequence-exit path (normal finish, abort/cancel, decode error,
+        // swap-out failure, panic). The explicit `free_sequence`/
+        // `compact_sequence` paths neutralize the guard so release is
+        // exactly-once. `slot_idx` is derived from the guard (SSOT for the
+        // owned index lives in the guard until an explicit path takes it).
+        let slot_guard = self.ssm_pool.claim_guarded()?;
+        let slot = slot_guard
+            .idx()
+            .expect("claim_guarded returns a guard owning a slot");
         // Zero SSM state to prevent stale h_state/conv_state from prior
         // sequences corrupting the recurrent computation during prefill.
         // CRITICAL: use Atlas's own stream (not stream 0) because Atlas's stream
@@ -171,6 +180,7 @@ impl TransformerModel {
             layer_states,
             proposer_state,
             slot_idx: slot,
+            ssm_slot: Some(slot_guard),
             marconi_skip_to: 0,
             marconi_exact_snap: None,
             session_hash: 0,

@@ -142,7 +142,11 @@ pub fn swap_out_sequence(
     // Compact the swapped-in sequence (same logic as retire path).
     if victim_idx < active.len() && active[victim_idx].seq.slot_idx != victim_idx {
         model.compact_sequence(&mut active[victim_idx].seq, victim_idx)?;
-        a.seq.slot_idx = usize::MAX; // sentinel: slot reused by compact
+        // Disown the victim's migrated slot BEFORE the fallible save below: sets
+        // the reuse sentinel AND neutralizes the RAII guard so a `?`-early-
+        // return (create_file/save_sequence_state error) that drops `a` cannot
+        // double-release the slot now owned by the swapped-in sequence.
+        model.detach_slot_for_reuse(&mut a.seq);
     }
 
     let (swap_id, mut writer) = spill.create_file()?;

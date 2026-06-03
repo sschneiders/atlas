@@ -335,6 +335,17 @@ pub trait Model: Send + Sync {
     /// swap_remove to keep active sequences at contiguous slots [0..N).
     fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<()>;
 
+    /// Disown a retired sequence's SSM pool slot after `compact_sequence`
+    /// migrated it to a surviving sequence.
+    ///
+    /// Sets the `slot_idx` reuse sentinel AND neutralizes the sequence's
+    /// internal slot-release guard so the migrated slot is NOT released when
+    /// this sequence is later freed or dropped (the surviving sequence now owns
+    /// it). The scheduler MUST call this — instead of mutating `slot_idx`
+    /// directly — immediately after a `compact_sequence` that reuses this
+    /// sequence's slot, so a subsequent early-return/drop cannot double-release.
+    fn detach_slot_for_reuse(&self, seq: &mut SequenceState);
+
     /// CUDA-graphed K=2 verify: 2 tokens, capture-then-replay. Returns
     /// `[verified_0, verified_1]` argmax IDs. SSM intermediates saved for
     /// partial rollback via `rollback_ssm_states`.

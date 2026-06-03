@@ -24,11 +24,9 @@
 
 mod loop_detect;
 mod msg_entry;
-pub(super) mod repair_json;
 mod sampling_setup;
 mod template;
 mod thinking;
-pub(super) mod tool_retry;
 
 use axum::extract::State;
 use axum::http::StatusCode;
