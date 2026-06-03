@@ -1,0 +1,36 @@
+#include <hip/hip_runtime.h>
+#include <cstdio>
+#include <cstdlib>
+typedef __bf16 v16bf __attribute__((ext_vector_type(16)));
+typedef float  v8f   __attribute__((ext_vector_type(8)));
+// A loaded row-major: lane l (mod 16) -> a[i]=A[l][i].  B loaded: b[k]=B[k][l].
+__global__ void probe(const __bf16* A, const __bf16* B, float* out){
+  int lane = threadIdx.x & 31;
+  v16bf a,b;
+  for(int i=0;i<16;i++){ a[i]=A[(lane&15)*16+i]; b[i]=B[i*16+(lane&15)]; }
+  v8f acc={0,0,0,0,0,0,0,0};
+  acc=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,acc);
+  for(int e=0;e<8;e++) out[lane*8+e]=acc[e];
+}
+static void run(int mode, float* host_out){ // mode 0: B[k][j]=k (rowid); 1: B[k][j]=j (colid)
+  __bf16 *A,*B; float *O;
+  __bf16 hA[256], hB[256]; float hO[256];
+  for(int i=0;i<16;i++)for(int k=0;k<16;k++) hA[i*16+k]=(__bf16)(i==k?1.0f:0.0f);
+  for(int k=0;k<16;k++)for(int j=0;j<16;j++) hB[k*16+j]=(__bf16)(float)(mode==0?k:j);
+  hipMalloc(&A,512); hipMalloc(&B,512); hipMalloc(&O,1024);
+  hipMemcpy(A,hA,512,hipMemcpyHostToDevice); hipMemcpy(B,hB,512,hipMemcpyHostToDevice);
+  probe<<<1,32>>>(A,B,O); hipDeviceSynchronize();
+  hipMemcpy(host_out,O,1024,hipMemcpyDeviceToHost);
+  hipFree(A);hipFree(B);hipFree(O);
+}
+int main(){
+  float rowp[256], colp[256];
+  run(0,rowp); run(1,colp);
+  printf("lane elt -> (row,col)  [empirical WMMA C-fragment layout]\n");
+  for(int lane=0; lane<32; lane++){
+    printf("L%02d:", lane);
+    for(int e=0;e<8;e++){ printf(" (%d,%d)", (int)(rowp[lane*8+e]+0.5f), (int)(colp[lane*8+e]+0.5f)); }
+    printf("\n");
+  }
+  return 0;
+}

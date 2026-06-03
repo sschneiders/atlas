@@ -225,6 +225,102 @@ impl ComputeTarget for ScaleTarget {
     }
 }
 
+/// Native ROCm/HIP compilation target (no SCALE): compiles the (unmodified
+/// except for mechanical compat) CUDA `.cu` sources directly with `hipcc` for
+/// an AMD `gfx*` arch, emitting a loadable HIP code object. Validated on
+/// gfx1151 — 72/92 kernels compile via this recipe with only compat headers +
+/// a mask-widen sed; the tensor-core kernels are ported to AMD WMMA separately.
+///
+/// Pairs with the `libcuda.so` → HIP shim (atlas-kernels/hip/libcuda_hip_shim.cpp):
+/// the unchanged cudarc runtime loads these objects via `cuModuleLoadData`
+/// (→ `hipModuleLoadData`). build.rs stages the CUDA→HIP compat-header dir and
+/// exports its path via `ATLAS_HIP_COMPAT_INCLUDE`; the per-source mask-widen
+/// sed runs during the source-mirror step (see build.rs HIP branch).
+struct HipTarget {
+    hipcc: PathBuf,
+}
+
+impl ComputeTarget for HipTarget {
+    fn source_extension(&self) -> &str {
+        "cu"
+    }
+    fn output_extension(&self) -> &str {
+        // HIP code object (loadable by hipModuleLoadData via the libcuda shim).
+        "co"
+    }
+    fn uses_cuda_module_api(&self) -> bool {
+        // The runtime still calls the CUDA driver API; the libcuda→HIP shim
+        // maps cuModuleLoadData/cuLaunchKernel/… onto HIP. Same registry path.
+        true
+    }
+
+    fn compile(
+        &self,
+        source: &std::path::Path,
+        output: &std::path::Path,
+        arch: &str,
+        extra_flags: &[String],
+    ) -> Result<(), String> {
+        // CUDA→HIP compat headers (cuda_runtime.h/cuda_bf16.h/cuda_fp8.h that
+        // forward to hip/* and alias __nv_* types) staged by build.rs. Placed
+        // first on the include path so the unmodified .cu finds them.
+        let compat = std::env::var("ATLAS_HIP_COMPAT_INCLUDE").map_err(|_| {
+            "ATLAS_HIP_COMPAT_INCLUDE not set — build.rs must stage the CUDA→HIP \
+             compat-header dir before compiling HIP kernels."
+                .to_string()
+        })?;
+        // `-x hip` + force-include hip_runtime.h (kernels that only include
+        // cuda_bf16.h otherwise lack blockIdx/threadIdx). `--genco` emits a
+        // loadable code object.
+        let mut args: Vec<String> = vec![
+            "-x".into(),
+            "hip".into(),
+            "--genco".into(),
+            format!("--offload-arch={arch}"),
+            "-O3".into(),
+            format!("-I{compat}"),
+            "-include".into(),
+            "hip/hip_runtime.h".into(),
+        ];
+        args.extend(extra_flags.iter().cloned());
+        args.push(source.to_str().unwrap().into());
+        args.push("-o".into());
+        args.push(output.to_str().unwrap().into());
+
+        let status = Command::new(&self.hipcc)
+            .args(&args)
+            .status()
+            .map_err(|e| format!("Failed to run hipcc ({}): {e}", self.hipcc.display()))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "hipcc --genco failed for {} (arch {arch})",
+                source.display()
+            ))
+        }
+    }
+}
+
+fn find_hipcc() -> PathBuf {
+    if let Ok(p) = std::env::var("ATLAS_HIPCC") {
+        return PathBuf::from(p);
+    }
+    let canonical = PathBuf::from("/opt/rocm/bin/hipcc");
+    if canonical.exists() {
+        return canonical;
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let p = dir.join("hipcc");
+            if p.exists() {
+                return p;
+            }
+        }
+    }
+    panic!("hipcc not found — install ROCm or set ATLAS_HIPCC to its path.");
+}
+
 fn find_xcrun() -> PathBuf {
     // Cargo's macOS hosts always have `/usr/bin/xcrun`; PATH lookup is a
     // safety net for unusual toolchain layouts (CI runners with custom
@@ -263,8 +359,12 @@ pub(super) fn resolve_compute_target(vendor: Option<&str>) -> Box<dyn ComputeTar
             let scale_root = super::build_codegen::find_scale_dir();
             Box::new(ScaleTarget { scale_root })
         }
+        // Native ROCm/HIP path (no SCALE) — pairs with the libcuda→HIP shim.
+        "hip" => Box::new(HipTarget {
+            hipcc: find_hipcc(),
+        }),
         other => panic!(
-            "Unsupported compute vendor '{other}'. Supported: nvidia, apple, amd.\n\
+            "Unsupported compute vendor '{other}'. Supported: nvidia, apple, amd, hip.\n\
              To add support for a new vendor, implement the ComputeTarget trait \n\
              in atlas-kernels/build_target.rs and atlas-core/src/compute.rs."
         ),

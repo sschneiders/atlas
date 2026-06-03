@@ -1,0 +1,67 @@
+#include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
+#include <cstdio>
+#include <cmath>
+typedef __bf16 v16bf __attribute__((ext_vector_type(16)));
+typedef float  v8f   __attribute__((ext_vector_type(8)));
+#define M_TILE 64
+#define N_TILE 64
+#define K_STEP 16
+#define PAD 2
+#define GROUP_SIZE 16
+__device__ __constant__ float E2M1_LUT[16] = {0,0.5,1,1.5,2,3,4,6,-0.0,-0.5,-1,-1.5,-2,-3,-4,-6};
+__device__ __forceinline__ float scl_fp8(unsigned char b){
+  unsigned int s=(b>>7)&1u,e=(b>>3)&0xFu,m=b&0x7u; float v;
+  if(e==0u) v=(float)m*0.001953125f; else if(e==15u&&m==7u) v=0.0f;
+  else v=__uint_as_float(((e+120u)<<23)|(m<<20)); return s?-v:v; }
+// WMMA port of w4a16_gemm: A[M,K] bf16 * dequant(NVFP4 B[N,K/2]) -> C[M,N] bf16.
+extern "C" __global__ void w4a16_gemm_wmma(
+  const __hip_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+  const unsigned char* __restrict__ B_scale, const float scale2,
+  __hip_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K){
+  const unsigned int cta_m=blockIdx.y*M_TILE, cta_n=blockIdx.x*N_TILE;
+  const unsigned int warp_id=threadIdx.x/32, lane=threadIdx.x%32;
+  __shared__ __hip_bfloat16 smem_A[M_TILE][K_STEP+PAD];
+  __shared__ __hip_bfloat16 smem_B[K_STEP][N_TILE+PAD];
+  v8f acc[4]; for(int i=0;i<4;i++) acc[i]=v8f{0,0,0,0,0,0,0,0};
+  const unsigned int half_K=K/2, num_groups=K/GROUP_SIZE;
+  for(unsigned int k_base=0;k_base<K;k_base+=K_STEP){
+    for(unsigned int i=0;i<(M_TILE*K_STEP)/128;i++){ unsigned int idx=threadIdx.x*((M_TILE*K_STEP)/128)+i;
+      unsigned int row=idx/K_STEP,col=idx%K_STEP,gr=cta_m+row,gc=k_base+col;
+      smem_A[row][col]=(gr<M&&gc<K)?A[gr*K+gc]:(__hip_bfloat16)0.0f; }
+    for(unsigned int i=0;i<8;i++){ unsigned int idx=threadIdx.x*8+i,k=idx/N_TILE,n=idx%N_TILE,gk=k_base+k,gn=cta_n+n;
+      if(gk<K&&gn<N){ unsigned int kp=gk/2; unsigned char pb=B_packed[(unsigned long long)gn*half_K+kp];
+        unsigned int nib=(gk&1)?(pb>>4):(pb&0xF); unsigned char sb=B_scale[(unsigned long long)gn*num_groups+gk/GROUP_SIZE];
+        smem_B[k][n]=(__hip_bfloat16)(E2M1_LUT[nib]*scl_fp8(sb)*scale2);
+      } else smem_B[k][n]=(__hip_bfloat16)0.0f; }
+    __syncthreads();
+    const unsigned int wm=warp_id*16;
+    v16bf a; for(int i=0;i<16;i++) a[i]=(__bf16)smem_A[wm+(lane&15)][i];
+    for(int nb=0;nb<4;nb++){ v16bf b; for(int k=0;k<16;k++) b[k]=(__bf16)smem_B[k][nb*16+(lane&15)];
+      acc[nb]=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,acc[nb]); }
+    __syncthreads();
+  }
+  const unsigned int wm=warp_id*16;
+  for(int nb=0;nb<4;nb++) for(int e=0;e<8;e++){ unsigned int row=cta_m+wm+2*e+(lane>>4),col=cta_n+nb*16+(lane&15);
+    if(row<M&&col<N) C[row*N+col]=(__hip_bfloat16)acc[nb][e]; }
+}
+static float cpu_scl(unsigned char b){ unsigned int s=(b>>7)&1u,e=(b>>3)&0xFu,m=b&0x7u; float v;
+  if(e==0u)v=(float)m*0.001953125f; else if(e==15u&&m==7u)v=0; else{unsigned int u=((e+120u)<<23)|(m<<20); v=*(float*)&u;} return s?-v:v; }
+int main(){ const int M=64,N=64,Kd=64; const float LUT[16]={0,0.5,1,1.5,2,3,4,6,-0.0,-0.5,-1,-1.5,-2,-3,-4,-6};
+  int hkK=Kd/2, ng=Kd/GROUP_SIZE;
+  __hip_bfloat16 hA[M*Kd]; unsigned char hBp[N*(Kd/2)], hBs[N*(Kd/GROUP_SIZE)]; float scale2=1.0f;
+  for(int i=0;i<M*Kd;i++) hA[i]=(__hip_bfloat16)(((i*7)%13-6)*0.25f);
+  for(int i=0;i<N*hkK;i++) hBp[i]=(unsigned char)((i*131+7)&0xFF);
+  for(int i=0;i<N*ng;i++) hBs[i]=(unsigned char)(0x38 + ((i*5)%6)); // fp8 scales ~1..2 range
+  float ref[M*N];
+  for(int m=0;m<M;m++)for(int n=0;n<N;n++){ float s=0; for(int k=0;k<Kd;k++){ unsigned char pb=hBp[n*hkK+k/2]; int nib=(k&1)?(pb>>4):(pb&0xF);
+    float dq=(float)(__hip_bfloat16)(LUT[nib]*cpu_scl(hBs[n*ng+k/GROUP_SIZE])*scale2); s+=(float)hA[m*Kd+k]*dq; } ref[m*N+n]=(float)(__hip_bfloat16)s; }
+  __hip_bfloat16 *A,*C; unsigned char *Bp,*Bs;
+  hipMalloc(&A,sizeof(hA)); hipMalloc(&Bp,sizeof(hBp)); hipMalloc(&Bs,sizeof(hBs)); hipMalloc(&C,M*N*sizeof(__hip_bfloat16));
+  hipMemcpy(A,hA,sizeof(hA),hipMemcpyHostToDevice); hipMemcpy(Bp,hBp,sizeof(hBp),hipMemcpyHostToDevice); hipMemcpy(Bs,hBs,sizeof(hBs),hipMemcpyHostToDevice);
+  dim3 grid(N/N_TILE,M/M_TILE); w4a16_gemm_wmma<<<grid,128>>>(A,Bp,Bs,scale2,C,M,N,Kd); hipDeviceSynchronize();
+  __hip_bfloat16 hC[M*N]; hipMemcpy(hC,C,M*N*sizeof(__hip_bfloat16),hipMemcpyDeviceToHost);
+  float maxe=0; int bad=0; for(int i=0;i<M*N;i++){ float e=fabsf((float)hC[i]-ref[i]); if(e>maxe)maxe=e; {float tol=fabsf(ref[i])*0.0079f+1e-6f; if(e>tol)bad++;} }
+  printf("w4a16 WMMA port %dx%dx%d vs CPU dequant-GEMM: max_abs_err=%.4f bad(>1ULP)=%d/%d  %s\n",M,N,Kd,maxe,bad,M*N,bad==0?"PASS ✅":"FAIL ❌");
+  printf("sample C[0,0]=%.3f ref=%.3f | C[33,40]=%.3f ref=%.3f | C[63,63]=%.3f ref=%.3f\n",(float)hC[0],ref[0],(float)hC[33*N+40],ref[33*N+40],(float)hC[M*N-1],ref[M*N-1]);
+  return 0; }
