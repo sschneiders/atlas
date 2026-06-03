@@ -1,8 +1,13 @@
 # Porting Atlas to AMD Strix Halo (gfx1151) via SCALE
 
-Status: **in progress** (branch `port/amd-strix-halo`). First target model:
-`qwen3.6-27b` served `Qwen/Qwen3.6-27B-FP8`. This guide is reproducible from a
-clean checkout and is updated as the port progresses.
+Status: **working end-to-end** (branch `port/amd-strix-halo`). First target
+model `qwen3.6-27b` served `Qwen/Qwen3.6-27B-FP8` generates **coherent output**
+on an AMD Radeon 8060S (gfx1151 / Strix Halo, RDNA 3.5) at ~8.8 tok/s decode.
+This guide is reproducible from a clean checkout on native Ubuntu.
+
+> **Requires SCALE ≥ 1.7.1.** 1.7.0 SIGSEGVs in the HSA queue-create path on
+> gfx1151 (wrong CWSR size for RDNA 3.5); 1.7.1 bundles ROCm 7.2.3 which reads
+> `cwsr_size` from sysfs and fixes it. See `atlas-issues-found.md`.
 
 SCALE (scale-lang.com, Spectral Compute) recompiles **unmodified CUDA** for
 AMD GPUs. It is a drop-in `nvcc` shim (clang-19 based) that provides the CUDA
@@ -19,6 +24,38 @@ Spectral clean repros for compiler defects.
 
 ---
 
+## 0. Quick start (verified working config)
+
+For the impatient, on a native-Ubuntu Strix Halo box with the model already in
+the HF cache and SCALE 1.7.1 unpacked at `$SCALE_HOME`:
+
+```bash
+# Build (SCALE compiles the unmodified CUDA kernels for gfx1151)
+export SCALE_HOME=~/scale171/scale-1.7.1-Linux
+export ATLAS_TARGET_HW=strix ATLAS_TARGET_MODEL=qwen3.6-27b ATLAS_TARGET_QUANT=nvfp4
+export CUDA_PATH="$SCALE_HOME/targets/gfx1151" CUDA_HOME="$CUDA_PATH"
+export PATH="$SCALE_HOME/targets/gfx1151/bin:/opt/rocm/bin:$PATH"
+export LD_LIBRARY_PATH="/opt/rocm/lib:$SCALE_HOME/targets/gfx1151/lib:$LD_LIBRARY_PATH"
+export CUDARC_CUDA_VERSION=12080
+cargo build --release -p spark-server --no-default-features --features cuda
+
+# Serve — three runtime shims are required on gfx1151 (see §4):
+export ATLAS_FORCE_GLOBAL_GDN=1     # route GDN prefill to the global-mem kernel (RDNA3.5 64KB LDS cap)
+export ATLAS_W4A16_VARIANT=v1       # use the BF16-MMA NVFP4 GEMM (SCALE FP8-MMA encode is broken on gfx1151)
+export ATLAS_NO_FP8_PREDEQUANT=1    # skip NVFP4->FP8 predequant (same broken-encode reason)
+# SCALE libs FIRST so /opt/rocm cannot shadow the fixed libhsa-runtime64:
+export LD_LIBRARY_PATH="$SCALE_HOME/targets/gfx1151/lib:$SCALE_HOME/lib"
+export PATH="$SCALE_HOME/targets/gfx1151/bin:$PATH"
+target/release/spark serve Qwen/Qwen3.6-27B-FP8 \
+  --port 8081 --max-seq-len 4096 --gpu-memory-utilization 0.70 \
+  --kv-cache-dtype bf16 --kv-high-precision-layers max --max-batch-size 4
+```
+
+A ready-made script lives at `serve-amd.sh` in the repo root. Sections 1–6
+below explain each step, the SCALE mechanics, and why each shim is needed.
+
+---
+
 ## 1. Toolchain
 
 ### 1.1 Get the right SCALE build
@@ -28,13 +65,14 @@ Spectral clean repros for compiler defects.
 | Tarball | Notes |
 |---|---|
 | `scale-free-1.4.2-amd64.tar.xz` | Free edition, **stale (Oct 2025)** — `targets/` has **no gfx1151**. Do not use for Strix. |
-| **`scale-1.7.0-amd64.tar.xz`** | Current (2026), ~1.35 GB. `targets/` **includes gfx1151** (+ gfx1150/1152/1153, RDNA4 gfx1200/1201, CDNA gfx942/950). **Use this.** |
+| `scale-1.7.0-amd64.tar.xz` | Has gfx1151 codegen but **SIGSEGVs at runtime** in HSA queue-create on gfx1151 (wrong CWSR size). Do not use. |
+| **`scale-1.7.1-amd64.tar.xz`** | Current (2026), ~1.43 GB. Bundles ROCm 7.2.3 → fixes the gfx1151 queue-create crash. `targets/` includes gfx1151 (+ gfx1150/1152/1153, RDNA4 gfx1200/1201, CDNA gfx942/950). **Use this.** |
 
 ```bash
-cd ~ && mkdir -p scale17 && cd scale17
-curl -L --fail -o s17.tar.xz https://pkgs.scale-lang.com/tar/scale-1.7.0-amd64.tar.xz
-tar -xf s17.tar.xz                       # → ~/scale17/scale-1.7.0-Linux
-export SCALE_HOME=~/scale17/scale-1.7.0-Linux
+cd ~ && mkdir -p scale171 && cd scale171
+curl -L --fail -o s171.tar.xz https://pkgs.scale-lang.com/tar/scale-1.7.1-amd64.tar.xz
+tar -xf s171.tar.xz                      # → ~/scale171/scale-1.7.1-Linux
+export SCALE_HOME=~/scale171/scale-1.7.1-Linux
 ```
 
 `SCALE_HOME` is honored by the Atlas build (`find_scale_dir`). A SCALE root
@@ -243,26 +281,35 @@ no-op. (Draft the email; do not auto-send.)
 
 ## 5. Build, deploy, run
 
-```bash
-# On a machine with SCALE_HOME set (the Strix box):
-export SCALE_HOME=~/scale17/scale-1.7.0-Linux
-export ATLAS_TARGET_HW=strix ATLAS_TARGET_MODEL=qwen3.6-27b ATLAS_TARGET_QUANT=nvfp4
-rm -rf target/release/build/atlas-kernels-*      # stale-cache guard on .cu change
-cargo build --release -p spark-server
+Verified on native Ubuntu (kernel 6.17.0-oem), gfx1151, SCALE 1.7.1. The repo
+ships `build-amd.sh` and `serve-amd.sh` that wrap exactly the commands below.
 
-# Serve (MTP stays DISABLED until validated on a known-good CUDA box —
-# omit --speculative for the initial Strix bring-up):
-spark serve <Qwen3.6-27B-FP8 path> --port 8888 --model-name qwen3.6-27b \
-  --max-seq-len 16384
+```bash
+# Build — SCALE_HOME set, kernels compiled for gfx1151:
+export SCALE_HOME=~/scale171/scale-1.7.1-Linux
+export ATLAS_TARGET_HW=strix ATLAS_TARGET_MODEL=qwen3.6-27b ATLAS_TARGET_QUANT=nvfp4
+export CUDA_PATH="$SCALE_HOME/targets/gfx1151" CUDA_HOME="$CUDA_PATH"
+export PATH="$SCALE_HOME/targets/gfx1151/bin:/opt/rocm/bin:$PATH"
+export LD_LIBRARY_PATH="/opt/rocm/lib:$SCALE_HOME/targets/gfx1151/lib:$LD_LIBRARY_PATH"
+export CUDARC_CUDA_VERSION=12080
+rm -rf target/release/build/atlas-kernels-*      # stale-cache guard on .cu change
+cargo build --release -p spark-server --no-default-features --features cuda
+
+# Serve — gfx1151 shims (§4) + SCALE libs first so /opt/rocm can't shadow libhsa:
+export ATLAS_FORCE_GLOBAL_GDN=1 ATLAS_W4A16_VARIANT=v1 ATLAS_NO_FP8_PREDEQUANT=1
+export LD_LIBRARY_PATH="$SCALE_HOME/targets/gfx1151/lib:$SCALE_HOME/lib"
+target/release/spark serve Qwen/Qwen3.6-27B-FP8 \
+  --port 8081 --max-seq-len 4096 --gpu-memory-utilization 0.70 \
+  --kv-cache-dtype bf16 --kv-high-precision-layers max --max-batch-size 4
 ```
 
-Runtime env: the Strix dev box is **WSL2** (`/dev/dxg`, no native ROCm).
-ROCm-on-WSL gfx1151 (ROCm 7.2.x, community `andweng/wsl-rocm`) is
-**dedicated-VRAM-only** (~60% less usable mem, no `hipMallocManaged`) — a 27B
-FP8 model likely will not fit under WSL; expect to fall back to a smaller
-model for the first on-device proof, or use native Linux on the Strix HW for
-the real 27B run. Mind the WSL memory-trap (raising the VRAM carveout starves
-Windows → hard hang).
+**Memory note (61 GB unified).** Strix shares one LPDDR5X pool between host and
+GPU (the `rocm-smi` VRAM carveout is only ~512 MB; GPU buffers live in GTT =
+system RAM). The KV sizer fills greedily to `--gpu-memory-utilization` and
+CUDA-graph capture allocates on top during warmup, so keep util at **0.70** for
+the 27B model; raising it triggers the OOM watchdog mid-warmup. `--max-seq-len`
+barely affects KV (it grabs all free memory regardless); util is the real lever.
+Restoring 16384 ctx needs the arena/graph accounting work noted in §4.
 
 ### 5.1 MTP / speculative decoding
 
