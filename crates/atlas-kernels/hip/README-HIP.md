@@ -34,13 +34,36 @@ put it first on the loader path:
 hipcc -shared -fPIC libcuda_hip_shim.cpp -o libcuda.so -I/opt/rocm/<ver>/include
 ```
 
-## Remaining to a running model
-1. Port the dense prefill MMA kernels to WMMA (recipe proven on `w4a16_gemm`):
-   `dense_gemm_tc`, one `inferspark_prefill` attention kernel, `w8a16_gemm(_t)`.
-2. Wire `HipTarget` into `build.rs` (stage `compat/` → `ATLAS_HIP_COMPAT_INCLUDE`,
-   build the sed'd source mirror, emit `.co` objects into the registry).
-3. `cargo build` spark-server; link/LD against the shim `libcuda.so` + `libamdhip64`.
-4. Serve Qwen3.6-27B-dense; validate coherence; measure decode tok/s (target 20).
+## Turnkey remaining checklist (every layer below is already proven; this is labor)
 
-Decode needs **zero** WMMA ports (all GEMV/attn-decode/SSM-decode kernels are in
-the clean/mechanical buckets) — the MMA work only affects prefill/TTFT.
+**A. MMA kernel ports (build blocker — a full `cargo build` compiles ALL kernels,
+so the 20 `mma.sync` ones must compile first).** Recipe: replace the
+`mma.sync.m16n8k16.row.col.f32.bf16.bf16.f32` asm with
+`__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32` using the validated fragment map
+(C: row=2*e+(lane>>4), col=lane&15; A: a[i]=A[lane&15][i]; B: b[k]=B[k][lane&15];
+acc = 4× v8f for n64). Also replace `cp.async.cg.shared.global` with synchronous
+smem loads (correctness-first; lose pipelining). For the NVFP4 **dense** model:
+  - PORT: `w4a16_gemm` (✅ done, in `ported/`), `dense_gemm_tc`,
+    `inferspark_prefill` (attention: same MMA shape + 4 cp.async sites).
+  - STUB (not used by dense NVFP4): `w8a16_gemm(_t)` (FP8-weight), all `moe_*`
+    (MoE), the unused `inferspark_prefill_paged_*` variants, `reshape_and_cache_turbo`
+    (CLEAN non-turbo fallback exists). A stub = compile body that traps if called.
+
+**B. Wire `HipTarget` into `build.rs`** (target/compile flow mapped 2026-06-03):
+  - `build.rs:159` `resolve_compute_target(vendor)` reads `kernels/<hw>/HARDWARE.toml`
+    `vendor`. Add a `strix-hip` HW dir (or env override) with `vendor="hip"`.
+  - Before the compile loop (`build.rs:192`): copy the kernel sources to `OUT_DIR`,
+    run the mask-widen sed on the copies, stage `hip/compat/` and export
+    `ATLAS_HIP_COMPAT_INCLUDE`. `HipTarget.compile` (already added) does the rest.
+  - `output_extension()="co"`; the registry codegen (build_codegen.rs) embeds the
+    `.co` objects — verify it treats them like the SCALE `.o` path.
+
+**C. Build + link:** `cargo build --release -p spark-server --no-default-features
+--features cuda` with the HIP env; link/LD against the shim `libcuda.so`
+(`-L.../hip` first) + `libamdhip64`.
+
+**D. Serve + measure (GPU window — bounce the SCALE demo server):** `spark serve
+Qwen/Qwen3.6-27B-FP8 …`; coherence check (temp=0 prompts); decode tok/s via
+`~/bench-atlas.sh` (target 20). Decode needs **zero** MMA ports, so even with
+stubbed prefill-extras the decode number is measurable once prefill (w4a16_gemm +
+inferspark_prefill) works.
