@@ -39,10 +39,8 @@ pub enum FfnActivation {
 
 pub struct DenseFfnLayer {
     pub weights: DenseFfnWeights,
-    activation: FfnActivation,
     w4a16_gemv: KernelHandle,
     w4a16_gemv_dual: KernelHandle,
-    w4a16_gemv_silu_input: KernelHandle,
     w4a16_gemv_dual_batch2: KernelHandle,
     w4a16_gemv_dual_batch3: KernelHandle,
     w4a16_gemv_batch2: KernelHandle,
@@ -86,10 +84,8 @@ impl DenseFfnLayer {
 
         Ok(Self {
             weights,
-            activation,
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_dual: gpu.kernel("w4a16_gemv_fused", "w4a16_gemv_dual")?,
-            w4a16_gemv_silu_input: gpu.kernel("w4a16_gemv_fused", "w4a16_gemv_silu_input")?,
             w4a16_gemv_dual_batch2: gpu.kernel("w4a16_gemv", "w4a16_gemv_dual_batch2")?,
             w4a16_gemv_dual_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_dual_batch3")?,
             w4a16_gemv_batch2: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
@@ -195,44 +191,36 @@ impl DenseFfnLayer {
         )?;
 
         let output = ctx.buffers.moe_output();
-        match self.activation {
-            FfnActivation::SiLU => {
-                // Fused SiLU(gate)*up + down_proj: [1, inter] → [1, H]
-                ops::w4a16_gemv_silu_input(
-                    ctx.gpu,
-                    self.w4a16_gemv_silu_input,
-                    gate_out,
-                    up_out,
-                    &self.weights.down_proj,
-                    output,
-                    h,
-                    inter,
-                    stream,
-                )?;
-            }
-            FfnActivation::GeLU => {
-                // GELU(gate)*up → gate_out, then down_proj GEMV
-                ops::silu_mul(
-                    ctx.gpu,
-                    self.act_mul,
-                    gate_out,
-                    up_out,
-                    gate_out,
-                    inter,
-                    stream,
-                )?;
-                ops::w4a16_gemv(
-                    ctx.gpu,
-                    self.w4a16_gemv,
-                    gate_out,
-                    &self.weights.down_proj,
-                    output,
-                    h,
-                    inter,
-                    stream,
-                )?;
-            }
-        }
+        // Activation (SiLU or GELU per self.act_mul) is computed ONCE over the
+        // [1, inter] vector, then a plain weight-bound w4a16 GEMV does down_proj.
+        //
+        // This replaces the previous fused `w4a16_gemv_silu_input` for the SiLU
+        // path. That fused kernel recomputed silu(gate)*up redundantly inside
+        // every output block (N/4 ≈ 1280× for inter=17408), making it ~2.6×
+        // slower than the down_proj's memory-bound floor (rocprofv3 on gfx1151:
+        // 457µs vs ~196µs BW-bound). Precomputing the activation once removes
+        // that redundant compute. The activation buffer (inter BF16 ≈ 34 KB)
+        // stays resident in L2 across the GEMV, so the extra round-trip is free.
+        // Numerically identical: same silu(gate)*up, same down_proj GEMV.
+        ops::silu_mul(
+            ctx.gpu,
+            self.act_mul,
+            gate_out,
+            up_out,
+            gate_out,
+            inter,
+            stream,
+        )?;
+        ops::w4a16_gemv(
+            ctx.gpu,
+            self.w4a16_gemv,
+            gate_out,
+            &self.weights.down_proj,
+            output,
+            h,
+            inter,
+            stream,
+        )?;
 
         Ok(output)
     }
