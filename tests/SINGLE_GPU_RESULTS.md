@@ -19,6 +19,14 @@
 > Mistral long-context failure was a code bug (YaRN inv_freq, now fixed). Nemotron tool-call
 > failure was a steering-prefix loop (MODEL.toml fix already applied). SSM pool memory is
 > correct behavior — see per-model analysis and updated Action Items below.
+>
+> **Re-investigation (2026-06-03, spec_ssm branch)**: Full code-path audit of all three priorities
+> against current HEAD. Confirmed all previously documented fixes are present and correct.
+> One latent bug identified: MLA chunked-prefill attention at chunk 1+ only attends to the
+> current chunk's K/V (not paged cache), producing wrong output for Mistral Small 4 prompts
+> exceeding `--max-prefill-tokens` (default 8192). This does not affect any test scenario
+> (max tested: 6.5K < 8192) but is a correctness risk for very long prompts. See Action Items
+> for the workaround and planned fix.
 
 ---
 
@@ -188,12 +196,16 @@ sudo docker run -d --name atlas-nemotron --gpus all --ipc=host --network host \
    `low_freq_factor`, producing wrong `inv_freq` for pairs j≈12–18. This caused attention
    attention scores from pair j=12 to flip sign at N≈867 tokens → gibberish above that threshold.
    **Fix**: `yarn.rs` now uses the correct YaRN formula in dimension-index space.
-   **Re-test needed**: Run the same long-context suite against a fresh build from current main.
+   **Verified (2026-06-03)**: `crates/spark-model/src/mistral_loader/loader_impl/yarn.rs` uses
+   the correct `find_correction_dim` formula in dimension-index space with `beta_fast=32`,
+   `beta_slow=1`. Produces `low=7, high=15` for Mistral Small 4 params (rope_theta=1e7,
+   rope_dim=64, factor=128, original_max_pos=8192). ✓
 
 2. **[P1] Nemotron tool calling — FIXED**: `disable_tool_steering = true` +
    `tool_call_parser = "bare_json"` added to `kernels/gb10/nemotron-super-120b-a12b/MODEL.toml`.
    Model generates native top-level JSON tool calls without the steering-prefix loop.
-   **Re-test needed**: Re-run the 2/2 tool call suite with updated MODEL.toml.
+   **Verified (2026-06-03)**: Both fields confirmed present in current `MODEL.toml`. The
+   `[behavior]` section contains detailed comments explaining why each flag is required. ✓
 
 3. **[P2] 122B SSM pool memory — DOCUMENTED (no code change needed)**:
    `--ssm-cache-slots 0` controls `SsmSnapshotPool` (prefix-cache SSM state snapshots).
@@ -203,10 +215,30 @@ sudo docker run -d --name atlas-nemotron --gpus all --ipc=host --network host \
    **To reduce**: pass `--max-batch-size 1` for single-user serving (reduces to ~151 MB).
    The two allocations are independent; `--ssm-cache-slots 0 --max-batch-size 1` gives
    minimum SSM footprint (~151 MB total), recovering ~1055 MB for the KV cache.
+   **Verified (2026-06-03)**: `serve_phases/preflight.rs` confirms `ssm_pool_bytes` is sized
+   by `max_batch_size × num_ssm_layers` independently of `ssm_cache_slots`. ✓
 
 4. **[P2] Nemotron long context — ARCHITECTURAL LIMIT**: SSM state saturation at >8K tokens
    is inherent to Mamba-2 recurrent architectures (fixed-size hidden state). No fix possible.
    Documented as known constraint; recommend use cases with inputs ≤8K tokens.
+
+5. **[NEW] MLA chunked-prefill attention gap — LATENT BUG**: Identified 2026-06-03 during
+   code-path audit. `crates/spark-model/src/layers/qwen3_attention/prefill/paged_mla.rs` is
+   invoked for MLA layers at chunk 1+ (when `seq_len_start > 0`). It runs flash attention on
+   the current chunk's expanded K/V (`k_contiguous`/`v_contiguous`) but does NOT consult the
+   paged KV cache for tokens from previous chunks. Concretely: for a 12K-token Mistral Small 4
+   prompt with default `--max-prefill-tokens 8192`, chunk 1 (3808 tokens) attends only to
+   itself instead of the full 12K context → wrong attention scores → incoherent output.
+   **Does not affect tested scenarios**: all test prompts (≤6.5K) fall within the single-chunk
+   limit (8192 tokens), so seq_len_start is always 0 and the correct
+   `prefill_attention_with_cache_skip` → `cache_skip_mla.rs` path is taken.
+   **Workaround**: Pass `--max-prefill-tokens 0` (or a value ≥ prompt length) to disable
+   chunking and keep Mistral Small 4 on the single-chunk path for any prompt length. The
+   memory cost is a larger buffer arena; at 65K tokens this is ~2.5 GB additional BF16 scratch.
+   **Proper fix** (non-trivial): implement a paged MLA prefill attention kernel that reads
+   compressed KV entries (1 head × 320 dims) from the block table for previous chunks, then
+   fuses with the current chunk's expanded K/V. Requires a new CUDA kernel analogous to
+   `inferspark_prefill_paged` but for MLA layout.
 
 ---
 
