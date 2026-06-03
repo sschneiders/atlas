@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+cd /workspace/atlas; . "$HOME/.cargo/env"
+export ATLAS_TARGET_HW=strix-hip ATLAS_TARGET_MODEL=qwen3.6-27b ATLAS_TARGET_QUANT=nvfp4
+export ATLAS_HIP_COMPAT_INCLUDE=/workspace/atlas/crates/atlas-kernels/hip/compat
+export ATLAS_HIPCC=/opt/rocm/bin/hipcc
+export CUDARC_CUDA_VERSION=12080
+export ATLAS_SKIP_BUILD=1
+export PATH=$HOME/hip-port/fakebin:/opt/rocm/bin:$PATH
+export RUSTFLAGS="-L native=$HOME/hip-port/link"
+export LIBRARY_PATH="$HOME/hip-port/link:/opt/rocm/core-7.13/lib"
+echo "=== HIP build start $(date) ==="
+cargo build --release -p spark-server --no-default-features --features cuda 2>&1
+echo "=== BUILD_EXIT=$? $(date) ==="

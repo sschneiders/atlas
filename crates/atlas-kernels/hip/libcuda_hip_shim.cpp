@@ -82,4 +82,6 @@ int cuGraphLaunch(void* exec, void* s)  { return hipGraphLaunch((hipGraphExec_t)
 int cuGraphExecDestroy(void* exec)      { return hipGraphExecDestroy((hipGraphExec_t)exec); }
 int cuGraphDestroy(void* graph)         { return hipGraphDestroy((hipGraph_t)graph); }
 
+int cuGraphInstantiateWithFlags(void** pexec, void* graph, unsigned long long flags){ return hipGraphInstantiateWithFlags((hipGraphExec_t*)pexec,(hipGraph_t)graph,flags); }
+
 } // extern "C"
