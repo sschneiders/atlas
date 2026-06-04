@@ -232,6 +232,14 @@ pub struct MoeLayer {
     // ATLAS_FP8_MOE_COALESCED=1 env var. Kernel handle may be 0 on older
     // images (then dispatch falls back to v1). Same signature as v1.
     moe_fp8_grouped_gemm_v2_k: KernelHandle,
+    // v3 grouped GEMM: cp.async occupancy-tuned rewrite, cosine=1.0 vs v1/v2,
+    // ~5× faster. 128×64 (M×N) tile (M_TILE=128) — needs a distinct
+    // div_ceil(total_expanded, 128) max_m_tiles. Handle may be 0 on older
+    // images. Gated ON only when ATLAS_MOE_V3=1 (default OFF — production
+    // dispatch unchanged). PCND: explicit flag, no implicit default.
+    moe_fp8_grouped_gemm_v3_k: KernelHandle,
+    // Resolved once per layer from ATLAS_MOE_V3 env var.
+    fp8_moe_v3_enabled: bool,
     // BF16 grouped GEMM — for FP8-source models dequanted to BF16 at load.
     // Activates the high-precision MoE path that closes the per-layer
     // 0.989 FP8 cosine ceiling. Handle may be 0 on images that don't ship

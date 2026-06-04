@@ -124,6 +124,10 @@ pub struct Qwen3SsmLayer {
     // fp8_gemm_n128 when block-scaled FP8 weights are available — matches
     // vLLM's per-128-block scale precision instead of single-scale).
     w8a16_gemm_k: KernelHandle,
+    // Pipelined (cp.async) rewrite of w8a16_gemm: bit-identical, ~4.6× faster.
+    // KernelHandle(0) when not linked into the image. Gated ON only when
+    // ATLAS_W8A16_PIPELINED=1 (default OFF — production dispatch unchanged).
+    w8a16_gemm_pipelined_k: KernelHandle,
     w8a16_gemm_t_k: KernelHandle,
     // W8A8 + FP32 epilogue (vLLM-equivalent) prefill kernels.
     // `per_token_group_quant_fp8` produces FP8 activations + per-token-per-128

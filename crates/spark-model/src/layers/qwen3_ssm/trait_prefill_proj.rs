@@ -115,29 +115,61 @@ impl Qwen3SsmLayer {
         } else if let Some(ref fp8w) = self.qkvz_fp8w
             && self.w8a16_gemm_k.0 != 0
         {
-            tracing::info!("ssm prefill: dispatching QKVZ via w8a16_gemm (block-scaled, vLLM-parity)");
             // Block-scaled W8A16 prefill: matches vLLM's per-128-block FP32
             // scale precision (vs the single-scale fp8_gemm_n128 below
             // which bakes ALL per-block scales into one global scale,
             // dropping per-block dynamic range). This is the SSM-side of
             // the W8A8+FP32-epilogue fix shipped for the attention layer.
-            ops::w8a16_gemm(
-                ctx.gpu,
-                self.w8a16_gemm_k,
-                normed,
-                fp8w.weight,
-                fp8w.row_scale,
-                proj_dst,
-                k,
-                qkvz_size as u32,
-                h as u32,
-                stream,
-            )
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "ssm prefill: QKVZ w8a16_gemm (block-scaled) failed (M={k}, N={qkvz_size}): {e}"
+            //
+            // Default dispatch is unchanged (`w8a16_gemm`). When
+            // ATLAS_W8A16_PIPELINED=1 AND the pipelined kernel is linked into
+            // the image, route to the bit-identical (cosine=1.0) ~4.6× faster
+            // `w8a16_gemm_pipelined`. PCND: explicit flag, default OFF.
+            let use_pipelined = std::env::var("ATLAS_W8A16_PIPELINED").as_deref() == Ok("1")
+                && self.w8a16_gemm_pipelined_k.0 != 0;
+            if use_pipelined {
+                tracing::info!(
+                    "ssm prefill: dispatching QKVZ via w8a16_gemm_pipelined (ATLAS_W8A16_PIPELINED=1)"
+                );
+                ops::w8a16_gemm_pipelined(
+                    ctx.gpu,
+                    self.w8a16_gemm_pipelined_k,
+                    normed,
+                    fp8w.weight,
+                    fp8w.row_scale,
+                    proj_dst,
+                    k,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
                 )
-            })?;
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "ssm prefill: QKVZ w8a16_gemm_pipelined failed (M={k}, N={qkvz_size}): {e}"
+                    )
+                })?;
+            } else {
+                tracing::info!(
+                    "ssm prefill: dispatching QKVZ via w8a16_gemm (block-scaled, vLLM-parity)"
+                );
+                ops::w8a16_gemm(
+                    ctx.gpu,
+                    self.w8a16_gemm_k,
+                    normed,
+                    fp8w.weight,
+                    fp8w.row_scale,
+                    proj_dst,
+                    k,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "ssm prefill: QKVZ w8a16_gemm (block-scaled) failed (M={k}, N={qkvz_size}): {e}"
+                    )
+                })?;
+            }
         } else if let Some(fp8) = self.qkvz_fp8 {
             ops::fp8_gemm_n128(
                 ctx.gpu,

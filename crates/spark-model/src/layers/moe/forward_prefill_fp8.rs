@@ -312,6 +312,14 @@ impl MoeLayer {
         let expert_gate_out = ctx.buffers.expert_gate_out();
         let expert_up_out = ctx.buffers.expert_up_out();
         let fp8_grouped_k = self.fp8_grouped_kernel();
+        // v3 cp.async grouped GEMM opt-in (ATLAS_MOE_V3=1, default OFF). The
+        // v3 kernel tiles M at PM3_M_TILE=128 (vs 64 for v1/v2), so it needs a
+        // distinct max-m-tiles count: div_ceil(total_expanded, 128). When the
+        // flag is unset or the kernel isn't linked, dispatch is byte-unchanged
+        // (v1/v2 with the existing div_ceil(., 64) max_m_tiles). PCND/SSOT:
+        // explicit flag, reuse the existing launch wrapper + handle.
+        let use_moe_v3 = self.fp8_moe_v3_enabled && self.moe_fp8_grouped_gemm_v3_k.0 != 0;
+        let max_m_tiles_v3 = (num_tokens * top_k as usize).div_ceil(128).max(1) as u32;
         // 2026-05-20: zero expert buffers unconditionally before the grouped
         // GEMMs. Even with worst-case `max_m_tiles` (which sizes the grid
         // for one-expert-eats-all), the kernel only writes rows where
@@ -393,37 +401,70 @@ impl MoeLayer {
             ctx.gpu.free(input_fp8)?;
             ctx.gpu.free(input_a_scale)?;
         } else if max_m_tiles > 0 {
-            ops::moe_fp8_grouped_gemm(
-                ctx.gpu,
-                fp8_grouped_k,
-                input,
-                gp.weight_ptrs,
-                gp.scale_ptrs,
-                expert_gate_out,
-                expert_offsets,
-                sorted_token_ids,
-                num_experts,
-                inter,
-                h,
-                max_m_tiles,
-                stream,
-            )?;
+            if use_moe_v3 {
+                ops::moe_fp8_grouped_gemm_v3(
+                    ctx.gpu,
+                    self.moe_fp8_grouped_gemm_v3_k,
+                    input,
+                    gp.weight_ptrs,
+                    gp.scale_ptrs,
+                    expert_gate_out,
+                    expert_offsets,
+                    sorted_token_ids,
+                    num_experts,
+                    inter,
+                    h,
+                    max_m_tiles_v3,
+                    stream,
+                )?;
+                ops::moe_fp8_grouped_gemm_v3(
+                    ctx.gpu,
+                    self.moe_fp8_grouped_gemm_v3_k,
+                    input,
+                    up.weight_ptrs,
+                    up.scale_ptrs,
+                    expert_up_out,
+                    expert_offsets,
+                    sorted_token_ids,
+                    num_experts,
+                    inter,
+                    h,
+                    max_m_tiles_v3,
+                    stream,
+                )?;
+            } else {
+                ops::moe_fp8_grouped_gemm(
+                    ctx.gpu,
+                    fp8_grouped_k,
+                    input,
+                    gp.weight_ptrs,
+                    gp.scale_ptrs,
+                    expert_gate_out,
+                    expert_offsets,
+                    sorted_token_ids,
+                    num_experts,
+                    inter,
+                    h,
+                    max_m_tiles,
+                    stream,
+                )?;
 
-            ops::moe_fp8_grouped_gemm(
-                ctx.gpu,
-                fp8_grouped_k,
-                input,
-                up.weight_ptrs,
-                up.scale_ptrs,
-                expert_up_out,
-                expert_offsets,
-                sorted_token_ids,
-                num_experts,
-                inter,
-                h,
-                max_m_tiles,
-                stream,
-            )?;
+                ops::moe_fp8_grouped_gemm(
+                    ctx.gpu,
+                    fp8_grouped_k,
+                    input,
+                    up.weight_ptrs,
+                    up.scale_ptrs,
+                    expert_up_out,
+                    expert_offsets,
+                    sorted_token_ids,
+                    num_experts,
+                    inter,
+                    h,
+                    max_m_tiles,
+                    stream,
+                )?;
+            }
         }
 
         // 6. Activation+mul + down GEMM
@@ -484,21 +525,39 @@ impl MoeLayer {
                 total_expanded * inter,
                 stream,
             )?;
-            ops::moe_fp8_grouped_gemm(
-                ctx.gpu,
-                fp8_grouped_k,
-                expert_gate_out,
-                dp.weight_ptrs,
-                dp.scale_ptrs,
-                expert_down_out,
-                expert_offsets,
-                spark_runtime::gpu::DevicePtr(0),
-                num_experts,
-                h,
-                inter,
-                max_m_tiles,
-                stream,
-            )?;
+            if use_moe_v3 {
+                ops::moe_fp8_grouped_gemm_v3(
+                    ctx.gpu,
+                    self.moe_fp8_grouped_gemm_v3_k,
+                    expert_gate_out,
+                    dp.weight_ptrs,
+                    dp.scale_ptrs,
+                    expert_down_out,
+                    expert_offsets,
+                    spark_runtime::gpu::DevicePtr(0),
+                    num_experts,
+                    h,
+                    inter,
+                    max_m_tiles_v3,
+                    stream,
+                )?;
+            } else {
+                ops::moe_fp8_grouped_gemm(
+                    ctx.gpu,
+                    fp8_grouped_k,
+                    expert_gate_out,
+                    dp.weight_ptrs,
+                    dp.scale_ptrs,
+                    expert_down_out,
+                    expert_offsets,
+                    spark_runtime::gpu::DevicePtr(0),
+                    num_experts,
+                    h,
+                    inter,
+                    max_m_tiles,
+                    stream,
+                )?;
+            }
         }
 
         // 7. Unpermute + weighted reduce + shared blend

@@ -223,6 +223,40 @@ pub fn w8a16_gemm(
         .launch(stream)
 }
 
+/// W8A16 GEMM pipelined (M>1): bit-identical (cosine=1.0) faster rewrite of
+/// `w8a16_gemm` — same args, same numerics, ~4.6× faster on GB10/sm_121.
+///
+/// Fix-A occupancy + cp.async pipelined kernel: 128×32 tile (M×N), 256-thread
+/// block (8 warps). Geometry mirrors the validated `w8a16_microtest`
+/// `"w8a16_gemm_pipelined"` arm (PM_M_TILE=128, PM_N_TILE=32).
+///
+/// Grid: (ceil(N/32), ceil(M/128), 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn w8a16_gemm_pipelined(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: DevicePtr,
+    block_scale: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 32), div_ceil(m, 128), 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight)
+        .arg_ptr(block_scale)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// Per-token-per-128-K-group FP8 activation quantization. Output: A_fp8
 /// [M, K] FP8 E4M3 + a_scale [M, K/128] FP32. Matches vLLM's
 /// `per_token_group_quant_fp8`.
@@ -356,6 +390,47 @@ pub fn moe_fp8_grouped_gemm(
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 64), max_m_tiles, num_experts])
         .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight_ptrs)
+        .arg_ptr(scale_ptrs)
+        .arg_ptr(output)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// FP8 grouped GEMM v3 — occupancy + cp.async pipelined rewrite of
+/// `moe_fp8_grouped_gemm` (cosine=1.0, ~5× faster on GB10/sm_121). Same args.
+///
+/// Uses a 128×64 tile (M×N), 256-thread block (8 warps). The M-tile
+/// granularity is PM3_M_TILE=128 (vs 64 for v1/v2), so `max_m_tiles` must be
+/// computed as `div_ceil(total_expanded, 128)` — distinct from the v1/v2
+/// `div_ceil(., 64)`. Geometry mirrors the validated `moe_microtest`
+/// `"moe_fp8_grouped_gemm_v3"` arm.
+///
+/// Grid: (ceil(N/64), max_m_tiles, num_experts)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_fp8_grouped_gemm_v3(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,            // [total_tokens, K] BF16
+    weight_ptrs: DevicePtr,      // [num_experts] → [N, K] FP8
+    scale_ptrs: DevicePtr,       // [num_experts] → [N/128, K/128] BF16
+    output: DevicePtr,           // [total_expanded, N] BF16
+    expert_offsets: DevicePtr,   // [num_experts + 1]
+    sorted_token_ids: DevicePtr, // [total_expanded]
+    num_experts: u32,
+    n: u32,
+    k: u32,
+    max_m_tiles: u32, // div_ceil(total_expanded, 128) — PM3_M_TILE=128
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), max_m_tiles, num_experts])
+        .block([256, 1, 1])
         .arg_ptr(input)
         .arg_ptr(weight_ptrs)
         .arg_ptr(scale_ptrs)

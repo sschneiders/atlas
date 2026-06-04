@@ -93,6 +93,11 @@ impl MoeLayer {
                 "moe_fp8_grouped_gemm",
                 "moe_fp8_grouped_gemm_v2",
             ),
+            moe_fp8_grouped_gemm_v3_k: super::super::try_kernel(
+                gpu,
+                "moe_fp8_grouped_gemm",
+                "moe_fp8_grouped_gemm_v3",
+            ),
             moe_w8a8_grouped_gemm_k: super::super::try_kernel(
                 gpu,
                 "moe_w8a8_grouped_gemm",
@@ -133,6 +138,10 @@ impl MoeLayer {
             fp8_moe_coalesced_enabled: std::env::var("ATLAS_FP8_MOE_COALESCED")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(true),
+            // v3 cp.async grouped GEMM (cosine=1.0, ~5× faster). Default OFF
+            // so production dispatch is byte-unchanged; opt-in via
+            // ATLAS_MOE_V3=1. PCND: explicit, no implicit default.
+            fp8_moe_v3_enabled: std::env::var("ATLAS_MOE_V3").as_deref() == Ok("1"),
             w8a16_gemm_k: super::super::try_kernel(gpu, "w8a16_gemm", "w8a16_gemm"),
             moe_gate_topk_fused_k: super::super::try_kernel(
                 gpu,
