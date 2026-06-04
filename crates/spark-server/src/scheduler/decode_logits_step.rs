@@ -4,6 +4,35 @@
 
 use super::*;
 
+/// DIAG (ATLAS_DECODE_TIMING=1): localize the host-path decode cost. Splits the
+/// per-token wall into `copy` (D2H of the full 248k-vocab logits + the GPU
+/// forward-wait absorbed by that sync) vs `sample` (the host scalar loops over
+/// 248k: BF16→FP32 expand + penalties + masks + argmax). Emits a 100-token
+/// running summary. Zero-cost when the env var is unset (OnceLock-gated).
+fn decode_timing_record(copy_us: u64, sample_us: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var("ATLAS_DECODE_TIMING").is_ok()) {
+        return;
+    }
+    static COPY: AtomicU64 = AtomicU64::new(0);
+    static SAMPLE: AtomicU64 = AtomicU64::new(0);
+    static CNT: AtomicU64 = AtomicU64::new(0);
+    COPY.fetch_add(copy_us, Ordering::Relaxed);
+    SAMPLE.fetch_add(sample_us, Ordering::Relaxed);
+    let n = CNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_multiple_of(100) {
+        let c = COPY.swap(0, Ordering::Relaxed);
+        let s = SAMPLE.swap(0, Ordering::Relaxed);
+        CNT.store(0, Ordering::Relaxed);
+        tracing::info!(
+            "DECODE_TIMING (last 100 host-path tokens): copy+fwd-wait={:.2}ms/tok sample(248k host)={:.2}ms/tok",
+            c as f64 / 100_000.0,
+            s as f64 / 100_000.0,
+        );
+    }
+}
+
 /// Sample and process decode logits for all active sequences.
 ///
 /// Factored out of `step_decode_only` so that `mixed_forward` can reuse
@@ -67,6 +96,7 @@ pub fn process_decode_logits(
             // We just need to read it with the matching width.
             let logits_fp32 = model.decode_logits_fp32();
             let elem_bytes = if logits_fp32 { 4 } else { 2 };
+            let t_copy = std::time::Instant::now();
             let mut buf = vec![0u8; n * vocab_size * elem_bytes];
             if let Err(e) = model.copy_logits_to_host(logits, &mut buf) {
                 tracing::error!("copy_logits_to_host error: {e:#}");
@@ -75,6 +105,7 @@ pub fn process_decode_logits(
                 }
                 return;
             }
+            let copy_us = t_copy.elapsed().as_micros() as u64;
             // SSOT: build the same `LogitsContext` the verify path passes
             // into `run_pipeline`, so `process_seq_logits` and the MTP
             // verify path share one pipeline-stage signature instead of
@@ -87,7 +118,8 @@ pub fn process_decode_logits(
                 tool_call_start_token,
                 tool_call_end_token,
             };
-            active
+            let t_sample = std::time::Instant::now();
+            let sampled: Vec<(u32, Option<crate::api::TokenLogprobs>)> = active
                 .iter_mut()
                 .enumerate()
                 .map(|(i, a)| {
@@ -103,7 +135,9 @@ pub fn process_decode_logits(
                         adaptive_sampling,
                     )
                 })
-                .collect()
+                .collect();
+            decode_timing_record(copy_us, t_sample.elapsed().as_micros() as u64);
+            sampled
         };
     let step_ms = t0.elapsed().as_secs_f64() * 1000.0;
     if tracing::enabled!(tracing::Level::DEBUG) {

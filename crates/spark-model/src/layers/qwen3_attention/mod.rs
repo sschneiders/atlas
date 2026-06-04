@@ -51,6 +51,13 @@ pub fn set_max_decode_seqs(n: u32) {
 /// to at least `num_seqs` so `num_splits` can never exceed what the fixed-size
 /// split-K workspace (`NUM_SMS` slots) supports for the actual batch.
 pub(crate) fn split_ref_seqs(num_seqs: u32) -> u32 {
+    // NOTE (2026-06-03): tried unpinning this for num_seqs==1 to raise split-K
+    // occupancy (16→48 CTAs) for single-stream long-ctx decode — clean A/B
+    // (eqfix vs splitk, same 21.8k code task) was BYTE-IDENTICAL (12.7 tok/s
+    // both), confirming attention occupancy is NOT the long-ctx bottleneck
+    // (attention is ~5% of decode bytes at depth). Reverted. The real ~3.6x
+    // decode gap vs vLLM is core kernel efficiency (MoE GEMV + per-step
+    // overhead), a separate multi-week effort. Determinism pin kept intact.
     MAX_DECODE_SEQS
         .get()
         .copied()
