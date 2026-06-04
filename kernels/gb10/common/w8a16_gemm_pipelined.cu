@@ -53,15 +53,22 @@
 // N=32 is the sweet spot. The smaller tile re-streams more B from DRAM, but the
 // kernel is occupancy/issue-bound (not DRAM-bound), so that trade is free.
 #define PM_N_TILE 32
-#define PM_K_STEP 16
+// K_STEP = 32 (Lever 2, was 16). Each resident K-step now carries TWO
+// m16n8k16 MMAs (16-K each), so the per-K-step barrier triple (raw-B sync →
+// dequant → smem_B sync → MMA → reuse sync) is amortized over 2× the MMA
+// work, halving the barrier count per K traversed. smem_Braw/smem_B grow with
+// K_STEP but stay well under budget.
+#define PM_K_STEP 32
+#define PM_K_SUB 16                           // one MMA's K-width; PM_K_STEP / PM_K_SUB sub-MMAs
+#define PM_K_SUBS (PM_K_STEP / PM_K_SUB)      // = 2
 #define PM_PAD 2
 // A-tile smem row stride MUST be a multiple of 8 BF16 (16 bytes) so every
 // 16-B cp.async chunk lands on a 16-byte boundary (cp.async.cg requires
 // 16-byte alignment — a 36-byte PAD=2 stride misaligns odd rows and faults
-// with CUDA_ERROR_MISALIGNED_ADDRESS). 16 real K-cols + 8 pad = 24 BF16 =
-// 48 bytes (multiple of 16); the pad also breaks shared-memory bank
+// with CUDA_ERROR_MISALIGNED_ADDRESS). 32 real K-cols + 8 pad = 40 BF16 =
+// 80 bytes (multiple of 16); the pad also breaks shared-memory bank
 // conflicts on the MMA's u32 reads.
-#define PM_A_STRIDE 24                        // 16 K-cols + 8 pad, mult. of 8 BF16
+#define PM_A_STRIDE 40                        // 32 K-cols + 8 pad, mult. of 8 BF16
 #define PM_FP8_BLOCK 128
 #define PM_WARPS 8
 #define PM_THREADS (PM_WARPS * 32)            // 256
@@ -102,57 +109,63 @@ __device__ __forceinline__ void cp_async_wait_le(unsigned int n) {
     }
 }
 
-// MMA over one resident K_STEP (16 K-elements). Accumulates into
-// inner[PM_N_TILES_PER_WARP][4] (one m16n8k16 per N-tile). Reads dequantized
-// BF16 weights from smem_B [k][n]
-// (cooperatively dequantized ONCE per K-step by all 256 threads — amortizing
-// the E4M3 conversion across the 8 warps that share each weight). Fragment
-// layout is byte-for-byte identical to w8a16_gemm's helper.
+// MMA over one resident K_STEP (PM_K_STEP K-elements = PM_K_SUBS m16n8k16
+// sub-MMAs of PM_K_SUB=16 K-each). Accumulates into inner[PM_N_TILES_PER_WARP][4]
+// (one accumulator per N-tile, summed across all sub-MMAs). Reads dequantized
+// BF16 weights from smem_B [k][n] (cooperatively dequantized ONCE per K-step by
+// all 256 threads — amortizing the E4M3 conversion across the 8 warps that share
+// each weight). Each sub-MMA's fragment layout is byte-for-byte identical to
+// w8a16_gemm's helper, just shifted by the sub-K offset (s*PM_K_SUB).
 __device__ __forceinline__ void pm_mma_kstep(
     const __nv_bfloat16* smem_A,   // [PM_M_TILE][PM_A_STRIDE]
-    const __nv_bfloat16* smem_B,   // [PM_K_STEP][PM_N_TILE + PM_PAD]
+    const __nv_bfloat16* smem_B,   // [PM_N_TILE][PM_K_STEP + PM_PAD] (K-contiguous)
     float inner[PM_N_TILES_PER_WARP][4],
     unsigned int warp_m_offset, unsigned int group_id, unsigned int tid
 ) {
     const unsigned int a_stride = PM_A_STRIDE;
-    const unsigned int b_stride = PM_N_TILE + PM_PAD;
+    const unsigned int b_stride = PM_K_STEP + PM_PAD;   // [n][k] K-contiguous stride
     const unsigned short* sA = (const unsigned short*)smem_A;
     const unsigned short* sB = (const unsigned short*)smem_B;
 
     unsigned int frag_r0 = warp_m_offset + group_id;
     unsigned int frag_r1 = warp_m_offset + group_id + 8;
-    unsigned int frag_c0 = tid * 2;
-    unsigned int frag_c1 = tid * 2 + 8;
-
-    unsigned int a0 = *(const unsigned int*)&sA[frag_r0 * a_stride + frag_c0];
-    unsigned int a1 = *(const unsigned int*)&sA[frag_r1 * a_stride + frag_c0];
-    unsigned int a2 = *(const unsigned int*)&sA[frag_r0 * a_stride + frag_c1];
-    unsigned int a3 = *(const unsigned int*)&sA[frag_r1 * a_stride + frag_c1];
 
     #pragma unroll
-    for (int n_tile = 0; n_tile < PM_N_TILES_PER_WARP; n_tile++) {
-        unsigned int n_col = n_tile * 8 + group_id;
-        unsigned int k0 = tid * 2;
-        unsigned int k1 = tid * 2 + 8;
+    for (int s = 0; s < PM_K_SUBS; s++) {
+        const unsigned int k_off = s * PM_K_SUB;     // K offset of this sub-MMA within the step
+        // A fragment columns for this sub-MMA (16-K window starting at k_off).
+        unsigned int frag_c0 = k_off + tid * 2;
+        unsigned int frag_c1 = k_off + tid * 2 + 8;
 
-        unsigned int b0 = ((unsigned int)sB[(k0 + 1) * b_stride + n_col] << 16) |
-                          (unsigned int)sB[k0 * b_stride + n_col];
-        unsigned int b1 = ((unsigned int)sB[(k1 + 1) * b_stride + n_col] << 16) |
-                          (unsigned int)sB[k1 * b_stride + n_col];
+        unsigned int a0 = *(const unsigned int*)&sA[frag_r0 * a_stride + frag_c0];
+        unsigned int a1 = *(const unsigned int*)&sA[frag_r1 * a_stride + frag_c0];
+        unsigned int a2 = *(const unsigned int*)&sA[frag_r0 * a_stride + frag_c1];
+        unsigned int a3 = *(const unsigned int*)&sA[frag_r1 * a_stride + frag_c1];
 
-        asm volatile(
-            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-            "{%0, %1, %2, %3}, "
-            "{%4, %5, %6, %7}, "
-            "{%8, %9}, "
-            "{%10, %11, %12, %13};"
-            : "=f"(inner[n_tile][0]), "=f"(inner[n_tile][1]),
-              "=f"(inner[n_tile][2]), "=f"(inner[n_tile][3])
-            : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-              "r"(b0), "r"(b1),
-              "f"(inner[n_tile][0]), "f"(inner[n_tile][1]),
-              "f"(inner[n_tile][2]), "f"(inner[n_tile][3])
-        );
+        #pragma unroll
+        for (int n_tile = 0; n_tile < PM_N_TILES_PER_WARP; n_tile++) {
+            unsigned int n_col = n_tile * 8 + group_id;
+            unsigned int k0 = k_off + tid * 2;
+            unsigned int k1 = k_off + tid * 2 + 8;
+
+            // [n][k] K-contiguous: (k, k+1) are adjacent → single aligned u32.
+            unsigned int b0 = *(const unsigned int*)&sB[n_col * b_stride + k0];
+            unsigned int b1 = *(const unsigned int*)&sB[n_col * b_stride + k1];
+
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                "{%0, %1, %2, %3}, "
+                "{%4, %5, %6, %7}, "
+                "{%8, %9}, "
+                "{%10, %11, %12, %13};"
+                : "=f"(inner[n_tile][0]), "=f"(inner[n_tile][1]),
+                  "=f"(inner[n_tile][2]), "=f"(inner[n_tile][3])
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+                  "r"(b0), "r"(b1),
+                  "f"(inner[n_tile][0]), "f"(inner[n_tile][1]),
+                  "f"(inner[n_tile][2]), "f"(inner[n_tile][3])
+            );
+        }
     }
 }
 
@@ -185,8 +198,26 @@ extern "C" __global__ void w8a16_gemm_pipelined(
     // N_TILE=32: smem_A 128*24*2=6144 B + smem_B 16*34*2=1088 B + smem_Braw
     // 32*16=512 B ≈ 7744 B → 15488 B for 2 stages.
     __shared__ __align__(16) __nv_bfloat16 smem_A[PM_STAGES][PM_M_TILE][PM_A_STRIDE];
-    __shared__ __nv_bfloat16 smem_B[PM_STAGES][PM_K_STEP][PM_N_TILE + PM_PAD];
+    // Lever 3: smem_B stored [n][k] (K-CONTIGUOUS), transposed from the prior
+    // [k][n] layout. The MMA B fragment packs two consecutive-K BF16 elements
+    // (k, k+1) per 32-bit register; with K contiguous that pair is a SINGLE
+    // aligned 32-bit smem load instead of two strided 16-bit loads + a shift/or.
+    // Row stride = PM_K_STEP + PM_PAD shorts (34 at K_STEP=32) keeps the u32
+    // reads off the same bank and the rows 16-bit aligned for the u32 cast.
+    __shared__ __nv_bfloat16 smem_B[PM_STAGES][PM_N_TILE][PM_K_STEP + PM_PAD];
     __shared__ __align__(16) unsigned char smem_Braw[PM_STAGES][PM_N_TILE][PM_K_STEP];
+
+    // ── Lever 1: stage the E4M3→FP32 LUT in SHARED memory ──
+    // The dequant indexes the table with DATA-DEPENDENT weight bytes; reads from
+    // __constant__ memory SERIALIZE across a warp whenever the 32 lanes hit
+    // divergent table entries (the constant cache is a broadcast cache, optimal
+    // only for UNIFORM access). Shared memory services divergent indices in
+    // parallel (one transaction per distinct bank, no broadcast restriction).
+    // Copy the 256-entry table from the __constant__ SSOT into smem ONCE per CTA
+    // (256 threads → one element each), then dequant reads the smem copy.
+    __shared__ float smem_lut[256];
+    smem_lut[threadIdx.x] = E4M3_LUT[threadIdx.x];   // PM_THREADS == 256, exact cover
+    __syncthreads();
 
     // Two-level FP32 accumulation (see file header — PRESERVED EXACTLY).
     float inner_acc[PM_N_TILES_PER_WARP][4];
@@ -204,9 +235,9 @@ extern "C" __global__ void w8a16_gemm_pipelined(
     const unsigned int n_block = cta_n / PM_FP8_BLOCK;
     const unsigned int n_steps = (K + PM_K_STEP - 1) / PM_K_STEP;
 
-    // A-tile cp.async: 128 rows × 16 K-cols BF16. Each row = 16 BF16 = 32 B =
-    // two 16-B chunks. 256 chunks total → 1 chunk/thread (256 threads).
-    const unsigned int a_chunks = (PM_M_TILE * PM_K_STEP) / 8;     // 256
+    // A-tile cp.async: 128 rows × PM_K_STEP K-cols BF16. Each 16-B chunk = 8
+    // BF16. At K_STEP=32: 128×32/8 = 512 chunks → 2 chunks/thread (256 threads).
+    const unsigned int a_chunks = (PM_M_TILE * PM_K_STEP) / 8;     // 512 at K_STEP=32
 
     // Issue cp.async loads for K-step `step` into double-buffer `stage`. The
     // copies are contiguous along K (the contiguous global axis for both A
@@ -235,39 +266,46 @@ extern "C" __global__ void w8a16_gemm_pipelined(
             }
         }
 
-        // ── B raw: one contiguous 16-B run of K-bytes per N-row ──
+        // ── B raw: contiguous 16-B (16 FP8-byte) chunks of K per N-row ──
         // smem_Braw[stage][n][k] mirrors global B[n, k_base + k] contiguously.
+        // At K_STEP=32 each N-row is 32 bytes = two 16-B chunks; iterate over
+        // (PM_N_TILE × PM_K_STEP/16) chunks, one cp.async per chunk.
+        const unsigned int b_chunks = (PM_N_TILE * PM_K_STEP) / 16;   // 64 at K_STEP=32
         #pragma unroll
-        for (unsigned int nrow = threadIdx.x; nrow < PM_N_TILE; nrow += PM_THREADS) {
+        for (unsigned int c = threadIdx.x; c < b_chunks; c += PM_THREADS) {
+            unsigned int nrow = (c * 16) / PM_K_STEP;        // 0..PM_N_TILE-1
+            unsigned int kcol = (c * 16) % PM_K_STEP;        // 0 or 16
             unsigned int gn = cta_n + nrow;
-            unsigned char* dst = &smem_Braw[stage][nrow][0];
-            if (gn < N && k_base + PM_K_STEP <= K) {
-                cp_async_cg_16(dst, &B[(unsigned long long)gn * K + k_base]);
+            unsigned int gk = k_base + kcol;
+            unsigned char* dst = &smem_Braw[stage][nrow][kcol];
+            if (gn < N && gk + 16 <= K) {
+                cp_async_cg_16(dst, &B[(unsigned long long)gn * K + gk]);
             } else {
                 #pragma unroll
-                for (unsigned int e = 0; e < PM_K_STEP; e++) {
-                    unsigned int gk = k_base + e;
-                    dst[e] = (gn < N && gk < K) ? B[(unsigned long long)gn * K + gk] : 0;
+                for (unsigned int e = 0; e < 16; e++) {
+                    unsigned int gke = gk + e;
+                    dst[e] = (gn < N && gke < K) ? B[(unsigned long long)gn * K + gke] : 0;
                 }
             }
         }
         cp_async_commit();
     };
 
-    // LUT-dequant just-arrived raw B for `stage` into the [k][n] BF16 layout
-    // the MMA reads. Raw is [n][k]; MMA wants [k][n]. No scale here (folded on
-    // the FP32 accumulator at the block boundary). Cooperative across all 256
-    // threads so each weight is converted once and reused by all 8 warps.
+    // LUT-dequant just-arrived raw B for `stage` into the MMA-ready BF16 buffer.
+    // Lever 3: smem_B is now ALSO [n][k] (K-contiguous), matching smem_Braw, so
+    // this is a same-layout element-wise dequant (no transpose). No scale here
+    // (folded on the FP32 accumulator at the block boundary). Cooperative across
+    // all 256 threads so each weight is converted once and reused by all 8 warps.
     // (Tested a direct BF16-bits LUT to skip the float→BF16 cast: bit-identical
     // but ~1% SLOWER and no register change — the float-LUT + __float2bfloat16
     // path already fuses optimally, so it is kept.)
     auto dequant_B = [&](unsigned int stage) {
         #pragma unroll
         for (unsigned int idx = threadIdx.x; idx < PM_K_STEP * PM_N_TILE; idx += PM_THREADS) {
-            unsigned int k = idx / PM_N_TILE;     // 0..15
-            unsigned int n = idx % PM_N_TILE;     // 0..PM_N_TILE-1
+            unsigned int n = idx / PM_K_STEP;     // 0..PM_N_TILE-1
+            unsigned int k = idx % PM_K_STEP;     // 0..PM_K_STEP-1
             unsigned char wb = smem_Braw[stage][n][k];
-            smem_B[stage][k][n] = __float2bfloat16(E4M3_LUT[wb]);
+            smem_B[stage][n][k] = __float2bfloat16(smem_lut[wb]);
         }
     };
 
