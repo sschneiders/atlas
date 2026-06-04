@@ -139,6 +139,8 @@ fn launch(gpu: &dyn GpuBackend, name: &str, ptrs: [DevicePtr; 4], m: u32, n: u32
     let (grid, block) = match name {
         // Current production kernel: 64×64 tile, 128-thread block.
         "w8a16_gemm" => ([n.div_ceil(64), m.div_ceil(64), 1], [128u32, 1, 1]),
+        // Fix-A pipelined rewrite: 128×128 tile, 256-thread block (8 warps).
+        "w8a16_gemm_pipelined" => ([n.div_ceil(128), m.div_ceil(128), 1], [256u32, 1, 1]),
         other => bail!("no launch geometry registered for kernel '{other}' — add an arm"),
     };
     KernelLaunch::new(gpu, handle)
