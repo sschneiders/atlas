@@ -93,10 +93,13 @@ impl MoeLayer {
                 "moe_fp8_grouped_gemm",
                 "moe_fp8_grouped_gemm_v2",
             ),
+            // ATLAS_MOE_V3 dispatch now loads v4 (K_STEP32 + K-contiguous smem_B +
+            // no-spill, +33% over v3, byte-identical numerics). Same grid/block/args
+            // as v3 so the ops::moe_fp8_grouped_gemm_v3 launch fn is reused unchanged.
             moe_fp8_grouped_gemm_v3_k: super::super::try_kernel(
                 gpu,
                 "moe_fp8_grouped_gemm",
-                "moe_fp8_grouped_gemm_v3",
+                "moe_fp8_grouped_gemm_v4",
             ),
             moe_w8a8_grouped_gemm_k: super::super::try_kernel(
                 gpu,
