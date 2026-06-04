@@ -4,10 +4,14 @@
 //
 // C[M,N] = A[M,K] (BF16 activations) * dequant(B[N,K] (FP8 E4M3 weights))
 //
-// Same math + same number formats as the production `w8a16_gemm`, but with
-// a much larger 128×128 output tile (8 warps) so each CTA re-streams far
-// less of the B weight matrix from DRAM, plus a 2-stage cp.async software
-// pipeline that hides global-load latency behind the tensor-core MMAs.
+// Same math + same number formats as the production `w8a16_gemm`, but tuned
+// for OCCUPANCY on GB10/sm_121 (the dominant lever — see the PM_N_TILE note):
+// a 128×32 output tile (8 warps) keeps the per-thread FP32 accumulator small
+// enough to fit 4 CTAs (32 warps) per SM, so warp-level parallelism hides the
+// per-K-step barriers / MMA-issue / smem latency. A 2-stage cp.async pipeline
+// prefetches the next K-step. 56 regs, no spill, 15.5 KB smem/CTA. Measured
+// ~12 TFLOP/s on the large shapes = 2.1× the 64×64 production kernel (5.6) and
+// +72% over the original 128×128 1-stage-occupancy pipelined draft (7.0).
 //
 // FP8-E4M3 weight format (2D block-scaled), identical to w8a16_gemm:
 //   B:           [N, K] uint8 — one byte per weight (FP8 E4M3)
@@ -22,22 +26,33 @@
 //   The scale is applied ONCE per block on the FP32 accumulator — never
 //   per-element, never folded into BF16.
 //
-// Pipeline (Stage 2): a 2-deep cp.async software pipeline prefetches the
-// NEXT K-step's A tile (BF16, contiguous K-run) and RAW FP8 B bytes (per-N
-// contiguous K-run) into double-buffered smem while the MMAs consume the
+// Pipeline (PM_STAGES-deep, default 2): a cp.async software pipeline prefetches
+// look-ahead K-steps' A tiles (BF16, contiguous K-run) and RAW FP8 B bytes
+// (per-N contiguous K-run) into multi-buffered smem while the MMAs consume the
 // current K-step. cp.async.cg (sm_80+) is correct on sm_121; TMA /
 // cp.async.bulk are AVOIDED (they silently corrupt on sm_121).
 //
 // Uses mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32.
 //
-// Grid: (ceil(N/128), ceil(M/128), 1), Block: (256, 1, 1) = 8 warps.
-// Static shared memory only (~24.7 KB), under the 48 KB limit.
+// Grid: (ceil(N/PM_N_TILE), ceil(M/PM_M_TILE), 1), Block: (256,1,1) = 8 warps.
+// Static shared memory only (15.5 KB at 2 stages), under the 48 KB limit.
 
 #include <cuda_bf16.h>
 #include "e4m3_lut.cuh"
 
 #define PM_M_TILE 128
-#define PM_N_TILE 128
+// N-tile = 32 (was 128). OCCUPANCY is the dominant lever on this kernel (ptxas
+// + perf sweep): the per-thread two-level FP32 accumulator tile is the register
+// hog, and registers cap how many CTAs co-reside per SM (= how many warps hide
+// each __syncthreads / MMA-issue / smem latency).
+//   N=128 → inner+outer acc = 16 N-tiles ×4 ×2 = 128 acc regs → 168 regs/thread
+//           → 1 CTA (8 warps) per SM = 12.5% occ → SM fully stalls on barriers.
+//   N=64  → 64 acc regs → 95 regs/thread → 2 CTAs (16 warps) = 25% occ. +45%.
+//   N=32  → 32 acc regs → 56 regs/thread → 4 CTAs (32 warps) = 50% occ. +68%.
+//   N=16  → 40 regs but B re-stream + tiny MMA tiles dominate → REGRESSES.
+// N=32 is the sweet spot. The smaller tile re-streams more B from DRAM, but the
+// kernel is occupancy/issue-bound (not DRAM-bound), so that trade is free.
+#define PM_N_TILE 32
 #define PM_K_STEP 16
 #define PM_PAD 2
 // A-tile smem row stride MUST be a multiple of 8 BF16 (16 bytes) so every
@@ -50,8 +65,14 @@
 #define PM_FP8_BLOCK 128
 #define PM_WARPS 8
 #define PM_THREADS (PM_WARPS * 32)            // 256
-#define PM_N_TILES_PER_WARP (PM_N_TILE / 8)   // 16 m16n8k16 N-tiles per warp
-#define PM_STAGES 2                           // double-buffered cp.async pipeline
+#define PM_N_TILES_PER_WARP (PM_N_TILE / 8)   // m16n8k16 N-tiles per warp (=4 at N_TILE=32)
+// cp.async pipeline depth. SWEEP RESULT: 2/3/4 stages are within noise
+// (12.1 / 11.85 / 11.93 TFLOP/s on 512×2048×4096) — the kernel is NOT
+// global-load-latency-bound (deepening the prefetch does not help), it is
+// occupancy/issue-bound. 2 stages wins marginally and uses the least smem
+// (15.5 KB/CTA → most headroom should the register budget ever drop enough to
+// fit a 5th CTA/SM), so keep the pipeline shallow.
+#define PM_STAGES 2
 
 // cp.async 16-byte (cg = cache-global) copy: smem <- global. sm_80+; correct
 // on sm_121 (unlike TMA / cp.async.bulk). Requires 16-byte-aligned addresses.
@@ -67,9 +88,26 @@ __device__ __forceinline__ void cp_async_wait_group() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
 
-// MMA over one resident K_STEP (16 K-elements). Accumulates into inner[16][4]
-// (one m16n8k16 per N-tile). Byte-for-byte identical fragment layout to
-// w8a16_gemm's helper, just generalised from 8 to 16 N-tiles.
+// Wait until at most `n` cp.async groups remain in flight, where `n` is a
+// runtime value in [0, PM_STAGES-1]. cp.async.wait_group requires a
+// compile-time immediate, so dispatch the runtime count through a small switch
+// over the (≤ PM_STAGES) legal values. The default arm covers any deeper
+// pipeline configuration safely (drains fully).
+__device__ __forceinline__ void cp_async_wait_le(unsigned int n) {
+    switch (n) {
+        case 0:  cp_async_wait_group<0>(); break;
+        case 1:  cp_async_wait_group<1>(); break;
+        case 2:  cp_async_wait_group<2>(); break;
+        default: cp_async_wait_group<3>(); break;
+    }
+}
+
+// MMA over one resident K_STEP (16 K-elements). Accumulates into
+// inner[PM_N_TILES_PER_WARP][4] (one m16n8k16 per N-tile). Reads dequantized
+// BF16 weights from smem_B [k][n]
+// (cooperatively dequantized ONCE per K-step by all 256 threads — amortizing
+// the E4M3 conversion across the 8 warps that share each weight). Fragment
+// layout is byte-for-byte identical to w8a16_gemm's helper.
 __device__ __forceinline__ void pm_mma_kstep(
     const __nv_bfloat16* smem_A,   // [PM_M_TILE][PM_A_STRIDE]
     const __nv_bfloat16* smem_B,   // [PM_K_STEP][PM_N_TILE + PM_PAD]
@@ -119,7 +157,7 @@ __device__ __forceinline__ void pm_mma_kstep(
 }
 
 /// W8A16 pipelined GEMM: B[N,K] row-major FP8 E4M3 with 2D block scales.
-/// 128×128 tile, 8 warps, 2-stage cp.async prefetch pipeline.
+/// 128×32 tile (M×N), 8 warps, PM_STAGES-deep cp.async prefetch pipeline.
 extern "C" __global__ void w8a16_gemm_pipelined(
     const __nv_bfloat16* __restrict__ A,            // [M, K] BF16 activations
     const unsigned char* __restrict__ B,             // [N, K] FP8 E4M3
@@ -137,10 +175,15 @@ extern "C" __global__ void w8a16_gemm_pipelined(
     const unsigned int group_id = lane_id >> 2;
     const unsigned int tid = lane_id & 3;
 
-    // Double-buffered smem (~24.7 KB total). cp.async destinations (smem_A,
-    // smem_Braw) are __align__(16) with 16-byte-aligned row strides so every
-    // 16-B cp.async.cg chunk is naturally aligned. smem_B (MMA-ready [k][n]
-    // BF16) is written by scalar dequant stores so its alignment is free.
+    // Pipelined smem. cp.async destinations (smem_A, smem_Braw) are
+    // __align__(16) with 16-byte-aligned row strides so every 16-B
+    // cp.async.cg chunk is naturally aligned. smem_B (MMA-ready [k][n] BF16) is
+    // the cooperatively-dequantized weight buffer: all 256 threads convert the
+    // K-step's weights ONCE (amortized across the 8 warps that share them) —
+    // fusing dequant into the MMA instead multiplies the LUT cost 8× and
+    // serializes the constant cache (measured 5× slowdown). Per stage at
+    // N_TILE=32: smem_A 128*24*2=6144 B + smem_B 16*34*2=1088 B + smem_Braw
+    // 32*16=512 B ≈ 7744 B → 15488 B for 2 stages.
     __shared__ __align__(16) __nv_bfloat16 smem_A[PM_STAGES][PM_M_TILE][PM_A_STRIDE];
     __shared__ __nv_bfloat16 smem_B[PM_STAGES][PM_K_STEP][PM_N_TILE + PM_PAD];
     __shared__ __align__(16) unsigned char smem_Braw[PM_STAGES][PM_N_TILE][PM_K_STEP];
@@ -213,37 +256,54 @@ extern "C" __global__ void w8a16_gemm_pipelined(
 
     // LUT-dequant just-arrived raw B for `stage` into the [k][n] BF16 layout
     // the MMA reads. Raw is [n][k]; MMA wants [k][n]. No scale here (folded on
-    // the FP32 accumulator at the block boundary).
+    // the FP32 accumulator at the block boundary). Cooperative across all 256
+    // threads so each weight is converted once and reused by all 8 warps.
+    // (Tested a direct BF16-bits LUT to skip the float→BF16 cast: bit-identical
+    // but ~1% SLOWER and no register change — the float-LUT + __float2bfloat16
+    // path already fuses optimally, so it is kept.)
     auto dequant_B = [&](unsigned int stage) {
         #pragma unroll
         for (unsigned int idx = threadIdx.x; idx < PM_K_STEP * PM_N_TILE; idx += PM_THREADS) {
             unsigned int k = idx / PM_N_TILE;     // 0..15
-            unsigned int n = idx % PM_N_TILE;     // 0..127
+            unsigned int n = idx % PM_N_TILE;     // 0..PM_N_TILE-1
             unsigned char wb = smem_Braw[stage][n][k];
             smem_B[stage][k][n] = __float2bfloat16(E4M3_LUT[wb]);
         }
     };
 
-    // ── Software-pipelined main loop ──
-    // Prologue: prefetch K-step 0 into stage 0.
-    prefetch(0, 0);
+    // ── Software-pipelined main loop (PM_STAGES-deep cp.async) ──
+    // Prologue: issue the first PM_STAGES-1 prefetches so that, on entering the
+    // main loop, the consuming stage for step 0 is already committed together
+    // with PM_STAGES-2 look-ahead stages. Each prefetch commits one cp.async
+    // group; we drain them from the head (FIFO) as we consume.
+    #pragma unroll
+    for (unsigned int p = 0; p < PM_STAGES - 1; p++) {
+        if (p < n_steps) {
+            prefetch(p, p % PM_STAGES);
+        }
+    }
     unsigned int k_step_in_block = 0;
 
     for (unsigned int step = 0; step < n_steps; step++) {
-        unsigned int cur = step & 1;
-        unsigned int nxt = (step + 1) & 1;
+        unsigned int cur = step % PM_STAGES;
 
-        // Prefetch the NEXT K-step before consuming the current one, so its
-        // global loads overlap the dequant + MMA below.
-        if (step + 1 < n_steps) {
-            prefetch(step + 1, nxt);
-            // Two groups committed (current + next); wait until ≤1 remains in
-            // flight → the CURRENT stage's copy has completed.
-            cp_async_wait_group<1>();
-        } else {
-            // Last step: only the current group is in flight.
-            cp_async_wait_group<0>();
+        // Prefetch the stage PM_STAGES-1 K-steps ahead (keeps the pipeline
+        // full) before consuming the current one, so its global loads overlap
+        // the dequant + MMA below.
+        unsigned int ahead = step + (PM_STAGES - 1);
+        if (ahead < n_steps) {
+            prefetch(ahead, ahead % PM_STAGES);
         }
+        // Drain so the `cur` stage (the oldest outstanding cp.async group) is
+        // guaranteed complete. Groups complete FIFO. After this step's
+        // prefetch, the total committed = min(n_steps, PM_STAGES + step) and
+        // `cur` is the step-th (0-indexed); the number of groups committed
+        // AFTER cur that should stay in flight is therefore:
+        //     target = min(n_steps, PM_STAGES + step) - (step + 1)
+        // which is PM_STAGES-1 in steady state and shrinks to 0 at the tail.
+        unsigned int committed = min(n_steps, PM_STAGES + step);
+        unsigned int target = committed - (step + 1);
+        cp_async_wait_le(target);
         __syncthreads();   // raw B for `cur` is now resident for all threads
 
         dequant_B(cur);

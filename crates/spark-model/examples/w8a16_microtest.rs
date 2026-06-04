@@ -29,6 +29,20 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kernel_args::KernelLaunch;
 use std::time::Instant;
 
+// Raw CUDA driver event API for kernel-only timing. The wall-clock `Instant`
+// metric below includes per-launch host overhead (~0.3 ms floor) which swamps
+// the small per-lever deltas on the compute-bound large shapes. CUDA events
+// recorded on the launch stream measure GPU execution time only, so the
+// optimization signal is trustworthy. Signatures mirror atlas-spark-bench's
+// gpu.rs (the SSOT for these decls in the benchmark crate).
+unsafe extern "C" {
+    fn cuEventCreate(event: *mut u64, flags: u32) -> i32;
+    fn cuEventRecord(event: u64, stream: u64) -> i32;
+    fn cuEventSynchronize(event: u64) -> i32;
+    fn cuEventElapsedTime(ms: *mut f32, start: u64, end: u64) -> i32;
+    fn cuEventDestroy_v2(event: u64) -> i32;
+}
+
 /// FP8 block size along both N and K (matches `FP8_BLOCK` in w8a16_gemm.cu).
 const FP8_BLOCK: usize = 128;
 /// Cosine gate. A correct kernel matches the CPU reference to ~1e-5; the
@@ -139,8 +153,8 @@ fn launch(gpu: &dyn GpuBackend, name: &str, ptrs: [DevicePtr; 4], m: u32, n: u32
     let (grid, block) = match name {
         // Current production kernel: 64×64 tile, 128-thread block.
         "w8a16_gemm" => ([n.div_ceil(64), m.div_ceil(64), 1], [128u32, 1, 1]),
-        // Fix-A pipelined rewrite: 128×128 tile, 256-thread block (8 warps).
-        "w8a16_gemm_pipelined" => ([n.div_ceil(128), m.div_ceil(128), 1], [256u32, 1, 1]),
+        // Fix-A pipelined rewrite: 128×64 tile (M×N), 256-thread block (8 warps).
+        "w8a16_gemm_pipelined" => ([n.div_ceil(32), m.div_ceil(128), 1], [256u32, 1, 1]),
         other => bail!("no launch geometry registered for kernel '{other}' — add an arm"),
     };
     KernelLaunch::new(gpu, handle)
@@ -155,6 +169,32 @@ fn launch(gpu: &dyn GpuBackend, name: &str, ptrs: [DevicePtr; 4], m: u32, n: u32
         .arg_u32(k)
         .launch(stream)?;
     gpu.synchronize(stream)?;
+    Ok(())
+}
+
+/// Launch WITHOUT a trailing stream synchronize — for the CUDA-event timing
+/// loop, where the per-launch host sync would serialize iterations and inflate
+/// the measured GPU time. The bracketing CUDA events (recorded on the same
+/// stream) capture only kernel execution. Geometry mirrors `launch`.
+fn launch_no_sync(gpu: &dyn GpuBackend, name: &str, ptrs: [DevicePtr; 4], m: u32, n: u32, k: u32, stream: u64) -> Result<()> {
+    let [a, b, scale, c] = ptrs;
+    let handle = gpu.kernel(name, name)?;
+    let (grid, block) = match name {
+        "w8a16_gemm" => ([n.div_ceil(64), m.div_ceil(64), 1], [128u32, 1, 1]),
+        "w8a16_gemm_pipelined" => ([n.div_ceil(32), m.div_ceil(128), 1], [256u32, 1, 1]),
+        other => bail!("no launch geometry registered for kernel '{other}' — add an arm"),
+    };
+    KernelLaunch::new(gpu, handle)
+        .grid(grid)
+        .block(block)
+        .arg_ptr(a)
+        .arg_ptr(b)
+        .arg_ptr(scale)
+        .arg_ptr(c)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)?;
     Ok(())
 }
 
@@ -234,12 +274,55 @@ fn main() -> Result<()> {
     let per_iter_s = t0.elapsed().as_secs_f64() / iters as f64;
     let tflops = (2.0 * m as f64 * n as f64 * k as f64) / per_iter_s / 1e12;
 
+    // ── kernel-only throughput (CUDA events on the launch stream) ──
+    // Brackets the 50 back-to-back launches (no intervening host sync) with
+    // two events; cuEventElapsedTime gives total GPU time for the batch. This
+    // excludes per-launch host overhead, so it is the trustworthy signal for
+    // the small per-lever deltas on the compute-bound large shapes.
+    let (mut ev_start, mut ev_end): (u64, u64) = (0, 0);
+    let rc = unsafe { cuEventCreate(&mut ev_start, 0) };
+    if rc != 0 {
+        bail!("cuEventCreate(start) failed: status {rc}");
+    }
+    let rc = unsafe { cuEventCreate(&mut ev_end, 0) };
+    if rc != 0 {
+        bail!("cuEventCreate(end) failed: status {rc}");
+    }
+    // Warm-up already done above. Record start, fire all iters, record end.
+    let rc = unsafe { cuEventRecord(ev_start, stream) };
+    if rc != 0 {
+        bail!("cuEventRecord(start) failed: status {rc}");
+    }
+    for _ in 0..iters {
+        launch_no_sync(gpu, &kernel, ptrs, m as u32, n as u32, k as u32, stream)?;
+    }
+    let rc = unsafe { cuEventRecord(ev_end, stream) };
+    if rc != 0 {
+        bail!("cuEventRecord(end) failed: status {rc}");
+    }
+    let rc = unsafe { cuEventSynchronize(ev_end) };
+    if rc != 0 {
+        bail!("cuEventSynchronize(end) failed: status {rc}");
+    }
+    let mut elapsed_ms: f32 = 0.0;
+    let rc = unsafe { cuEventElapsedTime(&mut elapsed_ms, ev_start, ev_end) };
+    if rc != 0 {
+        bail!("cuEventElapsedTime failed: status {rc}");
+    }
+    unsafe {
+        cuEventDestroy_v2(ev_start);
+        cuEventDestroy_v2(ev_end);
+    }
+    let kernel_s = (elapsed_ms as f64 / 1e3) / iters as f64;
+    let kernel_tflops = (2.0 * m as f64 * n as f64 * k as f64) / kernel_s / 1e12;
+
     for p in ptrs {
         gpu.free(p).ok();
     }
 
     println!("cosine={cosine:.6}  mean_rel={mean_rel:.2e}  max_rel={max_rel:.2e}");
     println!("perf: {:.3} ms/iter  ~{tflops:.2} TFLOP/s (wall-clock incl. launch)", per_iter_s * 1e3);
+    println!("kernel-only: {:.4} ms/iter  ~{kernel_tflops:.2} TFLOP/s (CUDA events)", kernel_s * 1e3);
 
     if cosine >= COSINE_GATE && cosine.is_finite() {
         println!("RESULT: PASS (cosine {cosine:.6} >= {COSINE_GATE})");
