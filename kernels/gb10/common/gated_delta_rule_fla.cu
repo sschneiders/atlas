@@ -22,6 +22,18 @@
 #define V_DIM 128
 #define CHUNK 64
 
+// GB10 sm_121 has cp.async.cg (NO TMA). 16-byte async global→shared copy + group
+// commit/wait — used to double-buffer the per-chunk W/U/K loads in chunk_delta_h
+// so the serial state spine overlaps the next chunk's load with the current
+// chunk's compute (it was global-load-LATENCY bound at 4 warps, not FLOP bound).
+__device__ __forceinline__ void cp_async16(void* dst_smem, const void* src_gmem) {
+    unsigned int s = (unsigned int)__cvta_generic_to_shared(dst_smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(src_gmem));
+}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N>
+__device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+
 // C[m][n] = Σ_k A[m][k]·B[n][k], M=64, K=K_DIM, N=NTC*8. A/B row-major bf16 smem;
 // 128 threads = 4 warps (16 M-rows each). NSTRIDE = C row-stride. (SSOT helper.)
 template <int NTC, int NSTRIDE, bool OutBf16>
@@ -178,6 +190,48 @@ gated_delta_rule_recompute_wu(
     }
 }
 
+// chunk_delta_h double-buffer: per-buffer smem holds {W,K,U} bf16 for one chunk.
+#define CDH_BUFSZ (CHUNK * (2 * K_DIM + V_DIM))   // 24576 bf16 = 48KB
+
+// Prefetch chunk c's W/U/K into buffer slot p via cp.async, and compute its gc
+// (the cumulative log-decay) on tid 0. K is loaded per-row and bounded to i<ce
+// (rows cs+i ≥ seq_len would be OOB); W/U load the full block (in-bounds, and the
+// i≥ce tail is never read since the compute loops are bounded by ce).
+__device__ __forceinline__ void cdh_prefetch(
+    __nv_bfloat16* buf, float* gcb, unsigned int p,
+    const __nv_bfloat16* __restrict__ W_in, const __nv_bfloat16* __restrict__ U_in,
+    const __nv_bfloat16* __restrict__ key, const float* __restrict__ gate,
+    unsigned int c, unsigned int b, unsigned int vh, unsigned int seq_len,
+    unsigned int num_chunks, unsigned int num_v_heads, unsigned int k_dim,
+    unsigned int kh, unsigned int qk_stride, unsigned int gb_stride
+) {
+    const unsigned int tid = threadIdx.x;
+    const unsigned int cs = c * CHUNK;
+    const unsigned int ce = (seq_len - cs) < CHUNK ? (seq_len - cs) : CHUNK;
+    const unsigned long long base = ((unsigned long long)(b * num_chunks + c) * num_v_heads + vh);
+    __nv_bfloat16* Wp = buf + (unsigned long long)p * CDH_BUFSZ;
+    __nv_bfloat16* Kp = Wp + CHUNK * K_DIM;
+    __nv_bfloat16* Up = Kp + CHUNK * K_DIM;
+    const __nv_bfloat16* Wsrc = W_in + base * CHUNK * K_DIM;
+    for (unsigned int e = tid * 8; e < CHUNK * K_DIM; e += 128 * 8) cp_async16(&Wp[e], &Wsrc[e]);
+    const __nv_bfloat16* Usrc = U_in + base * CHUNK * V_DIM;
+    for (unsigned int e = tid * 8; e < CHUNK * V_DIM; e += 128 * 8) cp_async16(&Up[e], &Usrc[e]);
+    for (unsigned int j = tid; j < CHUNK * 16; j += 128) {
+        unsigned int i = j >> 4, c16 = (j & 15) * 8;
+        if (i < ce)
+            cp_async16(&Kp[i * K_DIM + c16],
+                       key + (unsigned long long)(cs + i) * qk_stride + kh * k_dim + c16);
+    }
+    if (tid == 0) {
+        float acc = 0.0f;
+        for (unsigned int i = 0; i < ce; i++) {
+            acc += logf(gate[(unsigned long long)(cs + i) * gb_stride + vh]);
+            gcb[p * CHUNK + i] = acc;
+        }
+    }
+    cp_commit();
+}
+
 // ── KERNEL 2: chunk_delta_h ──────────────────────────────────────────────
 // The SERIAL state-passing spine — PRECISION-CRITICAL, so S stays f32 and its
 // matmuls are fp32-FFMA (NOT bf16-TC: bf16-S drift fails token-equality).
@@ -185,14 +239,15 @@ gated_delta_rule_recompute_wu(
 // = v-columns; thread tid owns the WHOLE state column S[:,tid] RESIDENT IN
 // REGISTERS (Sreg[K_DIM]) across all chunks — loaded once, updated in-register
 // per chunk, stored once. This kills the per-chunk smem read/write of the 64KB
-// f32 state (~98k smem ops/thread over a 16k ctx) that bottlenecked the prior
-// smem-resident design at ~5.8 TFLOP/s (latency-bound at 4 warps, not FLOP-bound).
-// Freed smem also lets W and K live in SEPARATE buffers → one fewer sync/chunk.
+// f32 state, and the freed smem is spent on a DOUBLE BUFFER so the per-chunk
+// W/U/K loads (the real bottleneck: global-load latency unhidden at 4 warps)
+// are cp.async-prefetched for chunk c+1 while chunk c computes.
 // (V-tiling for occupancy REGRESSED — 2 CTAs/head redundantly reload W + re-run
-// the serial loop. bf16x2-TC for the matmuls is the precision-sensitive next lever.)
+// the serial loop. bf16-TC for the matmuls validated precision-safe but the
+// kernel is load-latency bound, not FLOP bound, so prefetch is the lever.)
 // Per chunk c (entry S_c): store S_c → S_out; uc = U_c - W_c·S_c → uc_out;
 // S_{c+1} = exp(gc_last)·S_c + Σ_i exp(gc_last-gc_i)·uc_i·k_i.
-// smem: Wb(16K bf16) + Kb(16K bf16) + Ub(16K bf16) + gc = 49408 B.
+// smem: 2×{W(16K)+K(16K)+U(16K)} bf16 + gc[2][CHUNK] = 98816 B.
 extern "C" __global__ void __launch_bounds__(128, 1)
 gated_delta_rule_chunk_delta_h(
     float* __restrict__ h_state,          // [nv][K][V] per (b,vh): entry state IN, final state OUT
@@ -220,10 +275,8 @@ gated_delta_rule_chunk_delta_h(
     const unsigned int kh = vh / head_repeat;
 
     extern __shared__ char smem_raw[];
-    __nv_bfloat16* Wb = (__nv_bfloat16*)smem_raw;                 // [CHUNK*K_DIM] bf16
-    __nv_bfloat16* Kb = Wb + CHUNK * K_DIM;                       // [CHUNK*K_DIM] bf16
-    __nv_bfloat16* Ub = Kb + CHUNK * K_DIM;                       // [CHUNK*V_DIM] bf16
-    float* gc = (float*)(Ub + CHUNK * V_DIM);                     // [CHUNK]
+    __nv_bfloat16* buf = (__nv_bfloat16*)smem_raw;          // buf[2][CDH_BUFSZ]
+    float* gcb = (float*)(buf + 2 * CDH_BUFSZ);             // gcb[2][CHUNK]
 
     // State column S[:,tid] resident in registers for this thread's whole lifetime.
     float* H = h_state + ((unsigned long long)(b * num_v_heads + vh) * K_DIM * V_DIM);
@@ -231,58 +284,57 @@ gated_delta_rule_chunk_delta_h(
     #pragma unroll
     for (unsigned int k = 0; k < K_DIM; k++) Sreg[k] = H[k * V_DIM + tid];
 
+    // Prologue: kick off chunk 0's loads.
+    cdh_prefetch(buf, gcb, 0, W_in, U_in, key, gate, 0, b, vh, seq_len,
+                 num_chunks, num_v_heads, k_dim, kh, qk_stride, gb_stride);
+
     for (unsigned int c = 0; c < num_chunks; c++) {
+        const unsigned int cur = c & 1u;
         const unsigned int cs = c * CHUNK;
         const unsigned int ce = (seq_len - cs) < CHUNK ? (seq_len - cs) : CHUNK;
         const unsigned long long base = ((unsigned long long)(b * num_chunks + c) * num_v_heads + vh);
 
-        // Store entry state S_c (thread tid owns column tid).
+        if (c + 1 < num_chunks) {
+            cdh_prefetch(buf, gcb, (c + 1) & 1u, W_in, U_in, key, gate, c + 1, b, vh, seq_len,
+                         num_chunks, num_v_heads, k_dim, kh, qk_stride, gb_stride);
+            cp_wait<1>();   // chunk c's loads (older group) complete; keep c+1's in flight
+        } else {
+            cp_wait<0>();
+        }
+        __syncthreads();    // make buf[cur] visible CTA-wide
+
+        __nv_bfloat16* Wp = buf + (unsigned long long)cur * CDH_BUFSZ;
+        __nv_bfloat16* Kp = Wp + CHUNK * K_DIM;
+        __nv_bfloat16* Up = Kp + CHUNK * K_DIM;
+        const float* gcc = gcb + cur * CHUNK;
+
+        // Store entry state S_c (thread tid owns column tid; fire-and-forget global write).
         #pragma unroll
         for (unsigned int k = 0; k < K_DIM; k++)
             S_out[base * K_DIM * V_DIM + k * V_DIM + tid] = Sreg[k];
-        for (unsigned int idx = tid; idx < CHUNK * k_dim; idx += 128) {
-            unsigned int i = idx / k_dim, k = idx % k_dim;
-            bool live = i < ce;
-            Wb[i * K_DIM + k] = live ? W_in[base * CHUNK * K_DIM + i * k_dim + k] : __float2bfloat16(0.0f);
-            Kb[i * K_DIM + k] = live
-                ? key[(unsigned long long)(cs + i) * qk_stride + kh * k_dim + k]
-                : __float2bfloat16(0.0f);
-        }
-        for (unsigned int idx = tid; idx < CHUNK * v_dim; idx += 128) {
-            unsigned int i = idx / v_dim, v = idx % v_dim;
-            Ub[i * V_DIM + v] = (i < ce) ? U_in[base * CHUNK * V_DIM + i * v_dim + v] : __float2bfloat16(0.0f);
-        }
-        if (tid == 0) {
-            float acc = 0.0f;
-            for (unsigned int i = 0; i < ce; i++) {
-                acc += logf(gate[(unsigned long long)(cs + i) * gb_stride + vh]);
-                gc[i] = acc;
-            }
-        }
-        __syncthreads();
 
         // uc_i = U_i - W_i·S   (W·S contracts over k against the register state column)
         float duc[CHUNK];
-        const float dl = gc[ce - 1];
+        const float dl = gcc[ce - 1];
         const float edl = expf(dl);
         for (unsigned int i = 0; i < ce; i++) {
             float ws = 0.0f;
             #pragma unroll
             for (unsigned int k = 0; k < K_DIM; k++)
-                ws += (float)Wb[i * K_DIM + k] * Sreg[k];
-            float uci = (float)Ub[i * V_DIM + tid] - ws;
+                ws += (float)Wp[i * K_DIM + k] * Sreg[k];
+            float uci = (float)Up[i * V_DIM + tid] - ws;
             uc_out[base * CHUNK * V_DIM + i * v_dim + tid] = __float2bfloat16(uci);
-            duc[i] = expf(dl - gc[i]) * uci;   // decayed corrected-value, once per i
+            duc[i] = expf(dl - gcc[i]) * uci;   // decayed corrected-value, once per i
         }
         // S_{c+1} = edl·S + Σ_i duc_i·k_i   (in-register update, no smem state traffic)
         #pragma unroll
         for (unsigned int k = 0; k < K_DIM; k++) {
             float hv = edl * Sreg[k];
             for (unsigned int i = 0; i < ce; i++)
-                hv += duc[i] * (float)Kb[i * K_DIM + k];   // pure MAC inner loop
+                hv += duc[i] * (float)Kp[i * K_DIM + k];   // pure MAC inner loop
             Sreg[k] = hv;
         }
-        __syncthreads();   // Wb/Kb/Ub reused next chunk
+        __syncthreads();   // before buf[cur] is overwritten by the chunk-(c+2) prefetch
     }
 
     #pragma unroll

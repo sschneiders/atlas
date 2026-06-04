@@ -108,7 +108,7 @@ fn main() -> Result<()> {
         let hp = up_f32(g, &h0)?;
         let scp = g.alloc(nt * NV * KD * VD * 4)?;
         let ucp = g.alloc(nt * NV * C * VD * 2)?;
-        let smem2 = (C * KD * 2 + C * KD * 2 + C * VD * 2 + C * 4) as u32; // Wb+Kb+Ub+gc (S now in regs)
+        let smem2 = (2 * (C * (2*KD + VD) * 2) + 2 * C * 4) as u32; // 2×{W,K,U} double-buffer + 2×gc
         KernelLaunch::new(g, k_dh)
             .grid([NV as u32, 1, 1]).block([128, 1, 1]).shared_mem(smem2)
             .arg_ptr(hp).arg_ptr(wp).arg_ptr(up).arg_ptr(kp).arg_ptr(gp).arg_ptr(scp).arg_ptr(ucp)
@@ -153,7 +153,7 @@ fn main() -> Result<()> {
     let scp = g.alloc(nt * NV * KD * VD * 4)?; let ucp = g.alloc(nt * NV * C * VD * 2)?;
     let op = g.alloc(t * NV * VD * 2)?;
     let s1 = (C * KD * 2 + C * C * 4 + C * C * 4 + C * 4) as u32;
-    let s2 = (C * KD * 2 + C * KD * 2 + C * VD * 2 + C * 4) as u32; // Wb+Kb+Ub+gc (S now in regs)
+    let s2 = (2 * (C * (2*KD + VD) * 2) + 2 * C * 4) as u32; // 2×{W,K,U} double-buffer + 2×gc
     let s3 = (C * KD * 2 + C * KD * 2 + C * C * 4 + C * VD * 2 + KD * VD * 2 + C * 4) as u32;
     let fla = |g: &dyn GpuBackend| -> Result<()> {
         KernelLaunch::new(g, k_wu).grid([nt as u32, NV as u32, 1]).block([128, 1, 1]).shared_mem(s1)

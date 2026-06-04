@@ -271,6 +271,133 @@ fn fla_decomposed_ref(inp: &Inputs, d: Dims) -> (Vec<f64>, Vec<f64>) {
     (out, h)
 }
 
+/// Round-to-nearest-even truncation of an f64 to bf16 precision (8-bit mantissa),
+/// returned as f64 — simulates a bf16 tensor-core operand without a half dep.
+#[inline]
+fn b16(x: f64) -> f64 {
+    let f = x as f32;
+    let bits = f.to_bits();
+    let bias = 0x7FFFu32 + ((bits >> 16) & 1);
+    f32::from_bits(bits.wrapping_add(bias) & 0xFFFF_0000) as f64
+}
+#[inline]
+fn b16if(x: f64, on: bool) -> f64 {
+    if on { b16(x) } else { x }
+}
+
+/// FLA decomposition with SELECTIVE bf16-input rounding on the two chunk_delta_h
+/// matmuls, to decide where a bf16-tensor-core path is precision-safe.
+/// `round_ws`  → round the S-read operand of W·S (the uc = U − W·S cancellation).
+/// `round_su`  → round the duc and K operands of the serial S-update.
+/// W/U/K intermediates are ALWAYS bf16 (they already are in the live kernel), so
+/// (false,false) reproduces the current register-S kernel's precision.
+fn fla_decomposed_bf16sim_ref(
+    inp: &Inputs, d: Dims, round_ws: bool, round_su: bool,
+) -> (Vec<f64>, Vec<f64>) {
+    const C: usize = 64;
+    let scale = (d.kd as f64).powf(-0.5);
+    let mut h = inp.h0.clone();
+    let mut out = vec![0.0f64; d.t * d.nv * d.vd];
+    let kdot = |a_t: usize, b_t: usize, kh: usize, sb: &[f64]| -> f64 {
+        let mut s = 0.0;
+        for j in 0..d.kd { s += inp.k[qk(a_t, kh, j, d)] * sb[qk(b_t, kh, j, d)]; }
+        s
+    };
+    for vh in 0..d.nv {
+        let kh = vh / d.head_repeat();
+        let mut cs = 0;
+        while cs < d.t {
+            let ce = C.min(d.t - cs);
+            let mut gc = vec![0.0f64; ce];
+            let mut acc = 0.0;
+            for i in 0..ce { acc += inp.gate[(cs + i) * d.nv + vh].ln(); gc[i] = acc; }
+            let mut uu = vec![0.0f64; ce * d.vd];
+            let mut ww = vec![0.0f64; ce * d.kd];
+            for i in 0..ce {
+                let bi = inp.beta[(cs + i) * d.nv + vh];
+                for v in 0..d.vd { uu[i * d.vd + v] = bi * inp.v[vid(cs + i, vh, v, d)]; }
+                let egci = gc[i].exp();
+                for k in 0..d.kd { ww[i * d.kd + k] = bi * egci * inp.k[qk(cs + i, kh, k, d)]; }
+                for l in 0..i {
+                    let lil = bi * (gc[i] - gc[l]).exp() * kdot(cs + l, cs + i, kh, &inp.k);
+                    for v in 0..d.vd { uu[i * d.vd + v] -= lil * uu[l * d.vd + v]; }
+                    for k in 0..d.kd { ww[i * d.kd + k] -= lil * ww[l * d.kd + k]; }
+                }
+            }
+            // uf = U − W·S ; W is bf16 always, S-read bf16 iff round_ws (f32 accumulate).
+            let mut uf = vec![0.0f64; ce * d.vd];
+            for i in 0..ce {
+                for v in 0..d.vd {
+                    let mut s = uu[i * d.vd + v];
+                    for k in 0..d.kd {
+                        s -= b16(ww[i * d.kd + k]) * b16if(h[hid(vh, k, v, d)], round_ws);
+                    }
+                    uf[i * d.vd + v] = s;
+                }
+            }
+            // chunk_fwd_o is the parallel output pass — leave it f32 (separate kernel #3).
+            for i in 0..ce {
+                let egci = gc[i].exp();
+                for v in 0..d.vd {
+                    let mut o = 0.0;
+                    for k in 0..d.kd { o += egci * h[hid(vh, k, v, d)] * inp.q[qk(cs + i, kh, k, d)]; }
+                    for l in 0..=i {
+                        let kqd = kdot(cs + l, cs + i, kh, &inp.q);
+                        o += (gc[i] - gc[l]).exp() * kqd * uf[l * d.vd + v];
+                    }
+                    out[vid(cs + i, vh, v, d)] = o * scale;
+                }
+            }
+            // S-update: S = exp(dl)·S + Σ duc_i·k_i. K bf16 always; duc bf16 iff round_su.
+            let last = ce - 1;
+            let dl = gc[last];
+            for k in 0..d.kd {
+                for v in 0..d.vd {
+                    let mut hv = dl.exp() * h[hid(vh, k, v, d)];
+                    for i in 0..ce {
+                        let duc = (dl - gc[i]).exp() * uf[i * d.vd + v];
+                        hv += b16if(duc, round_su) * b16(inp.k[qk(cs + i, kh, k, d)]);
+                    }
+                    h[hid(vh, k, v, d)] = hv;
+                }
+            }
+            cs += ce;
+        }
+    }
+    (out, h)
+}
+
+/// Precision probe (run: `cargo test -p spark-runtime --release
+/// fla_bf16_precision_probe -- --ignored --nocapture`). Decides whether bf16-TC
+/// is safe for the W·S and/or S-update matmuls at a realistic 28k-token depth.
+#[test]
+#[ignore = "long; explicit precision probe"]
+fn fla_bf16_precision_probe() {
+    let d = Dims { t: 28000, nk: 2, nv: 4, kd: 128, vd: 128 };
+    let inp = gen_inputs(d, 0xC0FFEE);
+    let (o_rec, h_rec) = recurrent_ref(&inp, d);
+    let maxabs = |a: &[f64], b: &[f64]| -> (f64, f64) {
+        let (mut md, mut mref) = (0.0f64, 0.0f64);
+        for (x, y) in a.iter().zip(b) { md = md.max((x - y).abs()); mref = mref.max(y.abs()); }
+        (md, mref)
+    };
+    eprintln!("FLA bf16-TC precision probe @ t={} kd={} vd={} (vs recurrent SSOT)", d.t, d.kd, d.vd);
+    eprintln!("  scenario              out_maxabs  H_maxabs   (|out|max={:.3} |H|max={:.3})",
+        o_rec.iter().fold(0.0f64, |m, &x| m.max(x.abs())),
+        h_rec.iter().fold(0.0f64, |m, &x| m.max(x.abs())));
+    for (name, rw, rs) in [
+        ("baseline (S f32,duc f32)", false, false),
+        ("W·S bf16-read         ", true, false),
+        ("S-update duc bf16     ", false, true),
+        ("both bf16             ", true, true),
+    ] {
+        let (o, hh) = fla_decomposed_bf16sim_ref(&inp, d, rw, rs);
+        let (od, _) = maxabs(&o, &o_rec);
+        let (hd, _) = maxabs(&hh, &h_rec);
+        eprintln!("  {name}   out={od:.5}    H={hd:.5}");
+    }
+}
+
 #[test]
 fn fla_decomposed_matches_recurrent_oracle() {
     let dims_base = |t| Dims { t, nk: 2, nv: 4, kd: 8, vd: 8 };
