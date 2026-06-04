@@ -30,6 +30,19 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kernel_args::KernelLaunch;
 use std::time::Instant;
 
+// Raw CUDA driver event API for kernel-only timing. The wall-clock `Instant`
+// metric below includes per-launch host overhead which swamps small per-lever
+// deltas at the representative compute-bound size. CUDA events recorded on the
+// launch stream measure GPU execution time only, so the optimization signal is
+// trustworthy. Signatures mirror atlas-spark-bench's gpu.rs (the SSOT).
+unsafe extern "C" {
+    fn cuEventCreate(event: *mut u64, flags: u32) -> i32;
+    fn cuEventRecord(event: u64, stream: u64) -> i32;
+    fn cuEventSynchronize(event: u64) -> i32;
+    fn cuEventElapsedTime(ms: *mut f32, start: u64, end: u64) -> i32;
+    fn cuEventDestroy_v2(event: u64) -> i32;
+}
+
 const FP8_BLOCK: usize = 128;
 const COSINE_GATE: f64 = 0.9995;
 
@@ -103,6 +116,10 @@ fn main() -> Result<()> {
     let n: usize = args.get(4).map_or(256, |s| s.parse().unwrap());
     let k: usize = args.get(5).map_or(256, |s| s.parse().unwrap());
     let seed: u64 = args.get(6).map_or(0x9E3, |s| u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0x9E3));
+    // PERF-ONLY mode (arg 7 = "perf"): skip the O(experts*tok*N*K) CPU
+    // reference so a representative-size perf sweep (e.g. 8x256x2048x2048)
+    // runs in milliseconds. Correctness is gated separately on small configs.
+    let perf_only = args.get(7).map(|s| s == "perf" || s == "--perf").unwrap_or(false);
 
     if k % FP8_BLOCK != 0 {
         bail!("K ({k}) must be a multiple of {FP8_BLOCK}");
@@ -156,12 +173,29 @@ fn main() -> Result<()> {
     // C[total, N] BF16, zero-initialized (matches production memset)
     let c_ptr = upload_bytes(gpu, &vec![0u8; total * n * 2])?;
 
-    let max_m_tiles = (tpe.div_ceil(64)) as u32; // worst-case M-tiles across experts
-    let launch = |stream: u64| -> Result<()> {
+    // Per-kernel launch geometry. v1/v2 use a 64×64 tile, 128-thread block;
+    // v3 (Fix-B occupancy + cp.async rewrite) uses a 128×64 tile, 256-thread
+    // block. The M-tile count is the worst-case across experts at the kernel's
+    // M_TILE=128 granularity (here all experts have `tpe` tokens).
+    let grid_block = |name: &str| -> ([u32; 3], [u32; 3]) {
+        match name {
+            "moe_fp8_grouped_gemm_v3" => (
+                [(n as u32).div_ceil(64), (tpe.div_ceil(128)) as u32, num_experts as u32],
+                [256, 1, 1],
+            ),
+            // v1 / v2 default.
+            _ => (
+                [(n as u32).div_ceil(64), (tpe.div_ceil(64)) as u32, num_experts as u32],
+                [128, 1, 1],
+            ),
+        }
+    };
+    let (grid, block) = grid_block(&kernel);
+    let do_launch = |stream: u64, sync: bool| -> Result<()> {
         let handle = gpu.kernel("moe_fp8_grouped_gemm", &kernel)?;
         KernelLaunch::new(gpu, handle)
-            .grid([(n as u32).div_ceil(64), max_m_tiles, num_experts as u32])
-            .block([128, 1, 1])
+            .grid(grid)
+            .block(block)
             .arg_ptr(a_ptr)
             .arg_ptr(w_tbl)
             .arg_ptr(s_tbl)
@@ -172,53 +206,62 @@ fn main() -> Result<()> {
             .arg_u32(n as u32)
             .arg_u32(k as u32)
             .launch(stream)?;
-        gpu.synchronize(stream)
+        if sync { gpu.synchronize(stream) } else { Ok(()) }
     };
+    let launch = |stream: u64| -> Result<()> { do_launch(stream, true) };
     launch(stream)?;
-    let mut c_raw = vec![0u8; total * n * 2];
-    gpu.copy_d2h(c_ptr, &mut c_raw)?;
-    let c_gpu: Vec<u16> = c_raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
 
-    // ── CPU reference (per expert; two-level FP32 block-scale accumulation) ──
-    let mut c_cpu = vec![0u16; total * n];
-    for e in 0..num_experts {
-        let m_start = expert_offsets[e] as usize;
-        let m_end = expert_offsets[e + 1] as usize;
-        for m in m_start..m_end {
-            let token = sorted_token_ids[m] as usize;
-            for col in 0..n {
-                let mut outer = 0.0f32;
-                for kb in 0..k_blocks {
-                    let mut inner = 0.0f32;
-                    for kk in 0..FP8_BLOCK {
-                        let gk = kb * FP8_BLOCK + kk;
-                        let a = bf16_bits_to_f32(a_bf16[token * k + gk]);
-                        let b = e4m3_to_f32(weights[e][col * k + gk]);
-                        inner += a * b;
+    // ── correctness vs CPU reference (skipped in PERF-ONLY mode) ──
+    let cosine = if perf_only {
+        f64::NAN
+    } else {
+        let mut c_raw = vec![0u8; total * n * 2];
+        gpu.copy_d2h(c_ptr, &mut c_raw)?;
+        let c_gpu: Vec<u16> = c_raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+
+        // CPU reference (per expert; two-level FP32 block-scale accumulation).
+        let mut c_cpu = vec![0u16; total * n];
+        for e in 0..num_experts {
+            let m_start = expert_offsets[e] as usize;
+            let m_end = expert_offsets[e + 1] as usize;
+            for m in m_start..m_end {
+                let token = sorted_token_ids[m] as usize;
+                for col in 0..n {
+                    let mut outer = 0.0f32;
+                    for kb in 0..k_blocks {
+                        let mut inner = 0.0f32;
+                        for kk in 0..FP8_BLOCK {
+                            let gk = kb * FP8_BLOCK + kk;
+                            let a = bf16_bits_to_f32(a_bf16[token * k + gk]);
+                            let b = e4m3_to_f32(weights[e][col * k + gk]);
+                            inner += a * b;
+                        }
+                        outer += inner * scales[e][(col / FP8_BLOCK) * k_blocks + kb];
                     }
-                    outer += inner * scales[e][(col / FP8_BLOCK) * k_blocks + kb];
+                    c_cpu[m * n + col] = f32_to_bf16_bits(outer);
                 }
-                c_cpu[m * n + col] = f32_to_bf16_bits(outer);
             }
         }
-    }
 
-    // ── compare ──
-    let (mut dot, mut ng, mut nc, mut max_rel, mut sum_rel) = (0f64, 0f64, 0f64, 0f64, 0f64);
-    for i in 0..total * n {
-        let g = bf16_bits_to_f32(c_gpu[i]) as f64;
-        let c = bf16_bits_to_f32(c_cpu[i]) as f64;
-        dot += g * c;
-        ng += g * g;
-        nc += c * c;
-        let rel = (g - c).abs() / c.abs().max(1e-3);
-        max_rel = max_rel.max(rel);
-        sum_rel += rel;
-    }
-    let cosine = dot / (ng.sqrt() * nc.sqrt());
-    let mean_rel = sum_rel / (total * n) as f64;
+        // compare
+        let (mut dot, mut ng, mut nc, mut max_rel, mut sum_rel) = (0f64, 0f64, 0f64, 0f64, 0f64);
+        for i in 0..total * n {
+            let g = bf16_bits_to_f32(c_gpu[i]) as f64;
+            let c = bf16_bits_to_f32(c_cpu[i]) as f64;
+            dot += g * c;
+            ng += g * g;
+            nc += c * c;
+            let rel = (g - c).abs() / c.abs().max(1e-3);
+            max_rel = max_rel.max(rel);
+            sum_rel += rel;
+        }
+        let cos = dot / (ng.sqrt() * nc.sqrt());
+        let mean_rel = sum_rel / (total * n) as f64;
+        println!("cosine={cos:.6}  mean_rel={mean_rel:.2e}  max_rel={max_rel:.2e}");
+        cos
+    };
 
-    // ── rough throughput (wall-clock; relative A/B) ──
+    // ── rough throughput (wall-clock; includes launch overhead, relative A/B) ──
     let iters = 50;
     for _ in 0..5 {
         launch(stream)?;
@@ -229,10 +272,35 @@ fn main() -> Result<()> {
     }
     let per_iter = t0.elapsed().as_secs_f64() / iters as f64;
     let tflops = (2.0 * total as f64 * n as f64 * k as f64) / per_iter / 1e12;
-
-    println!("cosine={cosine:.6}  mean_rel={mean_rel:.2e}  max_rel={max_rel:.2e}");
     println!("perf: {:.3} ms/iter  ~{tflops:.2} TFLOP/s (wall-clock incl. launch)", per_iter * 1e3);
-    if cosine >= COSINE_GATE && cosine.is_finite() {
+
+    // ── kernel-only throughput (CUDA events on the launch stream) ──
+    // Brackets `iters` back-to-back launches (no intervening host sync) with two
+    // events; cuEventElapsedTime gives total GPU time for the batch, excluding
+    // per-launch host overhead — the trustworthy signal for per-lever deltas.
+    let (mut ev_start, mut ev_end): (u64, u64) = (0, 0);
+    if unsafe { cuEventCreate(&mut ev_start, 0) } != 0 { bail!("cuEventCreate(start) failed"); }
+    if unsafe { cuEventCreate(&mut ev_end, 0) } != 0 { bail!("cuEventCreate(end) failed"); }
+    if unsafe { cuEventRecord(ev_start, stream) } != 0 { bail!("cuEventRecord(start) failed"); }
+    for _ in 0..iters {
+        do_launch(stream, false)?;
+    }
+    if unsafe { cuEventRecord(ev_end, stream) } != 0 { bail!("cuEventRecord(end) failed"); }
+    if unsafe { cuEventSynchronize(ev_end) } != 0 { bail!("cuEventSynchronize(end) failed"); }
+    let mut elapsed_ms: f32 = 0.0;
+    if unsafe { cuEventElapsedTime(&mut elapsed_ms, ev_start, ev_end) } != 0 { bail!("cuEventElapsedTime failed"); }
+    unsafe {
+        cuEventDestroy_v2(ev_start);
+        cuEventDestroy_v2(ev_end);
+    }
+    let kernel_s = (elapsed_ms as f64 / 1e3) / iters as f64;
+    let kernel_tflops = (2.0 * total as f64 * n as f64 * k as f64) / kernel_s / 1e12;
+    println!("kernel-only: {:.4} ms/iter  ~{kernel_tflops:.2} TFLOP/s (CUDA events)", kernel_s * 1e3);
+
+    if perf_only {
+        println!("RESULT: PERF-ONLY (no correctness check)");
+        Ok(())
+    } else if cosine >= COSINE_GATE && cosine.is_finite() {
         println!("RESULT: PASS (cosine {cosine:.6} >= {COSINE_GATE})");
         Ok(())
     } else {
