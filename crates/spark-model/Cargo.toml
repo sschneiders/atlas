@@ -78,3 +78,7 @@ workspace = true
 [[example]]
 name = "w8a16_microtest"
 required-features = ["cuda"]
+
+[[example]]
+name = "moe_microtest"
+required-features = ["cuda"]
