@@ -43,6 +43,21 @@ impl Qwen3SsmLayer {
         let d_conv = ctx.config.linear_conv_kernel_dim;
         let qkvz_size = ctx.config.ssm_qkvz_size(); // 12288
 
+        // Env-gated per-substep timing (ATLAS_VERIFY_TIMING=1, eager mode).
+        // `ck` syncs the stream and charges the elapsed wall-time since the
+        // previous checkpoint to `acc`. Zero overhead when disabled.
+        use crate::layers::verify_timing as vt;
+        let timing = vt::enabled();
+        let mut ck_t = std::time::Instant::now();
+        let mut ck = |acc: &std::sync::atomic::AtomicU64| -> Result<()> {
+            if timing {
+                ctx.gpu.synchronize(stream)?;
+                vt::add(acc, ck_t.elapsed().as_nanos() as u64);
+                ck_t = std::time::Instant::now();
+            }
+            Ok(())
+        };
+
         // ── 1. RMS norm + residual for K tokens ──
         let normed = ctx.buffers.norm_output();
         ops::rms_norm_residual(
@@ -57,6 +72,7 @@ impl Qwen3SsmLayer {
             eps,
             stream,
         )?;
+        ck(&vt::SSM_RMSNORM_NS)?;
 
         // ── 2+3. QKVZ projection (+ deinterleave if needed) ──
         // For sequential_qkvz (Qwen3.5): write directly to deinterleaved buffer.
@@ -209,47 +225,42 @@ impl Qwen3SsmLayer {
                 )?;
             }
         }
+        ck(&vt::SSM_QKVZ_NS)?;
 
-        // ── 4. BA projection + GDN gates per token ──
-        // BA output: ssm_ba buffer; gates: ssm_gates buffer [K, nv*2] FP32
-        // Layout per token: [gate(nv), beta(nv)] → stride = 2*nv FP32 elements.
-        // Must match gdn_decode_chunk2's gb_stride parameter.
+        // ── 4. Fused BA projection + GDN gates (token-parallel) ──
+        // gates: ssm_gates buffer [K, nv*2] FP32, per-token layout
+        // [gate(nv), beta(nv)] → stride = 2*nv FP32 elements. Must match the
+        // gb_stride parameter that gdn_decode_wy{2,3,4}/gdn_decode read below.
+        //
+        // AMORTIZATION (MTP K-token verify): the prior per-token loop launched
+        // K× `dense_gemv` + K× `compute_gdn_gates` (2K kernels). Replace with
+        // the SAME fused kernel the prefill path uses (`ba_gates_prefill_k`),
+        // which adds a token dimension via blockIdx.y and produces the
+        // identical unified gate+beta buffer in ONE launch. BA is a tiny
+        // [64,h] projection — this saves (2K-1) launches/layer × 48 SSM layers
+        // per verify step with no change to the math (same weight, same A_log/
+        // dt_bias transform the prefill path is already verified-coherent on).
         let gates_buf = ctx.buffers.ssm_gates(); // [K, gate(nv) + beta(nv)] FP32
-        let gate_beta_stride = nv * 2 * fp32; // bytes per token in gates buffer
         let ba_size = ctx.config.ssm_ba_size(); // 64
-        for t in 0..(num_tokens as u32) {
-            let normed_t = normed.offset(t as usize * h * bf16);
-            let ba_out = ctx.buffers.ssm_ba().offset(t as usize * ba_size * bf16);
-            // Dense GEMV for BA projection (small: 64 outputs)
-            ops::dense_gemv(
-                ctx.gpu,
-                self.dense_gemv_k,
-                normed_t,
-                &self.ssm.in_proj_ba,
-                ba_out,
-                ba_size as u32,
-                h as u32,
-                stream,
-            )?;
-            // Apply gate transforms
-            let gate_t = gates_buf.offset(t as usize * gate_beta_stride);
-            let beta_t = gates_buf.offset(t as usize * gate_beta_stride + nv * fp32);
-            ops::compute_gdn_gates(
-                ctx.gpu,
-                self.compute_gdn_gates_k,
-                ba_out,
-                self.ssm.a_log.weight,
-                self.ssm.dt_bias.weight,
-                gate_t,
-                beta_t,
-                1,
-                nv as u32,
-                nk as u32,
-                vpg as u32,
-                ba_size as u32,
-                stream,
-            )?;
-        }
+        let gate_stride = nv * 2; // FP32 elements between tokens in gates buffer
+        ops::dense_gemm_ba_gates_prefill(
+            ctx.gpu,
+            self.ba_gates_prefill_k,
+            normed,
+            &self.ssm.in_proj_ba,
+            self.ssm.a_log.weight,
+            self.ssm.dt_bias.weight,
+            gates_buf,
+            k,
+            ba_size as u32,
+            h as u32,
+            h as u32,
+            gate_stride as u32,
+            nv as u32,
+            vpg as u32,
+            stream,
+        )?;
+        ck(&vt::SSM_BA_GATES_NS)?;
 
         // ── 5-7. Conv1d + L2 norm + GDN per token (with intermediate checkpoints) ──
         // Reuse ssm_qkvz buffer for conv output (safe: deinterleave is done)
@@ -302,6 +313,7 @@ impl Qwen3SsmLayer {
             stream,
         };
         self.decode_batched_conv_gdn(ssm_state, ctx, &args)?;
+        ck(&vt::SSM_CONV_GDN_NS)?;
 
         // ── 8. Gated RMS norm per token ──
         // Z gate is in deinterleaved at offset [Q_2048 + K_2048 + V_4096]
@@ -327,6 +339,7 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         }
+        ck(&vt::SSM_GATEDRMS_NS)?;
 
         // ── 9. Output projection → [K, H] ──
         let out_proj_buf = ctx.buffers.moe_output(); // [K, H] BF16
@@ -415,6 +428,7 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         }
+        ck(&vt::SSM_OUTPROJ_NS)?;
 
         // ── 10. Batched residual + post-norm, then MoE + residual ──
         // residual_add_rms_norm supports multi-token (grid.x = num_tokens)
@@ -476,6 +490,7 @@ impl Qwen3SsmLayer {
                 )?;
             }
         }
+        ck(&vt::SSM_MOE_NS)?;
 
         Ok(())
     }

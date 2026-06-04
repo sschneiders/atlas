@@ -109,7 +109,19 @@ impl Qwen3SsmLayer {
             Self::debug_bf16(ctx.gpu, "moe-input-normed", normed2, 4);
         }
 
-        let moe_out = self.ffn.forward(normed2, ctx, stream)?;
+        let moe_out = {
+            use crate::layers::verify_timing as vt;
+            if vt::enabled() {
+                ctx.gpu.synchronize(stream)?;
+                let t0 = std::time::Instant::now();
+                let r = self.ffn.forward(normed2, ctx, stream)?;
+                ctx.gpu.synchronize(stream)?;
+                vt::add(&vt::K1_SSM_MOE_NS, t0.elapsed().as_nanos() as u64);
+                r
+            } else {
+                self.ffn.forward(normed2, ctx, stream)?
+            }
+        };
         if debug {
             ctx.gpu.synchronize(stream)?;
             Self::debug_bf16(ctx.gpu, "moe-output", moe_out, 8);

@@ -12,6 +12,7 @@ pub mod nemotron_moe;
 pub mod ops;
 pub mod qwen3_attention;
 pub mod qwen3_ssm;
+pub mod verify_timing;
 pub mod vision_encoder;
 
 pub use dense_ffn::{DenseFfnLayer, FfnActivation};

@@ -159,7 +159,10 @@ impl TransformerModel {
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
             && !hss_engaged
-            && !dump_step0;
+            && !dump_step0
+            // K=1 reference timing inserts mid-step syncs (illegal under
+            // graph capture). Force eager when ATLAS_VERIFY_TIMING=1.
+            && !crate::layers::verify_timing::enabled();
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
@@ -213,7 +216,15 @@ impl TransformerModel {
         let probe_layers = !use_graphs
             && seq.seq_len == seq.prompt_len
             && std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok();
+        let k1_timing = crate::layers::verify_timing::enabled();
         for (i, layer) in self.layers.iter().enumerate() {
+            let is_attn =
+                self.config.layer_type(i) == atlas_core::config::LayerType::FullAttention;
+            let k1_t0 = if k1_timing {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             layer.decode(
                 hidden,
                 residual,
@@ -226,6 +237,18 @@ impl TransformerModel {
                 &ctx,
                 stream,
             )?;
+            if let Some(t0) = k1_t0 {
+                self.gpu.synchronize(stream)?;
+                let acc = if is_attn {
+                    &crate::layers::verify_timing::K1_ATTN_TOTAL_NS
+                } else {
+                    &crate::layers::verify_timing::K1_SSM_TOTAL_NS
+                };
+                crate::layers::verify_timing::add(
+                    acc,
+                    t0.elapsed().as_nanos() as u64,
+                );
+            }
             // CBD per-layer hidden fingerprint at decode step 0 (eager only).
             // Localizes the FIRST layer whose post-layer hidden diverges
             // cold-vs-ON / ON-vs-ON → pins the bug to that layer's read set.
@@ -250,6 +273,7 @@ impl TransformerModel {
             // hashmap-free position() probe over a 5-element vec.
             self.try_dflash_capture(i, 0, stream)?;
         }
+        crate::layers::verify_timing::dump_and_reset_k1();
         // MLA absorbed attention: defensive sync before final norm in eager
         // mode. Skipped under graph capture because cuStreamSynchronize is
         // illegal inside a capture region (CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED,

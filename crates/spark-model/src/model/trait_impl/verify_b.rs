@@ -165,7 +165,10 @@ impl TransformerModel {
                 .load(std::sync::atomic::Ordering::Relaxed)
             // Phase 6.2.c — see decode() for rationale: HSS path's host I/O is
             // illegal under CUDA graph capture.
-            && !hss_engaged;
+            && !hss_engaged
+            // Per-substep timing inserts mid-step stream syncs, which are
+            // illegal during CUDA-graph capture. Force eager when timing.
+            && !crate::layers::verify_timing::enabled();
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
@@ -206,10 +209,13 @@ impl TransformerModel {
                 self.gpu.begin_capture(stream)?;
             }
 
+            use crate::layers::verify_timing as vt;
+            let vtiming = vt::enabled();
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let layer_type = self.config.layer_type(layer_idx);
 
                 if layer_type == LayerType::FullAttention {
+                    let attn_t0 = std::time::Instant::now();
                     if hss_engaged {
                         // HSS path: `decode_multi_seq` calls the production
                         // paged-decode kernel which reads K/V from HBM only
@@ -259,6 +265,10 @@ impl TransformerModel {
                             stream,
                         )?;
                     }
+                    if vtiming {
+                        self.gpu.synchronize(stream)?;
+                        vt::add(&vt::ATTN_TOTAL_NS, attn_t0.elapsed().as_nanos() as u64);
+                    }
                 } else {
                     // SSM: process K=2 tokens for one sequence via decode_batched.
                     layer.decode_batched(
@@ -282,6 +292,8 @@ impl TransformerModel {
                 // is disabled.
                 self.try_dflash_capture(layer_idx, k - 1, stream)?;
             }
+
+            let head_t0 = std::time::Instant::now();
 
             // Final norm [2, H]
             let normed = self.buffers.norm_output();
@@ -314,6 +326,12 @@ impl TransformerModel {
                     vocab as u32,
                     stream,
                 )?;
+            }
+
+            if vtiming {
+                self.gpu.synchronize(stream)?;
+                let head_ms = head_t0.elapsed().as_nanos() as f64 / 1_000_000.0;
+                vt::dump_and_reset(head_ms);
             }
 
             if use_graphs {

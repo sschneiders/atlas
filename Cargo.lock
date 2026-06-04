@@ -2081,6 +2081,7 @@ dependencies = [
  "spark-runtime",
  "spark-storage",
  "tokenizers",
+ "toml",
  "tracing",
 ]
 

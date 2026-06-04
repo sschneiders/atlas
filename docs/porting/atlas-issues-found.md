@@ -478,3 +478,49 @@ present, gated by env vars — remove for clean build.
 LESSON: when A/B-comparing two kernels on the SAME platform, both can share an
 upstream-decode bug and "match" while both being wrong. Verify against a KNOWN-GOOD
 reference (real NVIDIA) or against first-principles (the probe), not just sibling kernels.
+
+---
+
+## #A6 (HIP merge Phase 2) — coherence merge ~8 GB post-weights over-alloc → OOM watchdog (FIXED 2026-06-03)
+
+BRANCH: merge-coherence (159f80a merge + 6ca4665 HIP-fix). The dense-Qwen3.6-27B
+coherence branch merged into the HIP port builds + serves, but the merged binary
+consumed ~8 GB more during model construction than the port baseline
+(port-safety-pre-merge), dropping post-construction free below the 2048 MB OOM
+watchdog → the watchdog terminated the server before first request. Held across
+util/ctx/max-prefill sweeps and with MTP off.
+
+ROOT CAUSE: the coherence merge ACTIVATED the native-FP8 SSM in_proj/out_proj
+prefill path (qwen35_dense.rs: builds a single-scale FP8 copy of qkvz [16384×5120]
+and out_proj [5120×6144] per SSM layer via bf16_to_fp8). That is 80 MB + 30 MB =
+110 MB × 48 SSM layers = ~5.3 GB of EXTRA weights the baseline never allocated.
+gfx1151 cannot even dispatch this path (no cp.async fp8_gemm_n128), so 6ca4665
+added HW flag `disable_fp8_ssm_prefill` (HARDWARE.toml) → build.rs emits
+`cargo:rustc-env=ATLAS_HW_DISABLE_FP8_SSM_PREFILL`, gated in qwen35_dense.rs via
+`option_env!(...).is_none()`.
+
+THE GATE WAS DEAD. `cargo:rustc-env` from atlas-kernels/build.rs is CRATE-LOCAL —
+it does not reach spark-model (which has no build.rs). So `option_env!` in
+spark-model was always None → fp8_ssm_prefill stayed true → the ~5.3 GB FP8 SSM
+prefill weights were allocated anyway. Serve log "SSM in_proj_qkv + out_proj via
+native FP8 prefill GEMM" fired (baseline-premerge log never prints it). This is
+the SAME dead-flag trap the SCALE-port notes warned about for ATLAS_HW_FORCE_BR32.
+
+FIX (additive, SSOT/PCND): added crates/spark-model/build.rs — resolves the SAME
+HARDWARE.toml (workspace/kernels/<ATLAS_TARGET_HW|gb10>/HARDWARE.toml, mirroring
+atlas-kernels resolution) and re-emits the `[hardware]` gating flags as
+cargo:rustc-env (disable_fp8_ssm_prefill → ATLAS_HW_DISABLE_FP8_SSM_PREFILL,
+force_br32_prefill → ATLAS_HW_FORCE_BR32). Emitted ONLY when the key is present
+and true; gb10 omits both keys → no env → option_env! None → NVIDIA/GB10 unchanged.
+Added `toml = "0.8"` build-dependency (already in workspace lock). The single
+authoritative value still lives only in HARDWARE.toml.
+
+RESULT: serve log no longer prints the native-FP8 message; KV-cache
+post-construction free rose from 7.1 GB (pre-fix, tiny 158 MB arena) to 11.8 GB
+(2049-tok arena) / 10.1 GB (full 8193-tok arena at ctx 16384). Server reaches
+"Listening" with MTP K2 at ctx 16384, no OOM kill. Coherent: primes
+"2, 3, 5, 7, 11, 13, 17, 19" + "Paris". MTP K2 ~18 tok/s, K2 accept 90-96%.
+
+This fix ALSO un-deads ATLAS_HW_FORCE_BR32 → gfx1151 prefill now routes to the
+LDS-safe BR32 kernel (was dispatching the BR64 kernel that overflows the 64 KB
+LDS cap per the HARDWARE.toml rationale) — strictly safer on this hardware.

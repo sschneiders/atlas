@@ -28,6 +28,15 @@ metal = [
 # doesn't drag in the tokenizer crate.
 metal-example = ["metal", "dep:tokenizers", "dep:memmap2", "dep:safetensors"]
 
+[build-dependencies]
+# Parse the active targets HARDWARE.toml [hardware] flags at build time and
+# re-emit them as compile-time env vars (cargo:rustc-env). atlas-kernels
+# already parses the same file, but cargo:rustc-env is crate-local, so the
+# option_env! reads in this crate (e.g. ATLAS_HW_DISABLE_FP8_SSM_PREFILL,
+# ATLAS_HW_FORCE_BR32) need this crate to emit them too. SSOT: the value
+# lives only in HARDWARE.toml; this just forwards it.
+toml = "0.8"
+
 [dependencies]
 atlas-core = { workspace = true }
 atlas-kernels = { workspace = true }

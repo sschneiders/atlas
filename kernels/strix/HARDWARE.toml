@@ -24,3 +24,11 @@ use_fp32_residual = false
 # (large prefill chunks tile in 32 rows instead of 64). NVIDIA targets
 # omit this key → option_env! None → unchanged behaviour.
 force_br32_prefill = true
+
+# RDNA3.5 has no cp.async PTX, so the coherence native-FP8 SSM prefill
+# GEMM (`fp8_gemm_n128`, cp.async-based) cannot be built/dispatched here
+# under SCALE either. Keep the NVFP4 SSM in_proj/out_proj path (the proven
+# dispatch for the Fp8Dequanted variant on this target). Without this gate
+# the binary would allocate the ~5.3 GB native-FP8 prefill buffers and risk
+# OOM on the bandwidth-limited APU. NVIDIA/GB10 omits this key → unchanged.
+disable_fp8_ssm_prefill = true
