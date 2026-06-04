@@ -344,9 +344,12 @@ gated_delta_rule_chunk_delta_h(
 // ── KERNEL 3: chunk_fwd_o ────────────────────────────────────────────────
 // The PARALLEL output pass. Grid: (NT, num_v_heads, batch). One CTA per (chunk,head).
 // O_i = (exp(gc_i)·<S_c[:,v],q_i> + Σ_{l<=i} exp(gc_i-gc_l)·<k_l,q_i>·uc_l[v])·rsqrt(d).
-// kq=<q_i,k_l> Gram on tensor cores; S_c read bf16 (TERMINAL output → no compounding,
-// like wy4's bf16 output rounding → precision-safe). Output layout matches wy4.
-// smem: sq(16K)+sk(16K)+kq(16K f32)+ucb(16K)+Sb(32K bf16)+gc = 96.25KB.
+// BOTH inner products are tensor-core Gram matmuls (full occupancy → compute bound):
+//   kq[i][l] = <q_i,k_l>          (mma_gram, decay folded in)
+//   o1[i][v] = <q_i, S_c[:,v]>    (mma_gram with S_c read TRANSPOSED → [V][K])
+// S_c read bf16 + o1 bf16 (TERMINAL output → no compounding, like wy4's bf16
+// output rounding → precision-safe). o1 reuses the freed sk region. Layout matches wy4.
+// smem: sq(16K)+sk/o1(16K)+kq(16K f32)+ucb(16K)+Sbᵀ(32K bf16)+gc = 96.25KB.
 extern "C" __global__ void __launch_bounds__(128, 1)
 gated_delta_rule_chunk_fwd_o(
     const __nv_bfloat16* __restrict__ query,
@@ -401,8 +404,11 @@ gated_delta_rule_chunk_fwd_o(
         unsigned int i = idx / v_dim, v = idx % v_dim;
         ucb[i * V_DIM + v] = (i < ce) ? uc_in[base * CHUNK * V_DIM + i * v_dim + v] : __float2bfloat16(0.0f);
     }
-    for (unsigned int idx = tid; idx < K_DIM * V_DIM; idx += 128)
-        Sb[idx] = __float2bfloat16(S_in[base * K_DIM * V_DIM + idx]);
+    // S_c read TRANSPOSED → Sbᵀ[v][k] = S_c[k][v], so mma_gram(q, Sbᵀ) = <q_i,S_c[:,v]>.
+    for (unsigned int idx = tid; idx < K_DIM * V_DIM; idx += 128) {
+        unsigned int v = idx / K_DIM, k = idx % K_DIM;
+        Sb[idx] = __float2bfloat16(S_in[base * K_DIM * V_DIM + k * V_DIM + v]);
+    }
     if (tid == 0) {
         float acc = 0.0f;
         for (unsigned int i = 0; i < ce; i++) {
@@ -421,14 +427,16 @@ gated_delta_rule_chunk_fwd_o(
         unsigned int i = p / CHUNK, l = p % CHUNK;
         if (i < ce && l <= i) kq[p] = expf(gc[i] - gc[l]) * kq[p];
     }
+    __syncthreads();   // sk is free past mma1 → reuse its region for the o1 = q·Sᵀ result
+
+    // o1[i][v] = <q_i, S_c[:,v]>  on tensor cores (bf16 out → terminal, precision-safe).
+    __nv_bfloat16* o1 = sk;                   // [CHUNK*V_DIM] bf16, reuses sk's 16KB
+    mma_gram<16, V_DIM, true>(sq, Sb, o1);
     __syncthreads();
 
     if (tid < v_dim) {
         for (unsigned int i = 0; i < ce; i++) {
-            float t1 = 0.0f;
-            for (unsigned int k = 0; k < k_dim; k++)
-                t1 += (float)Sb[k * V_DIM + tid] * (float)sq[i * K_DIM + k];
-            t1 *= expf(gc[i]);
+            float t1 = expf(gc[i]) * (float)o1[i * V_DIM + tid];
             float t2 = 0.0f;
             for (unsigned int l = 0; l <= i; l++)
                 t2 += kq[i * CHUNK + l] * (float)ucb[l * V_DIM + tid];   // pure MAC inner loop
