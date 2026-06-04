@@ -144,31 +144,21 @@ impl MoeLayer {
         } else if has_shared {
             let shared_gate_out = ctx.buffers.ssm_deinterleaved();
             let shared_up_out = ctx.buffers.ssm_qkvz();
+            // ATLAS_W8A16_PIPELINED: shared-expert dense GEMMs (gate/up/down, every
+            // token) via the pipelined kernel — same [N,K]+block-scale weights,
+            // ~4.6x faster, cosine=1.0. PCND: explicit flag, default OFF.
+            let use_sh_pipe = std::env::var("ATLAS_W8A16_PIPELINED").as_deref() == Ok("1")
+                && self.w8a16_gemm_pipelined_k.0 != 0;
+            let sh_gemm = |inp, w, sc, outp, mm, nn, kk| -> anyhow::Result<()> {
+                if use_sh_pipe {
+                    ops::w8a16_gemm_pipelined(ctx.gpu, self.w8a16_gemm_pipelined_k, inp, w, sc, outp, mm, nn, kk, stream)
+                } else {
+                    ops::w8a16_gemm(ctx.gpu, self.w8a16_gemm_k, inp, w, sc, outp, mm, nn, kk, stream)
+                }
+            };
             // FP8 GEMM for shared expert (M=num_tokens, single kernel each)
-            ops::w8a16_gemm(
-                ctx.gpu,
-                self.w8a16_gemm_k,
-                input,
-                sh.gate_proj.weight,
-                sh.gate_proj.row_scale,
-                shared_gate_out,
-                n,
-                shared_inter,
-                h,
-                stream,
-            )?;
-            ops::w8a16_gemm(
-                ctx.gpu,
-                self.w8a16_gemm_k,
-                input,
-                sh.up_proj.weight,
-                sh.up_proj.row_scale,
-                shared_up_out,
-                n,
-                shared_inter,
-                h,
-                stream,
-            )?;
+            sh_gemm(input, sh.gate_proj.weight, sh.gate_proj.row_scale, shared_gate_out, n, shared_inter, h)?;
+            sh_gemm(input, sh.up_proj.weight, sh.up_proj.row_scale, shared_up_out, n, shared_inter, h)?;
             // Activation + down for shared expert (SiLU or GeGLU)
             ops::silu_mul(
                 ctx.gpu,
@@ -180,18 +170,7 @@ impl MoeLayer {
                 stream,
             )?;
             let shared_down_out = ctx.buffers.attn_output();
-            ops::w8a16_gemm(
-                ctx.gpu,
-                self.w8a16_gemm_k,
-                shared_gate_out,
-                sh.down_proj.weight,
-                sh.down_proj.row_scale,
-                shared_down_out,
-                n,
-                h,
-                shared_inter,
-                stream,
-            )?;
+            sh_gemm(shared_gate_out, sh.down_proj.weight, sh.down_proj.row_scale, shared_down_out, n, h, shared_inter)?;
         }
 
         // ── Routed expert path ──

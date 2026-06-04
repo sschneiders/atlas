@@ -146,6 +146,7 @@ impl MoeLayer {
             // ATLAS_MOE_V3=1. PCND: explicit, no implicit default.
             fp8_moe_v3_enabled: std::env::var("ATLAS_MOE_V3").as_deref() == Ok("1"),
             w8a16_gemm_k: super::super::try_kernel(gpu, "w8a16_gemm", "w8a16_gemm"),
+            w8a16_gemm_pipelined_k: super::super::try_kernel(gpu, "w8a16_gemm_pipelined", "w8a16_gemm_pipelined"),
             moe_gate_topk_fused_k: super::super::try_kernel(
                 gpu,
                 "moe_gate_topk",

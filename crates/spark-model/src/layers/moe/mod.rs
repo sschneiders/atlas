@@ -251,6 +251,7 @@ pub struct MoeLayer {
     // Resolved once per layer from ATLAS_FP8_MOE_COALESCED env var.
     fp8_moe_coalesced_enabled: bool,
     w8a16_gemm_k: KernelHandle, // for shared expert FP8 prefill
+    w8a16_gemm_pipelined_k: KernelHandle, // ATLAS_W8A16_PIPELINED shared-expert variant
     // Fused gate GEMV + topK softmax (saves 1 kernel launch per layer)
     moe_gate_topk_fused_k: KernelHandle,
     // FP8 expert pointer tables (None when experts are NVFP4)
