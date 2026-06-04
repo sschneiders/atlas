@@ -142,6 +142,7 @@ pub struct Qwen3AttentionLayer {
     pub(super) w4a16_gemv_k: KernelHandle,
     pub(super) w8a16_gemv_k: KernelHandle,
     pub(super) w8a16_gemm_k: KernelHandle,
+    pub(super) w8a16_gemm_pipelined_k: KernelHandle,
     pub(super) w4a16_gemv_dual_k: KernelHandle,
     pub(super) rope_k: KernelHandle,
     /// MRoPE-interleaved kernel.
