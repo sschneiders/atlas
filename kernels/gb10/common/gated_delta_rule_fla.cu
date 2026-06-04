@@ -243,8 +243,13 @@ __device__ __forceinline__ void cdh_prefetch(
 // W/U/K loads (the real bottleneck: global-load latency unhidden at 4 warps)
 // are cp.async-prefetched for chunk c+1 while chunk c computes.
 // (V-tiling for occupancy REGRESSED — 2 CTAs/head redundantly reload W + re-run
-// the serial loop. bf16-TC for the matmuls validated precision-safe but the
-// kernel is load-latency bound, not FLOP bound, so prefetch is the lever.)
+// the serial loop. bf16-TC for the matmuls is precision-SAFE (oracle probe @28k:
+// +0.05% output drift) but architecturally BLOCKED on GB10: the 64KB f32 state
+// must persist across chunks — in registers (128/thread → collides with TC's
+// ~128 fragment-accumulator regs → spills) or in smem (64KB → no room for bf16
+// TC operands + f32 outputs under the 99KB cap; V-tiling S to fit = the redundant
+// reload that regressed). So scalar register-S + cp.async double-buffer is the
+// achieved optimum here; TC needs a ground-up smem-state-tiling rewrite.)
 // Per chunk c (entry S_c): store S_c → S_out; uc = U_c - W_c·S_c → uc_out;
 // S_{c+1} = exp(gc_last)·S_c + Σ_i exp(gc_last-gc_i)·uc_i·k_i.
 // smem: 2×{W(16K)+K(16K)+U(16K)} bf16 + gc[2][CHUNK] = 98816 B.
