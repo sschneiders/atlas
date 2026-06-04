@@ -269,6 +269,19 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         dflash_args,
     )?;
 
+    // Kernel load audit: print the table of every kernel resolved during model
+    // construction (grouped by module/operation family) + flag any MISSING
+    // (handle 0 → silent slower-fallback dispatch). Catches build/codegen
+    // regressions like a dropped pipelined GEMM at load time, not as a
+    // mystery slowdown.
+    tracing::info!(
+        "{}",
+        spark_runtime::kernel_audit::render_kernel_table(
+            &ptx_set.modules,
+            atlas_kernels::KERNEL_SET_HASH,
+        )
+    );
+
     // Phase 6.3 — HSS config built early so the EP worker can install it.
     let early_high_speed_swap_cfg = serve_phases::build_high_speed_swap_config(&args)?;
 

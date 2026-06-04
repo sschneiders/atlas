@@ -140,6 +140,7 @@ fn main() {
             pub fn metallib_modules() -> Vec<(&'static str, &'static [u8])> { Vec::new() }\n\
             pub fn all_ptx_sets() -> Vec<TargetPtxSet> { Vec::new() }\n";
         std::fs::write(out_dir.join("target_ptx.rs"), stub).expect("write skip stub target_ptx.rs");
+        println!("cargo:rustc-env=ATLAS_KERNEL_SET_HASH={}", content_hash(stub));
         println!("cargo:rustc-env=ATLAS_PTX_DIR={}", out_dir.display());
         return;
     }
@@ -361,7 +362,29 @@ fn main() {
     std::fs::write(&gen_path, &generated)
         .unwrap_or_else(|e| panic!("Failed to write {}: {e}", gen_path.display()));
 
+    // Force atlas-kernels lib recompilation whenever the generated kernel set
+    // changes. cargo does NOT track this build-script-generated `include!`d
+    // file as a recompile trigger, so without this the lib can embed a STALE
+    // module set (the 2026-06-04 98-vs-99 / dropped-pipelined-GEMM bug). The
+    // content hash is surfaced as a rustc-env that lib.rs references via env!;
+    // a changed hash invalidates the crate's fingerprint → fresh rebuild.
+    println!(
+        "cargo:rustc-env=ATLAS_KERNEL_SET_HASH={}",
+        content_hash(&generated)
+    );
     println!("cargo:rustc-env=ATLAS_PTX_DIR={}", out_dir.display());
+}
+
+/// FNV-1a 64-bit content fingerprint → 12 hex chars. Deterministic, no deps.
+/// Used to force atlas-kernels recompilation when the generated kernel set
+/// changes (cargo doesn't track build-script-generated `include!` files).
+fn content_hash(s: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in s.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:012x}", h & 0xffff_ffff_ffff)
 }
 
 /// Resolve all compilation targets from env vars, expanding wildcards.

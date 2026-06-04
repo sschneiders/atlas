@@ -20,7 +20,18 @@ use atlas_core::target::KernelTarget;
 
 // Auto-generated: per-target PTX constants, ptx_modules() function,
 // and all_ptx_sets() for multi-target builds.
+// NOTE: cargo does NOT track this build-script-generated include! as a
+// recompile trigger, so when build.rs regenerates target_ptx.rs (e.g. the
+// module set changes) this lib can keep a STALE embedded set. Any edit to
+// this file (or `cargo clean -p atlas-kernels`) forces a fresh recompile
+// against the current OUT_DIR/target_ptx.rs.
 include!(concat!(env!("OUT_DIR"), "/target_ptx.rs"));
+
+/// Content fingerprint of the generated kernel set, emitted by `build.rs` as a
+/// `rustc-env`. Referencing it here makes cargo recompile this crate whenever
+/// the kernel set changes — closing the `include!`-not-tracked staleness hole
+/// that silently embedded a stale module list (the 98-vs-99 regression).
+pub const KERNEL_SET_HASH: &str = env!("ATLAS_KERNEL_SET_HASH");
 
 // ═══════════════════════════════════════════════════════════════════
 // Target-aware PTX grouping
