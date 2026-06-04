@@ -77,6 +77,7 @@ pub struct Qwen3SsmLayer {
     w4a16_gemm_t_m128_k: KernelHandle, // M128 variant: 2 M-chunks per CTA, halves B re-reads
     w4a16_gemv_batch2_k: KernelHandle,
     dense_gemm_k: KernelHandle,
+    dense_gemm_pipelined_k: KernelHandle,
     gdn_prefill_k: KernelHandle,
     gdn_prefill_split_k: KernelHandle,
     gdn_prefill_split4_k: KernelHandle,
