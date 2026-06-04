@@ -80,6 +80,10 @@ name = "w8a16_microtest"
 required-features = ["cuda"]
 
 [[example]]
+name = "w8a16t_microtest"
+required-features = ["cuda"]
+
+[[example]]
 name = "moe_microtest"
 required-features = ["cuda"]
 
