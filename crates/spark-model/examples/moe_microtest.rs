@@ -179,7 +179,8 @@ fn main() -> Result<()> {
     // M_TILE=128 granularity (here all experts have `tpe` tokens).
     let grid_block = |name: &str| -> ([u32; 3], [u32; 3]) {
         match name {
-            "moe_fp8_grouped_gemm_v3" => (
+            // v3 and v4 share a 128×64 (M×N) tile, 256-thread block.
+            "moe_fp8_grouped_gemm_v3" | "moe_fp8_grouped_gemm_v4" => (
                 [(n as u32).div_ceil(64), (tpe.div_ceil(128)) as u32, num_experts as u32],
                 [256, 1, 1],
             ),
