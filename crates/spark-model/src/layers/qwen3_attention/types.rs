@@ -130,6 +130,7 @@ pub struct Qwen3AttentionLayer {
     pub(super) v_fp8w_t: Option<crate::weight_map::Fp8WeightTransposed>,
     pub(super) o_fp8w_t: Option<crate::weight_map::Fp8WeightTransposed>,
     pub(super) w8a16_gemm_t_k: KernelHandle,
+    pub(super) w8a16_gemm_t_pipelined_k: KernelHandle,
     // W8A8 + FP32 epilogue (vLLM-equivalent) — gated by ATLAS_FP8_W8A8=1.
     pub(super) per_token_group_quant_fp8_k: KernelHandle,
     pub(super) fp8_gemm_t_blockscaled_k: KernelHandle,

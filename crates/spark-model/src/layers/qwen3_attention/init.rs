@@ -193,6 +193,7 @@ impl Qwen3AttentionLayer {
             v_fp8w_t: None,
             o_fp8w_t: None,
             w8a16_gemm_t_k: super::super::try_kernel(gpu, "w8a16_gemm_t", "w8a16_gemm_t"),
+            w8a16_gemm_t_pipelined_k: super::super::try_kernel(gpu, "w8a16_gemm_t", "w8a16_gemm_t_pipelined"),
             per_token_group_quant_fp8_k: super::super::try_kernel(
                 gpu, "per_token_group_quant_fp8", "per_token_group_quant_fp8",
             ),

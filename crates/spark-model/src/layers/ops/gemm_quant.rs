@@ -549,6 +549,36 @@ pub fn w8a16_gemm_t(
         .launch(stream)
 }
 
+/// Pipelined transposed W8A16 GEMM (kernel `w8a16_gemm_t_pipelined`): same
+/// transposed args as `w8a16_gemm_t`, ~4.2x via smem-LUT + K_STEP32 +
+/// K-contiguous smem_B + 128x32 occupancy tile.
+/// Grid: (ceil(N/32), ceil(M/128), 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn w8a16_gemm_t_pipelined(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight_t: DevicePtr,
+    block_scale_t: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 32), div_ceil(m, 128), 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight_t)
+        .arg_ptr(block_scale_t)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// Transpose FP8 weight matrix on GPU: `B[N,K]` → `B_t[K,N]`.
 /// Grid: (ceil(N*K/256), 1, 1)  Block: (256, 1, 1)
 pub fn transpose_fp8(
