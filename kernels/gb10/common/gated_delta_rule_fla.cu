@@ -212,11 +212,12 @@ __device__ __forceinline__ void cdh_prefetch(
     __nv_bfloat16* Wp = buf + (unsigned long long)p * CDH_BUFSZ;
     __nv_bfloat16* Kp = Wp + CHUNK * K_DIM;
     __nv_bfloat16* Up = Kp + CHUNK * K_DIM;
+    const unsigned int nthr = blockDim.x;   // 128 (scalar/TC) or 256 (k-split)
     const __nv_bfloat16* Wsrc = W_in + base * CHUNK * K_DIM;
-    for (unsigned int e = tid * 8; e < CHUNK * K_DIM; e += 128 * 8) cp_async16(&Wp[e], &Wsrc[e]);
+    for (unsigned int e = tid * 8; e < CHUNK * K_DIM; e += nthr * 8) cp_async16(&Wp[e], &Wsrc[e]);
     const __nv_bfloat16* Usrc = U_in + base * CHUNK * V_DIM;
-    for (unsigned int e = tid * 8; e < CHUNK * V_DIM; e += 128 * 8) cp_async16(&Up[e], &Usrc[e]);
-    for (unsigned int j = tid; j < CHUNK * 16; j += 128) {
+    for (unsigned int e = tid * 8; e < CHUNK * V_DIM; e += nthr * 8) cp_async16(&Up[e], &Usrc[e]);
+    for (unsigned int j = tid; j < CHUNK * 16; j += nthr) {
         unsigned int i = j >> 4, c16 = (j & 15) * 8;
         if (i < ce)
             cp_async16(&Kp[i * K_DIM + c16],
@@ -344,6 +345,236 @@ gated_delta_rule_chunk_delta_h(
 
     #pragma unroll
     for (unsigned int k = 0; k < K_DIM; k++) H[k * V_DIM + tid] = Sreg[k];
+}
+
+// ── KERNEL 2-TC: chunk_delta_h_tc ────────────────────────────────────────
+// State-tiling tensor-core variant of the serial spine (A/B candidate vs the
+// scalar register-S kernel above). Same math, same outputs. register-S stays the
+// f32 MASTER state (no 64KB smem state); each chunk a bf16 SNAPSHOT Sᵀ[v][k]=
+// bf16(S[k][v]) is staged to smem PURELY as an mma operand — the f32 master in
+// registers is undamaged, so accumulation precision is unchanged (the snapshot
+// is only a per-chunk read, like a bf16 GEMM input; oracle probe @28k = +0.05%).
+//   Phase A (TC):  ws[i][v] = Σ_k W[i][k]·Sᵀ[v][k]  via mma_gram → uc=U-ws → duc.
+//   Phase B (scalar, increment-1):  S[k][v] = edl·S[k][v] + Σ_i duc_i·K[i][k].
+// smem: Sᵀ(32K) + W(16K) + ws(32K f32) + U(16K) = 96.25KB (K reuses Sᵀ for phase B).
+extern "C" __global__ void __launch_bounds__(128, 1)
+gated_delta_rule_chunk_delta_h_tc(
+    float* __restrict__ h_state,
+    const __nv_bfloat16* __restrict__ W_in,
+    const __nv_bfloat16* __restrict__ U_in,
+    const __nv_bfloat16* __restrict__ key,
+    const float* __restrict__ gate,
+    float* __restrict__ S_out,
+    __nv_bfloat16* __restrict__ uc_out,
+    unsigned int batch_size,
+    unsigned int seq_len,
+    unsigned int num_chunks,
+    unsigned int num_k_heads,
+    unsigned int num_v_heads,
+    unsigned int k_dim,
+    unsigned int v_dim,
+    unsigned int qk_stride,
+    unsigned int gb_stride
+) {
+    const unsigned int vh = blockIdx.x;
+    const unsigned int b = blockIdx.y;
+    if (vh >= num_v_heads || b >= batch_size) return;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int head_repeat = num_v_heads / num_k_heads;
+    const unsigned int kh = vh / head_repeat;
+
+    extern __shared__ char smem_raw[];
+    __nv_bfloat16* St = (__nv_bfloat16*)smem_raw;          // [V_DIM*K_DIM] bf16 snapshot Sᵀ
+    __nv_bfloat16* Wb = St + V_DIM * K_DIM;                // [CHUNK*K_DIM] bf16
+    float* ws = (float*)(Wb + CHUNK * K_DIM);              // [CHUNK*V_DIM] f32 (W·S output)
+    __nv_bfloat16* Ub = (__nv_bfloat16*)(ws + CHUNK * V_DIM); // [CHUNK*V_DIM] bf16
+    float* gc = (float*)(Ub + CHUNK * V_DIM);              // [CHUNK]
+    __nv_bfloat16* Kb = St;                                // phase B reuses Sᵀ region for K
+
+    float* H = h_state + ((unsigned long long)(b * num_v_heads + vh) * K_DIM * V_DIM);
+    float Sreg[K_DIM];
+    #pragma unroll
+    for (unsigned int k = 0; k < K_DIM; k++) Sreg[k] = H[k * V_DIM + tid];
+
+    for (unsigned int c = 0; c < num_chunks; c++) {
+        const unsigned int cs = c * CHUNK;
+        const unsigned int ce = (seq_len - cs) < CHUNK ? (seq_len - cs) : CHUNK;
+        const unsigned long long base = ((unsigned long long)(b * num_chunks + c) * num_v_heads + vh);
+
+        // Entry state S_c → S_out (thread tid owns column tid).
+        #pragma unroll
+        for (unsigned int k = 0; k < K_DIM; k++)
+            S_out[base * K_DIM * V_DIM + k * V_DIM + tid] = Sreg[k];
+
+        // Stage bf16 snapshot Sᵀ[v][k] = S[k][v] (thread tid=v writes row v) + load W, gc.
+        #pragma unroll
+        for (unsigned int k = 0; k < K_DIM; k++) St[tid * K_DIM + k] = __float2bfloat16(Sreg[k]);
+        for (unsigned int idx = tid; idx < CHUNK * k_dim; idx += 128) {
+            unsigned int i = idx / k_dim, k = idx % k_dim;
+            Wb[i * K_DIM + k] = (i < ce) ? W_in[base * CHUNK * K_DIM + i * k_dim + k] : __float2bfloat16(0.0f);
+        }
+        if (tid == 0) {
+            float acc = 0.0f;
+            for (unsigned int i = 0; i < ce; i++) {
+                acc += logf(gate[(unsigned long long)(cs + i) * gb_stride + vh]);
+                gc[i] = acc;
+            }
+        }
+        __syncthreads();
+
+        // Phase A: ws[i][v] = Σ_k W[i][k]·Sᵀ[v][k] = <W_i, S[:,v]>  on tensor cores.
+        mma_gram<16, V_DIM, false>(Wb, St, ws);
+        __syncthreads();
+
+        // uc = U - ws ; duc = decay·uc  (read ws from smem; no per-element matmul)
+        float duc[CHUNK];
+        const float dl = gc[ce - 1];
+        const float edl = expf(dl);
+        for (unsigned int idx = tid; idx < CHUNK * v_dim; idx += 128) {
+            unsigned int i = idx / v_dim, v = idx % v_dim;
+            Ub[i * V_DIM + v] = (i < ce) ? U_in[base * CHUNK * V_DIM + i * v_dim + v] : __float2bfloat16(0.0f);
+        }
+        __syncthreads();
+        if (tid < v_dim) {
+            for (unsigned int i = 0; i < ce; i++) {
+                float uci = (float)Ub[i * V_DIM + tid] - ws[i * V_DIM + tid];
+                uc_out[base * CHUNK * V_DIM + i * v_dim + tid] = __float2bfloat16(uci);
+                duc[i] = expf(dl - gc[i]) * uci;
+            }
+        }
+        __syncthreads();   // before Sᵀ region is reused for K
+
+        // Load K into the (freed) Sᵀ region; Phase B scalar S-update (register-S).
+        for (unsigned int idx = tid; idx < CHUNK * k_dim; idx += 128) {
+            unsigned int i = idx / k_dim, k = idx % k_dim;
+            Kb[i * K_DIM + k] = (i < ce)
+                ? key[(unsigned long long)(cs + i) * qk_stride + kh * k_dim + k]
+                : __float2bfloat16(0.0f);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int k = 0; k < K_DIM; k++) {
+            float hv = edl * Sreg[k];
+            for (unsigned int i = 0; i < ce; i++)
+                hv += duc[i] * (float)Kb[i * K_DIM + k];
+            Sreg[k] = hv;
+        }
+        __syncthreads();   // before St/Wb/ws reused next chunk
+    }
+
+    #pragma unroll
+    for (unsigned int k = 0; k < K_DIM; k++) H[k * V_DIM + tid] = Sreg[k];
+}
+
+// ── KERNEL 2-KSPLIT: chunk_delta_h_ksplit<SPLIT> ─────────────────────────
+// OCCUPANCY variant of the serial spine (A/B vs the scalar/TC kernels above).
+// chunk_delta_h is occupancy/latency bound (32 heads = 32 CTAs, only 4 warps each
+// → can't hide smem-load/FFMA latency; TC made it WORSE because staging latency is
+// also unhidden). Fix: split the K dimension of the state across SPLIT threads per
+// v-column → 128·SPLIT threads = 4·SPLIT warps/CTA (more warps to hide latency) on
+// the SAME 32 SMs, NO redundant work. Thread (v,sub) owns S[sub·KH .. +KH][v] in
+// registers (Sreg[KH], KH=K_DIM/SPLIT). W·S needs the full-k sum → a log2(SPLIT)
+// __shfl_xor butterfly across the aligned SPLIT-group of lanes. Same f32 math/output.
+// smem: 2×{W,K,U} bf16 double-buffer + 2×gc = 98816 B (same as scalar).
+template <int SPLIT>
+__device__ __forceinline__ void cdh_ksplit_core(
+    float* __restrict__ h_state, const __nv_bfloat16* __restrict__ W_in,
+    const __nv_bfloat16* __restrict__ U_in, const __nv_bfloat16* __restrict__ key,
+    const float* __restrict__ gate, float* __restrict__ S_out, __nv_bfloat16* __restrict__ uc_out,
+    unsigned int seq_len, unsigned int num_chunks, unsigned int num_k_heads,
+    unsigned int num_v_heads, unsigned int k_dim, unsigned int v_dim,
+    unsigned int qk_stride, unsigned int gb_stride
+) {
+    constexpr int KH = K_DIM / SPLIT;            // per-thread slice of the state column
+    const unsigned int vh = blockIdx.x;
+    const unsigned int b = blockIdx.y;
+    if (vh >= num_v_heads) return;
+    const unsigned int t = threadIdx.x;          // 0..128·SPLIT-1
+    const unsigned int v = t / SPLIT;            // v-column 0..127
+    const unsigned int sub = t % SPLIT;          // which k-slice
+    const unsigned int k0 = sub * KH;
+    const unsigned int head_repeat = num_v_heads / num_k_heads;
+    const unsigned int kh = vh / head_repeat;
+
+    extern __shared__ char smem_raw[];
+    __nv_bfloat16* buf = (__nv_bfloat16*)smem_raw;          // buf[2][CDH_BUFSZ]
+    float* gcb = (float*)(buf + 2 * CDH_BUFSZ);             // gcb[2][CHUNK]
+
+    float* H = h_state + ((unsigned long long)(b * num_v_heads + vh) * K_DIM * V_DIM);
+    float Sreg[KH];
+    #pragma unroll
+    for (int kk = 0; kk < KH; kk++) Sreg[kk] = H[(k0 + kk) * V_DIM + v];
+
+    cdh_prefetch(buf, gcb, 0, W_in, U_in, key, gate, 0, b, vh, seq_len,
+                 num_chunks, num_v_heads, k_dim, kh, qk_stride, gb_stride);
+
+    for (unsigned int c = 0; c < num_chunks; c++) {
+        const unsigned int cur = c & 1u;
+        const unsigned int cs = c * CHUNK;
+        const unsigned int ce = (seq_len - cs) < CHUNK ? (seq_len - cs) : CHUNK;
+        const unsigned long long base = ((unsigned long long)(b * num_chunks + c) * num_v_heads + vh);
+
+        if (c + 1 < num_chunks) {
+            cdh_prefetch(buf, gcb, (c + 1) & 1u, W_in, U_in, key, gate, c + 1, b, vh, seq_len,
+                         num_chunks, num_v_heads, k_dim, kh, qk_stride, gb_stride);
+            cp_wait<1>();
+        } else {
+            cp_wait<0>();
+        }
+        __syncthreads();
+
+        __nv_bfloat16* Wp = buf + (unsigned long long)cur * CDH_BUFSZ;
+        __nv_bfloat16* Kp = Wp + CHUNK * K_DIM;
+        __nv_bfloat16* Up = Kp + CHUNK * K_DIM;
+        const float* gcc = gcb + cur * CHUNK;
+
+        #pragma unroll
+        for (int kk = 0; kk < KH; kk++)
+            S_out[base * K_DIM * V_DIM + (k0 + kk) * V_DIM + v] = Sreg[kk];
+
+        const float dl = gcc[ce - 1];
+        const float edl = expf(dl);
+        float duc[CHUNK];
+        for (unsigned int i = 0; i < ce; i++) {
+            float wsp = 0.0f;
+            #pragma unroll
+            for (int kk = 0; kk < KH; kk++)
+                wsp += (float)Wp[i * K_DIM + k0 + kk] * Sreg[kk];
+            #pragma unroll
+            for (int s = 1; s < SPLIT; s <<= 1) wsp += __shfl_xor_sync(0xffffffffu, wsp, s);
+            float uci = (float)Up[i * V_DIM + v] - wsp;   // wsp == full <W_i, S[:,v]>
+            if (sub == 0) uc_out[base * CHUNK * V_DIM + i * v_dim + v] = __float2bfloat16(uci);
+            duc[i] = expf(dl - gcc[i]) * uci;
+        }
+        #pragma unroll
+        for (int kk = 0; kk < KH; kk++) {
+            float hv = edl * Sreg[kk];
+            for (unsigned int i = 0; i < ce; i++)
+                hv += duc[i] * (float)Kp[i * K_DIM + k0 + kk];
+            Sreg[kk] = hv;
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int kk = 0; kk < KH; kk++) H[(k0 + kk) * V_DIM + v] = Sreg[kk];
+}
+
+// SPLIT=2 (8 warps/CTA) is the chosen production variant: chunk_delta_h 34→26ms,
+// FLA total 1.55→1.75x, cos=1.0 vs scalar. SPLIT=4 (16 warps) was tested and gave
+// NO further gain (26.3 vs 26.5ms) — 8 warps already saturates the latency hiding,
+// so the kernel is no longer occupancy-bound past that. Template kept for the record.
+extern "C" __global__ void __launch_bounds__(256, 1)
+gated_delta_rule_chunk_delta_h_ksplit(
+    float* __restrict__ h_state, const __nv_bfloat16* __restrict__ W_in,
+    const __nv_bfloat16* __restrict__ U_in, const __nv_bfloat16* __restrict__ key,
+    const float* __restrict__ gate, float* __restrict__ S_out, __nv_bfloat16* __restrict__ uc_out,
+    unsigned int batch_size, unsigned int seq_len, unsigned int num_chunks,
+    unsigned int num_k_heads, unsigned int num_v_heads, unsigned int k_dim,
+    unsigned int v_dim, unsigned int qk_stride, unsigned int gb_stride
+) {
+    cdh_ksplit_core<2>(h_state, W_in, U_in, key, gate, S_out, uc_out, seq_len, num_chunks,
+                       num_k_heads, num_v_heads, k_dim, v_dim, qk_stride, gb_stride);
 }
 
 // ── KERNEL 3: chunk_fwd_o ────────────────────────────────────────────────

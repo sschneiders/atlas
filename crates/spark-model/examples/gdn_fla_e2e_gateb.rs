@@ -56,6 +56,8 @@ fn main() -> Result<()> {
     let g: &dyn GpuBackend = &backend;
     let k_wu: KernelHandle = g.kernel("gated_delta_rule_fla", "gated_delta_rule_recompute_wu")?;
     let k_dh: KernelHandle = g.kernel("gated_delta_rule_fla", "gated_delta_rule_chunk_delta_h")?;
+    let k_dh_tc: KernelHandle = g.kernel("gated_delta_rule_fla", "gated_delta_rule_chunk_delta_h_tc")?;
+    let k_dh_ks: KernelHandle = g.kernel("gated_delta_rule_fla", "gated_delta_rule_chunk_delta_h_ksplit")?;
     let k_fo: KernelHandle = g.kernel("gated_delta_rule_fla", "gated_delta_rule_chunk_fwd_o")?;
 
     let mut all_ok = true;
@@ -196,7 +198,24 @@ fn main() -> Result<()> {
             .arg_u32(1).arg_u32(t as u32).arg_u32(nt as u32).arg_u32(NK as u32).arg_u32(NV as u32)
             .arg_u32(KD as u32).arg_u32(VD as u32).arg_u32((NK*KD) as u32).arg_u32(NV as u32).launch(0)
     };
-    fla(g)?; g.synchronize(0)?; wy4(g)?; g.synchronize(0)?; // warmup
+    // TC chunk_delta_h variant (A/B candidate). smem: St(32K)+W(16K)+ws(32K f32)+U(16K)+gc.
+    let s2tc = (VD * KD * 2 + C * KD * 2 + C * VD * 4 + C * VD * 2 + C * 4) as u32; // 98560
+    let k2_tc = |g: &dyn GpuBackend| -> Result<()> {
+        KernelLaunch::new(g, k_dh_tc).grid([NV as u32, 1, 1]).block([128, 1, 1]).shared_mem(s2tc)
+            .arg_ptr(hp).arg_ptr(wp).arg_ptr(up).arg_ptr(kp).arg_ptr(gp).arg_ptr(scp).arg_ptr(ucp)
+            .arg_u32(1).arg_u32(t as u32).arg_u32(nt as u32).arg_u32(NK as u32).arg_u32(NV as u32)
+            .arg_u32(KD as u32).arg_u32(VD as u32).arg_u32((NK*KD) as u32).arg_u32(NV as u32).launch(0)
+    };
+    let fla_tc = |g: &dyn GpuBackend| -> Result<()> { k1(g)?; k2_tc(g)?; k3(g) };
+    // k-split chunk_delta_h: 256-thread block (2 threads/v-column), same double-buffer smem.
+    let k2_ks = |g: &dyn GpuBackend| -> Result<()> {
+        KernelLaunch::new(g, k_dh_ks).grid([NV as u32, 1, 1]).block([256, 1, 1]).shared_mem(s2)
+            .arg_ptr(hp).arg_ptr(wp).arg_ptr(up).arg_ptr(kp).arg_ptr(gp).arg_ptr(scp).arg_ptr(ucp)
+            .arg_u32(1).arg_u32(t as u32).arg_u32(nt as u32).arg_u32(NK as u32).arg_u32(NV as u32)
+            .arg_u32(KD as u32).arg_u32(VD as u32).arg_u32((NK*KD) as u32).arg_u32(NV as u32).launch(0)
+    };
+    let fla_ks = |g: &dyn GpuBackend| -> Result<()> { k1(g)?; k2_ks(g)?; k3(g) };
+    fla(g)?; g.synchronize(0)?; wy4(g)?; g.synchronize(0)?; fla_tc(g)?; g.synchronize(0)?; fla_ks(g)?; g.synchronize(0)?; // warmup
     let iters = 5;
     let timeit = |f: &dyn Fn(&dyn GpuBackend) -> Result<()>| -> Result<f64> {
         let t0 = std::time::Instant::now();
@@ -204,9 +223,27 @@ fn main() -> Result<()> {
         Ok(t0.elapsed().as_secs_f64() * 1e3 / iters as f64)
     };
     let (m1, m2, m3) = (timeit(&k1)?, timeit(&k2)?, timeit(&k3)?);
+    let m2tc = timeit(&k2_tc)?;
+    let m2ks = timeit(&k2_ks)?;
     let fla_ms = timeit(&fla)?;
+    let fla_ks_ms = timeit(&fla_ks)?;
     let wy4_ms = timeit(&wy4)?;
     eprintln!("SPEED @t={t}: FLA total={fla_ms:.2}ms (recompute_wu={m1:.2} chunk_delta_h={m2:.2} chunk_fwd_o={m3:.2})  wy4={wy4_ms:.2}ms  speedup={:.2}x", wy4_ms / fla_ms);
+    eprintln!("  chunk_delta_h_tc={m2tc:.2}ms (TC-staging, occupancy-bound → no win)", );
+    eprintln!("  chunk_delta_h_ksplit={m2ks:.2}ms (8 warps) → FLA total={fla_ks_ms:.2}ms  speedup={:.2}x  (scalar dh={m2:.2})  ← WINNER", wy4_ms / fla_ks_ms);
+
+    // A/B correctness: alt-dh pipeline O vs scalar-dh pipeline O (scalar already SSOT-validated above).
+    fla(g)?; g.synchronize(0)?;
+    let o_scalar = dn_bf16(g, op, t * NV * VD)?;
+    fla_tc(g)?; g.synchronize(0)?;
+    let o_tc = dn_bf16(g, op, t * NV * VD)?;
+    fla_ks(g)?; g.synchronize(0)?;
+    let o_ks = dn_bf16(g, op, t * NV * VD)?;
+    let (md_tc, cos_tc) = cmp(&o_scalar, &o_tc);
+    let (md_ks, cos_ks) = cmp(&o_scalar, &o_ks);
+    eprintln!("  A/B vs scalar-dh:  TC max={md_tc:.5} cos={cos_tc:.6} {}  |  KSPLIT max={md_ks:.5} cos={cos_ks:.6} {}",
+        if cos_tc >= 0.9999 { "PASS" } else { "FAIL" }, if cos_ks >= 0.9999 { "PASS" } else { "FAIL" });
+
     for p in [qp, kp, vp, gp, bp, hp, wp, up, scp, ucp, op] { let _ = g.free(p); }
 
     if !all_ok { std::process::exit(1); }
