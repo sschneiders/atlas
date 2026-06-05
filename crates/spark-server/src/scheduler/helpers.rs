@@ -36,6 +36,19 @@ pub fn im_start_hard_stop() -> Option<u32> {
     let id = IM_START_HARD_STOP.load(std::sync::atomic::Ordering::Relaxed);
     if id == 0 { None } else { Some(id) }
 }
+
+/// Fix B (2026-06-05): global hard-stop token for the `<tool_response>` control
+/// token. Set once at startup from `tokenizer_runtime.rs` when `<tool_response>`
+/// resolves to a single token id; mirrors the `<|im_start|>` hard-stop above.
+/// 0 = unset / no hard-stop.
+static TOOL_RESPONSE_HARD_STOP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub fn set_tool_response_hard_stop(id: u32) {
+    TOOL_RESPONSE_HARD_STOP.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn tool_response_hard_stop() -> Option<u32> {
+    let id = TOOL_RESPONSE_HARD_STOP.load(std::sync::atomic::Ordering::Relaxed);
+    if id == 0 { None } else { Some(id) }
+}
 // ── Sampling defaults (SSOT) ────────────────────────────────────────────────
 // All SamplingParams constructors reference these constants. Change here, not
 // at each call site.
@@ -238,6 +251,17 @@ fn parse_forced_token_fastpath(env: Option<&str>) -> bool {
         }
         None => true,
     }
+}
+
+/// Fix A (2026-06-05, kill-switch default OFF): lift EOS suppression after a
+/// completed tool call in auto mode (is_terminated() never becomes true there).
+pub fn tool_eos_escape_enabled() -> bool {
+    std::env::var("ATLAS_TOOL_EOS_ESCAPE").as_deref() == Ok("1")
+}
+/// Fix B (2026-06-05, kill-switch default OFF): hard-stop on the <tool_response>
+/// control token (a token the model must never generate).
+pub fn tool_response_stop_enabled() -> bool {
+    std::env::var("ATLAS_TOOL_RESPONSE_STOP").as_deref() == Ok("1")
 }
 
 /// Whether the grammar forced-token fast-path is enabled (default

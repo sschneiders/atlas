@@ -310,6 +310,7 @@ pub fn resume_swapped_seq(
         // the snapshot was mid-tool-call, the sample path needs a
         // safe default. Cleared at next emit if we re-cross a marker.
         inside_tool_body: false,
+        tool_call_completed: false,
         tool_body_streak_tokens: 0,
         inside_parameter_body: false,
         param_body_chars_emitted: 0,

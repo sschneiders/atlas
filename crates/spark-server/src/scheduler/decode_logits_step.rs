@@ -155,6 +155,22 @@ pub fn process_decode_logits(
         a.last_token = tok;
         a.last_token_time = now;
 
+        // Fix B (2026-06-05, kill-switch): <tool_response> hard stop. This decode
+        // path has no `<|im_start|>` hard-stop block (that lives only in
+        // emit_step.rs), so add the guard at the earliest safe point in the
+        // per-token handler — before grammar advance / EOS handling. The model
+        // must never generate this control token; if it does (post-tool-call
+        // runaway), end the turn. Uses `continue` (loop body), not `return`.
+        if tool_response_stop_enabled()
+            && let Some(trs) = tool_response_hard_stop()
+            && tok == trs
+        {
+            a.output_tokens.push(tok);
+            a.finished = true;
+            tracing::debug!("<tool_response> hard-stop fired (id={trs}); ending turn");
+            continue;
+        }
+
         // Spontaneous <think>: model generates <think> even when thinking
         // was not requested. Enter thinking mode so EOS is suppressed and
         // thinking content is stripped. Matches vLLM's behavior of always
@@ -320,6 +336,10 @@ pub fn process_decode_logits(
         // the grammar controls when EOS is valid.
         if tool_call_end_token == Some(tok) && !a.inside_thinking {
             a.output_tokens.push(tok);
+            // Fix A (2026-06-05): mark the tool call complete so the EOS-escape
+            // gate (below) can lift suppression. Inert unless
+            // `tool_eos_escape_enabled()` (default OFF).
+            a.tool_call_completed = true;
             if let ResponseSink::Streaming(ref tx) = a.sink {
                 let event = if let Some(lp) = a.logprobs_data.last().cloned() {
                     StreamEvent::TokenWithLogprobs(tok, lp)
@@ -379,10 +399,21 @@ pub fn process_decode_logits(
         // Grammar-based: grammar controls when EOS is allowed (is_terminated()).
         // Legacy: require_tool_call suppresses EOS until <tool_call> is seen.
         // min_tokens: suppress EOS until output_tokens.len() >= min_tokens.
+        // Fix A (2026-06-05, kill-switch): in tool_choice="auto" the grammar's
+        // is_terminated() never becomes true after a tool call, so EOS is
+        // suppressed forever — trapping the model into a hallucinated-transcript
+        // runaway. When enabled and a tool call has completed (and we're not
+        // inside a tool body / thinking), lift the grammar suppression so the
+        // model's natural EOS ends the turn. Inert unless ATLAS_TOOL_EOS_ESCAPE=1.
+        let eos_escape = tool_eos_escape_enabled()
+            && a.tool_call_completed
+            && !a.inside_tool_body
+            && !a.inside_thinking;
         let grammar_suppresses_eos = a
             .grammar_state
             .as_ref()
-            .is_some_and(|gs| !gs.is_terminated());
+            .is_some_and(|gs| !gs.is_terminated())
+            && !eos_escape;
         let legacy_suppresses_eos = a.require_tool_call;
         let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
         // Suppress EOS during thinking: <|im_end|> inside <think> is spurious.

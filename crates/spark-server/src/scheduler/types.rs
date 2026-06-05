@@ -186,6 +186,9 @@ pub(super) struct ActiveSeq {
     /// True between emission of `<tool_call>`/`<function=…>` (open) and
     /// `</tool_call>`/`</function>` (close).
     pub inside_tool_body: bool,
+    /// Fix A (2026-06-05): true once a complete `</tool_call>` has been emitted;
+    /// gates the EOS-escape (helpers::tool_eos_escape_enabled).
+    pub tool_call_completed: bool,
     /// Consecutive tokens emitted while `inside_tool_body=true`. When
     /// this exceeds `MAX_TOOL_BODY_TOKENS` (emit_step.rs), the response
     /// is force-ended: the model has emitted a `<tool_call>` opener but

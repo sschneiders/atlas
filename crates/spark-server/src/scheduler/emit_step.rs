@@ -60,6 +60,19 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         return;
     }
 
+    // Fix B (2026-06-05, kill-switch): <tool_response> hard stop — the model must
+    // never generate this control token; if it does (post-tool-call runaway), end
+    // the turn. Mirrors the <|im_start|> hard stop above.
+    if tool_response_stop_enabled()
+        && let Some(trs) = tool_response_hard_stop()
+        && tok == trs
+    {
+        a.output_tokens.push(tok);
+        a.finished = true;
+        tracing::debug!("<tool_response> hard-stop fired (id={trs}); ending turn");
+        return;
+    }
+
     // Spontaneous <think>: model generates <think> even when thinking was not
     // requested. Enter thinking mode so EOS is suppressed and thinking content
     // is stripped. This handles MTP bootstrap/verify paths.
@@ -101,6 +114,13 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     // also depended on this state was removed 2026-06-03; the state is
     // still required for A1/B1 and the adadec_diag dump.)
     update_tool_param_state(a, tok);
+
+    // Fix A (2026-06-05): mark a tool call complete on `</tool_call>` (outside
+    // thinking) so the EOS-escape gate can lift suppression. Inert unless
+    // `tool_eos_escape_enabled()` (default OFF).
+    if a.tool_call_end_token == Some(tok) && !a.inside_thinking {
+        a.tool_call_completed = true;
+    }
 
     // F2 mirror (Iter 46, 2026-06-02): reset the inter-tool prose budget when
     // a tool call opens on the MTP/emit path — parity with the non-MTP reset
@@ -307,10 +327,21 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     }
 
     // EOS handling: grammar-based, legacy, or min_tokens suppression.
+    // Fix A (2026-06-05, kill-switch): in tool_choice="auto" the grammar's
+    // is_terminated() never becomes true after a tool call, so EOS is suppressed
+    // forever — trapping the model into a hallucinated-transcript runaway. When
+    // enabled and a tool call has completed (and we're not inside a tool body /
+    // thinking), lift the grammar suppression so the model's natural EOS ends the
+    // turn. Inert unless ATLAS_TOOL_EOS_ESCAPE=1.
+    let eos_escape = tool_eos_escape_enabled()
+        && a.tool_call_completed
+        && !a.inside_tool_body
+        && !a.inside_thinking;
     let grammar_suppresses_eos = a
         .grammar_state
         .as_ref()
-        .is_some_and(|gs| !gs.is_terminated());
+        .is_some_and(|gs| !gs.is_terminated())
+        && !eos_escape;
     let legacy_suppresses_eos = a.require_tool_call;
     let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
     let suppress_eos = grammar_suppresses_eos || legacy_suppresses_eos || min_tokens_suppresses;

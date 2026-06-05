@@ -54,6 +54,7 @@ pub use helpers::set_boundary_token_mask;
 pub use helpers::set_enable_loop_watchdog;
 pub use helpers::set_im_start_hard_stop;
 pub use helpers::set_mid_word_token_mask;
+pub use helpers::set_tool_response_hard_stop;
 pub use helpers::set_numeric_token_mask;
 use helpers::*;
 pub use helpers::{CONTENT_LOOP_PERIOD_MAX, CONTENT_LOOP_PERIOD_MIN};

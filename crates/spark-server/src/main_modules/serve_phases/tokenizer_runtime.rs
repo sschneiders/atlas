@@ -209,6 +209,22 @@ pub(crate) fn resolve_tokenizer_runtime(
         tracing::info!("ChatML role-boundary hard stop: <|im_start|> (id {id}) registered");
     }
 
+    // Fix B (2026-06-05): mirror the <|im_start|> hard-stop resolution for the
+    // <tool_response> control token. Only registered when it resolves to a
+    // single token id. NOT added to `eos_tokens` — that would alter behavior
+    // even with the kill-switch OFF (the id would be treated as a stop token on
+    // the always-on EOS path); registration stays inert until the decode-time
+    // gate `tool_response_stop_enabled()` (ATLAS_TOOL_RESPONSE_STOP=1, default
+    // OFF) consults `tool_response_hard_stop()`.
+    let tool_response_id: Option<u32> = tokenizer
+        .encode("<tool_response>")
+        .ok()
+        .and_then(|ids| if ids.len() == 1 { Some(ids[0]) } else { None });
+    if let Some(id) = tool_response_id {
+        crate::scheduler::set_tool_response_hard_stop(id);
+        tracing::info!("Tool-response hard stop: <tool_response> (id {id}) registered");
+    }
+
     let tool_call_format_name: Option<String> = args.tool_call_parser.clone().or_else(|| {
         let defaults: toml::Table = toml::from_str(include_str!("../../../tool_defaults.toml"))
             .expect("invalid tool_defaults.toml");
