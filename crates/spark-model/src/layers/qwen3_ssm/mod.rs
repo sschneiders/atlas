@@ -83,6 +83,15 @@ pub struct Qwen3SsmLayer {
     gdn_prefill_split4_k: KernelHandle,
     gdn_prefill_persistent_k: KernelHandle,
     gdn_prefill_persistent_wy4_k: KernelHandle,
+    /// Chunk-64 chunked-scan prefill (GATE-C experiment, `ATLAS_GDN_CHUNK64=1`):
+    /// kk/kq Gram matmuls on tensor cores; H-recurrence still scalar (bf16-H).
+    gdn_prefill_chunk64_k: KernelHandle,
+    /// FLA multi-kernel chunked prefill (`ATLAS_GDN_FLA=1`): recompute_wu →
+    /// chunk_delta_h_ksplit (k-split occupancy) → chunk_fwd_o. 1.75x vs wy4 @16k,
+    /// token-equal (cos=1.0 vs scalar). Three handles; all must be non-null.
+    gdn_prefill_fla_recompute_wu_k: KernelHandle,
+    gdn_prefill_fla_chunk_delta_h_k: KernelHandle,
+    gdn_prefill_fla_chunk_fwd_o_k: KernelHandle,
     /// WY32 chunked prefill: processes 32 tokens per WY iteration with H in
     /// shared memory. ~30x faster than per-token for 14k+ sequences.
     gdn_prefill_wy32_k: KernelHandle,

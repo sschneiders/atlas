@@ -63,6 +63,9 @@ pub struct BufferArena {
     expert_down_out: DevicePtr,
     /// Split-K decode attention workspace: partials from split CTAs (F32).
     splitk_workspace: DevicePtr,
+    /// GDN FLA chunked-prefill scratch (W|U|S|uc sub-divided). NULL unless the
+    /// model is a 128-dim-linear-head GDN model (ATLAS_GDN_FLA path).
+    gdn_fla_scratch: DevicePtr,
     /// Maximum batch tokens this arena was sized for.
     max_batch_tokens: usize,
     /// Sizes in bytes for each buffer (for debug/logging).
@@ -98,6 +101,13 @@ impl BufferArena {
         let expert_up_out = gpu.alloc(sizes.expert_up_out)?;
         let expert_down_out = gpu.alloc(sizes.expert_down_out)?;
         let splitk_workspace = gpu.alloc(sizes.splitk_workspace)?;
+        // GDN FLA scratch: only allocate for the 128-dim-linear-head GDN path
+        // (size 0 → NULL → ATLAS_GDN_FLA dispatch stays disabled).
+        let gdn_fla_scratch = if sizes.gdn_fla_scratch > 0 {
+            gpu.alloc(sizes.gdn_fla_scratch)?
+        } else {
+            DevicePtr::NULL
+        };
 
         tracing::info!(
             "Buffer arena: {} tokens × {:.1} MB total (attn_out={:.1}MB, ssm_deint={:.1}MB, kv_lora_rank={})",
@@ -127,6 +137,7 @@ impl BufferArena {
             expert_up_out,
             expert_down_out,
             splitk_workspace,
+            gdn_fla_scratch,
             max_batch_tokens,
             sizes,
         })
@@ -191,6 +202,11 @@ impl BufferArena {
         self.expert_down_out
     }
     /// Split-K decode attention workspace (F32 partials).
+    /// GDN FLA chunked-prefill scratch base (W|U|S|uc sub-divided by the caller).
+    /// `DevicePtr::NULL` unless this is a 128-dim-linear-head GDN model.
+    pub fn gdn_fla_scratch(&self) -> DevicePtr {
+        self.gdn_fla_scratch
+    }
     pub fn splitk_workspace(&self) -> DevicePtr {
         self.splitk_workspace
     }

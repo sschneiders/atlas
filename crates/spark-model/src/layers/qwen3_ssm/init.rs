@@ -102,6 +102,26 @@ impl Qwen3SsmLayer {
                 "gated_delta_rule_persistent",
                 "gated_delta_rule_prefill_persistent_wy4",
             ),
+            gdn_prefill_chunk64_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule_chunk64",
+                "gated_delta_rule_prefill_chunk64",
+            ),
+            gdn_prefill_fla_recompute_wu_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule_fla",
+                "gated_delta_rule_recompute_wu",
+            ),
+            gdn_prefill_fla_chunk_delta_h_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule_fla",
+                "gated_delta_rule_chunk_delta_h_ksplit",
+            ),
+            gdn_prefill_fla_chunk_fwd_o_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule_fla",
+                "gated_delta_rule_chunk_fwd_o",
+            ),
             gdn_prefill_wy32_k: super::super::try_kernel(
                 gpu,
                 "gated_delta_rule_wy64_prefill",

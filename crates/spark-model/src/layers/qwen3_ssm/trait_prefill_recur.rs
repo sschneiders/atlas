@@ -59,7 +59,90 @@ impl Qwen3SsmLayer {
             std::env::var("ATLAS_FORCE_PERSISTENT").ok().as_deref(),
             Some("1")
         );
-        if force_persistent && self.gdn_prefill_persistent_k.0 != 0 {
+        // ATLAS_GDN_CHUNK64=1 — chunked-scan prefill (GATE-C precision experiment):
+        // kk/kq Gram matmuls on tensor cores; H-recurrence scalar (bf16-H). Takes
+        // priority over wy4 when set. smem = sk_bf+sq_bf(bf16) + kk+kq(f32) + gc.
+        let chunk64_on = matches!(
+            std::env::var("ATLAS_GDN_CHUNK64").ok().as_deref(),
+            Some("1")
+        );
+        // ATLAS_GDN_FLA=1 — FLA multi-kernel chunked prefill (recompute_wu →
+        // chunk_delta_h_ksplit → chunk_fwd_o). 1.75x vs wy4 @16k, token-equal
+        // (cos=1.0 vs scalar). HIGHEST priority when set + 128-dim linear heads +
+        // kernels & scratch present. Scratch = BufferArena.gdn_fla_scratch, carved
+        // W|U|S|uc by the runtime chunk count (≤ the max_batch_tokens it was sized for).
+        let fla_on = matches!(
+            std::env::var("ATLAS_GDN_FLA").ok().as_deref(),
+            Some("1")
+        );
+        let fla_scratch = ctx.buffers.gdn_fla_scratch();
+        if fla_on
+            && kd == 128
+            && vd == 128
+            && fla_scratch.0 != 0
+            && self.gdn_prefill_fla_recompute_wu_k.0 != 0
+            && self.gdn_prefill_fla_chunk_delta_h_k.0 != 0
+            && self.gdn_prefill_fla_chunk_fwd_o_k.0 != 0
+        {
+            let num_chunks = k.div_ceil(64);
+            let nt = num_chunks as usize;
+            let w_out = fla_scratch;
+            let u_out = w_out.offset(nt * nv * 64 * kd * 2);
+            let s_out = u_out.offset(nt * nv * 64 * vd * 2);
+            let uc_out = s_out.offset(nt * nv * kd * vd * 4);
+            ops::gdn_prefill_fla(
+                ctx.gpu,
+                self.gdn_prefill_fla_recompute_wu_k,
+                self.gdn_prefill_fla_chunk_delta_h_k,
+                self.gdn_prefill_fla_chunk_fwd_o_k,
+                h_state,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                gates_buf,
+                gates_buf.offset(nv * fp32),
+                gdn_out_buf,
+                w_out,
+                u_out,
+                s_out,
+                uc_out,
+                1,
+                k,
+                num_chunks,
+                nk as u32,
+                nv as u32,
+                kd as u32,
+                vd as u32,
+                conv_dim as u32,
+                conv_dim as u32,
+                gb_stride,
+                stream,
+            )?;
+        } else if chunk64_on && self.gdn_prefill_chunk64_k.0 != 0 {
+            let smem64 = (3 * 64 * kd * 2 + 2 * 64 * 64 * 4 + 2 * 64 * 64 * 2 + 64 * 4) as u32;
+            ops::gdn_prefill_persistent_smem(
+                ctx.gpu,
+                self.gdn_prefill_chunk64_k,
+                h_state,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                gates_buf,
+                gates_buf.offset(nv * fp32),
+                gdn_out_buf,
+                1,
+                k,
+                nk as u32,
+                nv as u32,
+                kd as u32,
+                vd as u32,
+                conv_dim as u32,
+                conv_dim as u32,
+                gb_stride,
+                smem64,
+                stream,
+            )?;
+        } else if force_persistent && self.gdn_prefill_persistent_k.0 != 0 {
             // Forced per-token persistent at ANY k.
             ops::gdn_prefill_persistent(
                 ctx.gpu,
