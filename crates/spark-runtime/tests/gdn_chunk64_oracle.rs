@@ -143,7 +143,7 @@ fn chunk64_ref(inp: &Inputs, d: Dims) -> (Vec<f64>, Vec<f64>) {
             let mut gc = vec![0.0f64; ce];
             let mut acc = 0.0;
             for i in 0..ce {
-                acc += inp.gate[(cs + i) * d.nv + vh].ln();
+                acc += inp.gate[(cs + i) * d.nv + vh].max(1e-30).ln();
                 gc[i] = acc;
             }
             for tid in 0..d.vd {
@@ -216,7 +216,7 @@ fn fla_decomposed_ref(inp: &Inputs, d: Dims) -> (Vec<f64>, Vec<f64>) {
             let ce = C.min(d.t - cs);
             let mut gc = vec![0.0f64; ce];
             let mut acc = 0.0;
-            for i in 0..ce { acc += inp.gate[(cs + i) * d.nv + vh].ln(); gc[i] = acc; }
+            for i in 0..ce { acc += inp.gate[(cs + i) * d.nv + vh].max(1e-30).ln(); gc[i] = acc; }
             // recompute_w_u: U[i][v] (ce×vd), W[i][k] (ce×kd) via forward-sub (== T·βV, T·β·exp(gc)·K)
             let mut uu = vec![0.0f64; ce * d.vd];
             let mut ww = vec![0.0f64; ce * d.kd];
@@ -310,7 +310,7 @@ fn fla_decomposed_bf16sim_ref(
             let ce = C.min(d.t - cs);
             let mut gc = vec![0.0f64; ce];
             let mut acc = 0.0;
-            for i in 0..ce { acc += inp.gate[(cs + i) * d.nv + vh].ln(); gc[i] = acc; }
+            for i in 0..ce { acc += inp.gate[(cs + i) * d.nv + vh].max(1e-30).ln(); gc[i] = acc; }
             let mut uu = vec![0.0f64; ce * d.vd];
             let mut ww = vec![0.0f64; ce * d.kd];
             for i in 0..ce {
@@ -370,6 +370,41 @@ fn fla_decomposed_bf16sim_ref(
 /// Precision probe (run: `cargo test -p spark-runtime --release
 /// fla_bf16_precision_probe -- --ignored --nocapture`). Decides whether bf16-TC
 /// is safe for the W·S and/or S-update matmuls at a realistic 28k-token depth.
+/// Regression test for the in-model NaN bug: deep-layer gates underflow to exactly
+/// 0.0 (or tiny), and the log-space chunked form does log(gate) → -inf → exp(gc_i-gc_l)
+/// = NaN. The recurrent SSOT (h=g·h, no log) is robust; the floored chunked form must
+/// match it and stay finite. (The original GATE-B used gate∈[0.8,0.999] and missed this.)
+#[test]
+fn fla_decomposed_handles_gate_underflow() {
+    let dims_base = |t| Dims { t, nk: 2, nv: 4, kd: 8, vd: 8 };
+    for &t in &[64usize, 100, 200] {
+        let d = dims_base(t);
+        let mut inp = gen_inputs(d, 0xDEAD ^ (t as u64));
+        // Force a fraction of gates to underflow (exact 0.0) or near-underflow.
+        for (j, g) in inp.gate.iter_mut().enumerate() {
+            if j % 7 == 0 {
+                *g = 0.0;
+            } else if j % 11 == 0 {
+                *g = 1e-40;
+            }
+        }
+        let (o_rec, h_rec) = recurrent_ref(&inp, d);
+        let (o_fla, h_fla) = fla_decomposed_ref(&inp, d);
+        assert!(
+            o_fla.iter().all(|x| x.is_finite()) && h_fla.iter().all(|x| x.is_finite()),
+            "seq_len={t}: FLA produced NON-FINITE output under underflow gates (the bug)"
+        );
+        let mut max_o = 0.0f64;
+        for (a, b) in o_rec.iter().zip(&o_fla) { max_o = max_o.max((a - b).abs()); }
+        let mut max_h = 0.0f64;
+        for (a, b) in h_rec.iter().zip(&h_fla) { max_h = max_h.max((a - b).abs()); }
+        assert!(
+            max_o < 1e-6 && max_h < 1e-6,
+            "seq_len={t}: FLA(floored) vs recurrent diverged under underflow gates — out={max_o:e} h={max_h:e}"
+        );
+    }
+}
+
 #[test]
 #[ignore = "long; explicit precision probe"]
 fn fla_bf16_precision_probe() {
