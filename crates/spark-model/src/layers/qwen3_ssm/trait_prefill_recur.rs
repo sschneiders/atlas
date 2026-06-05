@@ -84,6 +84,14 @@ impl Qwen3SsmLayer {
             && self.gdn_prefill_fla_chunk_delta_h_k.0 != 0
             && self.gdn_prefill_fla_chunk_fwd_o_k.0 != 0
         {
+            // One-time positive signal that the FLA path is live (vs silently
+            // falling through to wy4 on a guard miss) — greppable in the server log.
+            static FLA_LOG: std::sync::Once = std::sync::Once::new();
+            FLA_LOG.call_once(|| {
+                tracing::info!(
+                    "GDN prefill: ATLAS_GDN_FLA path ACTIVE (recompute_wu → chunk_delta_h_ksplit → chunk_fwd_o)"
+                );
+            });
             let num_chunks = k.div_ceil(64);
             let nt = num_chunks as usize;
             let w_out = fla_scratch;
