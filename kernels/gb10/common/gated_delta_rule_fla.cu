@@ -21,6 +21,12 @@
 #define K_DIM 128
 #define V_DIM 128
 #define CHUNK 64
+// Floor for the linear gate before log-space cumsum. Deep-layer gates can
+// underflow to exactly 0.0 (or tiny negatives), and log(0)=-inf → exp(gc_i-gc_l)
+// = exp(-inf - -inf) = NaN. The per-token recurrence (h=g·h) tolerates g≈0; the
+// chunked log-space form does not. 1e-30 ⇒ log≈-69 (effectively full decay) and
+// is a no-op for any normal gate. (GATE-B used g∈[0.8,0.999], never hitting this.)
+#define GATE_FLOOR 1e-30f
 
 // GB10 sm_121 has cp.async.cg (NO TMA). 16-byte async global→shared copy + group
 // commit/wait — used to double-buffer the per-chunk W/U/K loads in chunk_delta_h
@@ -143,7 +149,7 @@ gated_delta_rule_recompute_wu(
     if (tid == 0) {
         float acc = 0.0f;
         for (unsigned int i = 0; i < ce; i++) {
-            acc += logf(gate[(unsigned long long)(cs + i) * gb_stride + vh]);
+            acc += logf(fmaxf(gate[(unsigned long long)(cs + i) * gb_stride + vh], GATE_FLOOR));
             gc[i] = acc;
         }
     }
@@ -226,7 +232,7 @@ __device__ __forceinline__ void cdh_prefetch(
     if (tid == 0) {
         float acc = 0.0f;
         for (unsigned int i = 0; i < ce; i++) {
-            acc += logf(gate[(unsigned long long)(cs + i) * gb_stride + vh]);
+            acc += logf(fmaxf(gate[(unsigned long long)(cs + i) * gb_stride + vh], GATE_FLOOR));
             gcb[p * CHUNK + i] = acc;
         }
     }
@@ -416,7 +422,7 @@ gated_delta_rule_chunk_delta_h_tc(
         if (tid == 0) {
             float acc = 0.0f;
             for (unsigned int i = 0; i < ce; i++) {
-                acc += logf(gate[(unsigned long long)(cs + i) * gb_stride + vh]);
+                acc += logf(fmaxf(gate[(unsigned long long)(cs + i) * gb_stride + vh], GATE_FLOOR));
                 gc[i] = acc;
             }
         }
@@ -648,7 +654,7 @@ gated_delta_rule_chunk_fwd_o(
     if (tid == 0) {
         float acc = 0.0f;
         for (unsigned int i = 0; i < ce; i++) {
-            acc += logf(gate[(unsigned long long)(cs + i) * gb_stride + vh]);
+            acc += logf(fmaxf(gate[(unsigned long long)(cs + i) * gb_stride + vh], GATE_FLOOR));
             gc[i] = acc;
         }
     }
