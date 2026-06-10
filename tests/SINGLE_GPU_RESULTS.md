@@ -281,3 +281,114 @@ budgets independently for memory-check purposes.
 
 **Status**: correct behavior, no code change needed. To minimize SSM footprint for single-user
 serving use `--max-batch-size 1` (reduces `SsmStatePool` from ~1206 MB to ~151 MB).
+
+---
+
+## Codebase Verification — 2026-06-10 (spec_ssm branch)
+
+Independent deep audit of all three priorities against the current `spec_ssm` branch.
+Files read and control flow traced end-to-end. No new bugs found; all previously noted
+fixes remain correctly in place.
+
+### P1 — Mistral Small 4 MLA prefill (>1K token gibberish)
+
+**Scope**: `yarn.rs` (YaRN fix), `paged_mla.rs` (primary prefill path), `cache_skip_mla.rs`
+(prefix-cache recompute path), `kv_dtypes.rs` (BF16 fence), `mla_absorbed.cu` (CUDA kernels).
+
+**yarn.rs — correct**: `find_correction_dim` in dimension-index space matches HF
+`_compute_yarn_parameters` exactly. For Mistral Small 4 (`rope_dim=64`, `theta=1e7`,
+`factor=128`, `beta_fast=32`, `beta_slow=1.0`, `orig_ctx=8192`):
+
+```
+low  = floor(64 × ln(8192 / (32 × 2π)) / (2 × ln(1e7))) = floor(7.36)  = 7
+high = ceil (64 × ln(8192 / ( 1 × 2π)) / (2 × ln(1e7))) = ceil (14.24) = 15
+```
+
+`ramp = (j − low) / (high − low)`, clamped [0,1]; `extrap_factor = 1 − ramp`;
+`inv_freq = interp × ramp + extrap × (1 − ramp)`. Verified against HF reference
+(`inv_freq_extrapolation_factor = 1 − linear_ramp_factor(low, high, dim//2)`).
+Boundary logic matches: j < 7 full extrapolation, j 7–15 linear blend, j > 15 full
+1/128 interpolation. Formula correct. ✓
+
+**paged_mla.rs — correct**: this is the code path exercised by a >1K token single-chunk
+prefill (no prefix cache hit). Key checks:
+
+- `kv_dim = nkv × hd = 8 × 128 = 1024`. V written at `k_contiguous.offset(N × 1024 × 2)`.
+  For Mistral Small 4: `mla_v_dim = 128 = hd`, so K and V have identical per-token stride
+  and the V pointer offset is exact. ✓
+- `mla_kv_assemble_batched` grid `(num_tokens, 2, 1)` handles >65535 tokens via 64-bit
+  address arithmetic (`unsigned long long` offsets in the kernel). ✓
+- `mla_cache_assemble_batched` block `(mla_cache_dim.max(256), 1, 1)` = `(320, 1, 1)`
+  for `mla_cache_dim=320`; one pass per thread covers exactly one cache element. ✓
+- Flash attention: `prefill_attn_k` (standard tile, `hd=128 ≤ 256`) with
+  `effective_attn_scale(hd=128) = 1/√128 ≈ 0.0884`. `attn_scale_override` is None for
+  Mistral (only Gemma4 sets it to 1.0). ✓
+- Buffer lifetime: `q_latent = ssm_ba()` fully consumed (through wq_b→qg_out) before
+  `k_rope_buf = ssm_ba()` reuses the same slot. No aliasing hazard. ✓
+- `kv_latent = expert_gate_out()` is preserved through the `wkv_b` expansion step
+  (expansion writes to `ssm_deinterleaved()`), still valid at the cache assembly call. ✓
+
+**kv_dtypes.rs — correct**: `auto_high_precision_layers(BF16, ...)` returns `None`
+→ `build_layer_kv_dtypes(BF16, n, 0, BF16)` returns empty vec → all attention layers
+remain uniform BF16. `--kv-high-precision-layers auto` is a no-op when the base dtype
+is already BF16; zero risk of accidental FP8 injection into MLA compressed latents. ✓
+
+**Status**: YaRN fix and all MLA prefill paths confirmed correct. Awaiting live hardware
+re-test to close P0 entirely.
+
+### P2 — Nemotron Super 120B tool calling
+
+**Scope**: `kernels/gb10/nemotron-super-120b-a12b/MODEL.toml`, `jinja-templates/nemotron_h.jinja`,
+`crates/spark-server/src/tool_parser/bare_json.rs`, `crates/spark-server/src/tokenizer/chat_impl.rs`,
+`crates/spark-server/src/api/chat/template.rs`.
+
+**MODEL.toml — correct**: `disable_tool_steering = true`, `tool_call_parser = "bare_json"`,
+`thinking_in_tools = true` (flipped back from false in a later pass; no regression observed). ✓
+
+**End-to-end flow verified**:
+1. `chat/template.rs` calls `state.tokenizer.apply_chat_template_openai(..., state.behavior.disable_tool_steering)`.
+2. `chat_impl.rs::apply_chat_template_openai` passes `disable_tool_steering` into the
+   minijinja context as a named variable.
+3. `nemotron_h.jinja` line 204: `{%- if tools and not disable_tool_steering %}` — with
+   `disable_tool_steering=true`, the `<tool_call>\n` steering prefix is skipped and the
+   `enable_thinking` branch fires instead, opening `<think>` naturally. ✓
+4. The jinja template still renders `<tools>…</tools>` + XML format instructions in the
+   system message (the `{% if tools %}` block at line 48 is NOT gated on
+   `disable_tool_steering`). This is intentional: the model ignores the XML guidance and
+   falls back to its bare-JSON training distribution. The bare_json xgrammar (trigger
+   mode in `tool_choice=auto`) activates on the first `{` after `</think>` and constrains
+   the output to a schema-valid `{"name":…, "arguments":{…}}` object. ✓
+5. `BareJsonParser::system_prompt()` generates a plain-text tool instruction but is NOT
+   injected as an extra system message (the injection was removed on 2026-05-25 to avoid
+   competing with the jinja template's format block). ✓
+
+**Status**: fix confirmed correct. Awaiting live hardware re-test.
+
+### P3 — 122B SSM pool allocation with `--ssm-cache-slots 0`
+
+**Scope**: `crates/spark-server/src/cli.rs`, `crates/spark-model/src/model/impl_a1.rs`,
+`crates/spark-model/src/model/ssm_pool.rs`, `crates/spark-model/src/model/ssm_snapshot.rs`,
+`crates/spark-server/src/main_modules/serve_phases/build.rs`.
+
+**CLI propagation — correct**: `args.ssm_cache_slots` passes through
+`serve_phases/build.rs:71` as the `ssm_cache_slots` positional argument to
+`TransformerModel::new(...)`, which feeds directly into
+`SsmSnapshotPool::new(ssm_cache_slots, ...)` at `impl_a1.rs:159`. Passing `--ssm-cache-slots 0`
+correctly zeroes the Marconi prefix-cache snapshot budget. ✓
+
+**SsmStatePool is independent — confirmed**: `SsmStatePool::new(&config, max_batch_size, ...)`
+at `impl_a1.rs:136` uses `max_batch_size` (from `--max-batch-size`, default 8), not
+`ssm_cache_slots`. It allocates `(max_batch_size + 1) × num_ssm_layers × (h_bytes + conv_bytes)`.
+The `+1` is a dedicated dummy slot (index `max_slots`) that prevents pad-position SSM state
+writes from colliding with claimed slots. This allocation is mandatory for any model with
+SSM layers — it holds the live recurrent state for all in-flight decode sequences.
+
+**Observation**: for Qwen3.5-122B-A10B (36 SSM layers, default `--max-batch-size 8`) the
+pool is `9 × 36 × h_bytes ≈ 1206 MB`. Since the model must decode at least one sequence
+at a time, this memory is non-optional. Passing `--ssm-cache-slots 0` reduces the
+`SsmSnapshotPool` (Marconi + decode-rollback ring) to the ring-only budget
+(`DECODE_ROLLBACK_RING_SLOTS × max_batch_size × num_ssm_layers × h_bytes`) but leaves the
+main pool intact.
+
+**Status**: correct behavior, no code change needed. Documented in Action Items (P2). Use
+`--max-batch-size 1` to reduce `SsmStatePool` to ~151 MB for single-user deployments.
