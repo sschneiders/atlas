@@ -248,7 +248,8 @@ Additional MLA prefill code paths also verified clean:
 **Verified**: `kernels/gb10/nemotron-super-120b-a12b/MODEL.toml` contains:
 - `disable_tool_steering = true` — skips the `<tool_call>\n` steering prefix
 - `tool_call_parser = "bare_json"` — uses the model's native top-level JSON format
-- `thinking_in_tools = false` — prevents reasoning trace from burying the JSON payload
+- `thinking_in_tools = true` — project-wide default flipped 2026-05-23; per-model override
+  available if thinking-during-tools degrades bare_json output in practice
 
 **Verified**: `jinja-templates/nemotron_h.jinja` generation-prompt block correctly gates the
 steering prefix on `not disable_tool_steering`:
@@ -288,9 +289,10 @@ serving use `--max-batch-size 1` (reduces `SsmStatePool` from ~1206 MB to ~151 M
 
 Independent deep audit of all three priorities against the current `spec_ssm` branch.
 Files read and control flow traced end-to-end. No new bugs found; all previously noted
-fixes remain correctly in place.
+fixes remain correctly in place. Documentation inaccuracy in the 2026-06-07 P1 section
+corrected (`thinking_in_tools` was listed as `false`; current value is `true`).
 
-### P1 — Mistral Small 4 MLA prefill (>1K token gibberish)
+### P0 — Mistral Small 4 MLA prefill (>1K token gibberish)
 
 **Scope**: `yarn.rs` (YaRN fix), `paged_mla.rs` (primary prefill path), `cache_skip_mla.rs`
 (prefix-cache recompute path), `kv_dtypes.rs` (BF16 fence), `mla_absorbed.cu` (CUDA kernels).
@@ -328,22 +330,40 @@ prefill (no prefix cache hit). Key checks:
 - `kv_latent = expert_gate_out()` is preserved through the `wkv_b` expansion step
   (expansion writes to `ssm_deinterleaved()`), still valid at the cache assembly call. ✓
 
+**cache_skip_mla.rs — correct**: `prefill_attention_64` with `1/sqrt(hd=128)` hardcoded
+inline. Same scale as `paged_mla.rs`; no correctness gap between the two prefill paths. ✓
+
 **kv_dtypes.rs — correct**: `auto_high_precision_layers(BF16, ...)` returns `None`
 → `build_layer_kv_dtypes(BF16, n, 0, BF16)` returns empty vec → all attention layers
 remain uniform BF16. `--kv-high-precision-layers auto` is a no-op when the base dtype
 is already BF16; zero risk of accidental FP8 injection into MLA compressed latents. ✓
 
+**mla_absorbed.cu CUDA kernel audit** — all four seq_len concerns ruled out:
+
+1. **seq_len limits**: None. All batched kernels (`mla_q_rope_extract_batched`,
+   `mla_q_rope_writeback_batched`, `mla_kv_assemble_batched`, `mla_cache_assemble_batched`,
+   `mla_q_final_assemble_batched`) use grid-stride loops over `total = N × heads × dim`
+   and launch with `gridDim.x = ceil(total/256)`. No hardcoded `N_max` or `seq_len` cap.
+2. **Shared memory**: `mla_batched_gemv` cross-warp reduction uses
+   `__shared__ float s_partial[N_PER_BLOCK * 2][2]` (64 bytes, constant). No shared-memory
+   allocation that scales with seq_len.
+3. **Tile loop bounds**: `mla_batched_gemv` iterates over `K4 = K/4` (K = 256 or 128,
+   both compile-time-fixed). No tile bound that could overflow at >1K tokens.
+4. **BF16 dispatch**: entire file is pure BF16 (`__nv_bfloat16`). No FP8/NVFP4 code
+   path exists; the absorbed GEMV kernels are always BF16. ✓
+
 **Status**: YaRN fix and all MLA prefill paths confirmed correct. Awaiting live hardware
 re-test to close P0 entirely.
 
-### P2 — Nemotron Super 120B tool calling
+### P1 — Nemotron Super 120B tool calling
 
 **Scope**: `kernels/gb10/nemotron-super-120b-a12b/MODEL.toml`, `jinja-templates/nemotron_h.jinja`,
 `crates/spark-server/src/tool_parser/bare_json.rs`, `crates/spark-server/src/tokenizer/chat_impl.rs`,
 `crates/spark-server/src/api/chat/template.rs`.
 
 **MODEL.toml — correct**: `disable_tool_steering = true`, `tool_call_parser = "bare_json"`,
-`thinking_in_tools = true` (flipped back from false in a later pass; no regression observed). ✓
+`thinking_in_tools = true` (project-wide default flipped to `true` on 2026-05-23; per-model
+override remains available if thinking-during-tools degrades bare_json output in practice). ✓
 
 **End-to-end flow verified**:
 1. `chat/template.rs` calls `state.tokenizer.apply_chat_template_openai(..., state.behavior.disable_tool_steering)`.
@@ -353,18 +373,18 @@ re-test to close P0 entirely.
    `disable_tool_steering=true`, the `<tool_call>\n` steering prefix is skipped and the
    `enable_thinking` branch fires instead, opening `<think>` naturally. ✓
 4. The jinja template still renders `<tools>…</tools>` + XML format instructions in the
-   system message (the `{% if tools %}` block at line 48 is NOT gated on
-   `disable_tool_steering`). This is intentional: the model ignores the XML guidance and
-   falls back to its bare-JSON training distribution. The bare_json xgrammar (trigger
-   mode in `tool_choice=auto`) activates on the first `{` after `</think>` and constrains
-   the output to a schema-valid `{"name":…, "arguments":{…}}` object. ✓
+   system message (the `{% if tools %}` block is NOT gated on `disable_tool_steering`).
+   This is intentional: the model ignores the XML guidance and falls back to its bare-JSON
+   training distribution. The bare_json xgrammar (trigger mode in `tool_choice=auto`)
+   activates on the first `{` after `</think>` and constrains the output to a schema-valid
+   `{"name":…, "arguments":{…}}` object. ✓
 5. `BareJsonParser::system_prompt()` generates a plain-text tool instruction but is NOT
-   injected as an extra system message (the injection was removed on 2026-05-25 to avoid
-   competing with the jinja template's format block). ✓
+   injected as an extra system message (injection removed 2026-05-25 to avoid competing
+   with the jinja template's format block). ✓
 
 **Status**: fix confirmed correct. Awaiting live hardware re-test.
 
-### P3 — 122B SSM pool allocation with `--ssm-cache-slots 0`
+### P2 — 122B SSM pool allocation with `--ssm-cache-slots 0`
 
 **Scope**: `crates/spark-server/src/cli.rs`, `crates/spark-model/src/model/impl_a1.rs`,
 `crates/spark-model/src/model/ssm_pool.rs`, `crates/spark-model/src/model/ssm_snapshot.rs`,
