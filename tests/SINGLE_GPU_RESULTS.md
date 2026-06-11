@@ -514,6 +514,35 @@ xgrammar `{"name":"` trigger enforces the schema once the model begins a JSON ob
 Both kernels are dead code: optionally loaded to avoid build failures when the `.cu` file
 is present, but no call site exists. They do not affect correctness.
 
+**Decode path vs. prefill path comparison** — the task asked to compare
+`attention_forward_mla.rs` (decode) with the prefill paths to spot inconsistencies.
+Key verified differences (all expected and correct):
+
+| Aspect | Prefill (`paged_mla.rs`) | Decode (`attention_forward_mla.rs`) |
+|--------|--------------------------|--------------------------------------|
+| Q form | Expanded Q (`nq × hd`) via `wq_b` GEMM | Absorbed Q (`nq × mla_cache_dim`) via batched GEMV with `w_uk_t` |
+| K/V form | Expanded K/V (`nkv × hd`), assembled in-memory | Compressed latent cache entry (`mla_cache_dim`), read from paged pool |
+| Attention kernel | `prefill_attention` (flash, causal, hd=128) | `paged_decode_attn_bf16` (paged, hd=mla_cache_dim=320) |
+| V extraction | Directly from `kv_expanded` (part of wkv_b output) | Post-attention GEMV via `w_uv` (batched) |
+| O-proj input | Expanded attn_out (`nq × hd`) | V-extracted output (`nq × mla_v_dim`) |
+| YaRN table | `mla.yarn_inv_freq` (same pointer) | `mla.yarn_inv_freq` (same pointer) |
+| Output buffer | `ctx.buffers.norm_output()` | `ctx.buffers.qkv_output()` |
+
+The output-buffer difference (norm_output vs. qkv_output) is harmless — both functions
+return the pointer and their callers use the returned value. `cache_skip_mla.rs` also uses
+`qkv_output` and documents "norm_output aliases downstream". No correctness divergence exists.
+
+`mla.yarn_inv_freq` is computed once in `yarn.rs` and shared by both paths; the YaRN fix
+therefore heals both prefill (long-context gibberish) and any edge cases in decode (which
+was already working but used an incorrect inv_freq table pre-fix).
+
+**MODEL.toml BF16 safety guard verified**: `kernels/gb10/mistral-small-4/MODEL.toml` contains
+`default_kv_dtype = "bf16"` with comment "MLA latent space values exceed FP8 E4M3 range (±448)".
+This is a model-side override that takes precedence over the server default of FP8, providing
+a belt-and-suspenders guarantee that Mistral's compressed KV latents are never quantized to FP8.
+
+**Status**: decode path confirmed consistent with prefill; no new bugs found.
+
 ### P2 — 122B SSM pool memory
 
 **Verified** (unchanged from 2026-06-07 and 2026-06-10 audits): `SsmStatePool` is always
