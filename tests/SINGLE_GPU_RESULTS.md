@@ -552,3 +552,94 @@ independent and correctly retained. The 1206 MB "SSM state pool" shown in the me
 comes from `SsmStatePool`, not `SsmSnapshotPool`.
 
 **Status**: correct behavior, no code change needed.
+
+---
+
+## Codebase Verification — 2026-06-11 (second independent pass)
+
+Fresh read of every source file named in the original task spec. No new bugs found.
+All previously-noted fixes are confirmed in place.
+
+### P0/P1 — Mistral Small 4 MLA prefill (>1K token gibberish)
+
+**`prefill/paged.rs`** (dispatch point): `prefill_attention_paged` checks `if self.mla.is_some()`
+and returns early into `paged_mla.rs`, passing `kv_dim = nkv * hd`. No non-MLA prefill code runs
+for Mistral layers. ✓
+
+**`prefill/paged_mla.rs`**:
+- `v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16)` where `kv_dim = nkv * hd`.
+  Mistral: `mla_v_dim = v_head_dim = head_dim = hd = 128`, so K and V have identical per-token
+  stride and the V pointer is exact. ✓
+- Flash attention kernel selection: `hd=128 ≤ 256` → uses `prefill_attn_k` (standard BR=32 tile).
+  `prefill_attn_512_k` branch is dead for all current MLA models. ✓
+- Buffer lifetime: `ssm_ba()` used as `q_latent`, fully consumed before reuse as `k_rope_buf`;
+  all accesses sequential on one stream. ✓
+
+**`crates/spark-server/src/main_modules/serve_phases/kv_cache.rs`** (BF16 fence):
+`--kv-high-precision-layers auto` is parsed to the hard-coded value `kv_hp_layers = 2` (line 233).
+`build_layer_kv_dtypes(BF16, n_attn_layers, 2, BF16)` immediately short-circuits to `vec![]`
+because `kv_dtype == boundary_dtype` (line 53 of `kv_dtypes.rs`). All 36 Mistral attention layers
+remain uniform BF16 — no per-layer FP8 override is possible. The fallback path
+`auto_high_precision_layers(BF16, …) → None` provides a second guard for the `kv_hp_layers==0`
+case. ✓
+
+**`crates/spark-runtime/src/buffers/sizes.rs`** (ssm_qkvz capacity):
+```
+ssm_qkvz ≥ max(m × ssm_qkvz_size × bf16, …, m × 2 × kv_heads × hd × bf16)
+```
+The `2 × kv_heads × hd` factor covers K + V contiguous per token (`mla_v_dim = hd` for Mistral).
+At `m = max_batch_tokens` the buffer always holds the full N-token K+V assembly. ✓
+
+**`kernels/gb10/mistral-small-4/nvfp4/mla_absorbed.cu`**:
+- All batched kernels use grid-stride loops; `gridDim.x = ceil(total/256)`, no hardcoded `N_max`.
+  CUDA SM8+ supports `gridDim.x` up to 2^31−1, well above a 65536-token prefill. ✓
+- Shared memory for cross-warp reduction: `__shared__ float s_partial[8][2]` = 64 bytes,
+  constant regardless of N. ✓
+- Entire file is pure `__nv_bfloat16` — no FP8/NVFP4 code path. ✓
+
+**`decode/attention_forward_mla.rs`** (decode vs. prefill): decode uses absorbed Q
+(`mla_cache_dim=320`) + paged KV with `paged_decode_attn_bf16`; prefill uses expanded Q+K+V
+(`hd=128`) + contiguous flash attention. Both call `effective_attn_scale(hd=128)` → same
+`1/√128` scale, algebraically equivalent across the two forms. Both use the same
+`mla.yarn_inv_freq` pointer from `yarn.rs`. No correctness divergence. ✓
+
+**Status**: P0/P1 clean. Awaiting live hardware re-test to close the item.
+
+### P1 (task numbering) — Nemotron Super 120B tool calling
+
+**`jinja-templates/nemotron_h.jinja`**:
+- Line 93: `{%- if not disable_tool_steering %}` guards the XML format mandate
+  (`NEVER emit JSON … ALWAYS use <tool_call>`). With `disable_tool_steering=true` the instruction
+  is suppressed — model sees tool definitions but not the conflicting format constraint. (commit
+  `d192412`) ✓
+- Line 206: `{%- if tools and not disable_tool_steering %}` guards the `<tool_call>\n` steering
+  prefix in the generation prompt. With `disable_tool_steering=true` the model opens `<think>`
+  naturally via the `elif enable_thinking` branch. ✓
+
+**`kernels/gb10/nemotron-super-120b-a12b/MODEL.toml`**:
+`disable_tool_steering = true`, `tool_call_parser = "bare_json"`, `thinking_in_tools = true` ✓
+
+**Status**: P1 clean. Both system-message and generation-prompt fixes confirmed in codebase.
+Awaiting live hardware re-test.
+
+### P2 (task numbering) — 122B SSM pool memory
+
+**`crates/spark-server/src/cli.rs`**: `ssm_cache_slots` default `16`; `--ssm-cache-slots 0`
+overrides at CLI level. ✓
+
+**`crates/spark-server/src/main_modules/serve_phases/build.rs`**: passes `args.ssm_cache_slots`
+unchanged to `spark_model::factory::build_model` (line 71). ✓
+
+**`crates/spark-model/src/model/impl_a1.rs`** (pool construction):
+```rust
+let ssm_pool = SsmStatePool::new(&config, max_batch_size, …);   // line 136
+let ssm_snapshots = SsmSnapshotPool::new(ssm_cache_slots, …);   // line 158
+```
+`SsmStatePool` receives `max_batch_size`; `SsmSnapshotPool` receives `ssm_cache_slots`.
+Entirely independent. `--ssm-cache-slots 0` zeroes Marconi but leaves live decode state intact. ✓
+
+**`crates/spark-model/src/model/ssm_pool.rs`**: `total_slots = max_batch_size + 1` (dummy slot
+for padding). Default `--max-batch-size 8` → 9 × 36 SSM layers × `h_bytes` ≈ 1206 MB.
+Non-optional for any model with SSM layers. ✓
+
+**Status**: P2 correct behavior, no code change needed.
