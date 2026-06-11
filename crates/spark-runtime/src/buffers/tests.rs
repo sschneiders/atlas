@@ -41,10 +41,10 @@ fn test_buffer_arena_alloc() {
     assert!(!arena.hidden_states().is_null());
     assert!(!arena.logits().is_null());
     assert_eq!(arena.max_batch_tokens(), 128);
-    // 19 allocations for 19 buffers (12 data + 1 scratch + 3 expert + 2 splitk
-    // + 1 gdn_fla_scratch). Bump from 18 reflects the GDN FLA chunked-prefill
-    // scratch buffer added when ATLAS_GDN_FLA was wired into the arena.
-    assert_eq!(gpu.alloc_count(), 19);
+    // 20 allocations: 19 prior (12 data + 1 scratch + 3 expert + 2 splitk +
+    // 1 gdn_fla_scratch) + 1 decode_logits_staging (#110 mixed-batch fix:
+    // private staging so the prefill half can't clobber decode logits).
+    assert_eq!(gpu.alloc_count(), 20);
 }
 
 #[test]

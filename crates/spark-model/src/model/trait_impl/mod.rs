@@ -25,6 +25,7 @@ mod decode_b2;
 mod decode_checkpoint;
 mod ep_misc;
 mod meta;
+mod mixed_batch;
 mod prefill_a;
 mod prefill_b;
 mod prefill_c;
