@@ -13,7 +13,7 @@
 |-------|---------|----------|-----------|------------|------------|-------------|--------|
 | **Qwen3.5-122B** | 90 GB | 0.8 GB (FP8) | 3/3 | 2/2 | 16.5 tok/s | 26K PASS | **PASS** |
 | **Mistral Small 4** | 66 GB | 38 GB (BF16) | 3/3 | 2/2 | 34-40 tok/s | **>1K FAIL** (bug fixed) | **FIXED** |
-| **Nemotron Super 120B** | 94 GB | tiny (FP8) | 3/3 | 2/2 | 20-22 tok/s | 6.5K PASS, 13K FAIL | **PARTIAL** (tool fix pending re-test) |
+| **Nemotron Super 120B** | 94 GB | tiny (FP8) | 3/3 | 2/2 | 20-22 tok/s | 6.5K PASS, 13K FAIL | **PARTIAL** (both tool fixes applied; hardware re-test pending) |
 
 > **Post-test analysis (2026-05-18)**: All three action items investigated against current codebase.
 > Mistral long-context failure was a code bug (YaRN inv_freq, now fixed). Nemotron tool-call
@@ -295,90 +295,6 @@ serving use `--max-batch-size 1` (reduces `SsmStatePool` from ~1206 MB to ~151 M
 
 ---
 
-## Codebase Verification — 2026-06-11
-
-Deep investigation of all three issues against the current `spec_ssm` branch. One new bug
-found and fixed (P1 Nemotron jinja template). P0 Mistral and P2 SSM pool both confirmed clean.
-
-### P0 — Mistral long-context (MLA prefill, BF16 dispatch, buffer sizing)
-
-**Verified**: `yarn.rs` fix confirmed correct with numerical check:
-- `find_correction_dim(beta_fast=32)` = 7.36 → floor → `low = 7`
-- `find_correction_dim(beta_slow=1)` = 14.24 → ceil → `high = 15`
-- Linear ramp in j-space matches YaRN paper; full 1/128 interpolation for j > 15.
-
-**Verified**: `ssm_qkvz` buffer in `crates/spark-runtime/src/buffers/sizes.rs` is sized as:
-```
-max(…, m × 2 × kv_heads × hd × bf16, …)
-```
-This provides exactly `max_batch_tokens × 2 × kv_dim × 2` bytes — enough for K+V
-contiguous storage in both `paged_mla.rs` and `cache_skip_mla.rs`. No overflow possible
-for `num_tokens ≤ max_batch_tokens`.
-
-**Verified**: `v_contiguous` offset in both MLA prefill files:
-```rust
-let v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16);
-```
-`kv_dim = nkv × hd` where `hd = mla_nope + mla_rope`. Mistral sets `v_head_dim = head_dim`
-(default path in `parsers/mistral.rs:53`), so `mla_v_dim == hd` and the V offset is correct.
-
-**Verified**: `auto_high_precision_layers(Bf16, …)` → `None` (line 31 of `kv_dtypes.rs`).
-`--kv-high-precision-layers auto` is a no-op when the base dtype is already BF16; no
-accidental FP8/turbo mixing can occur for Mistral's BF16 KV cache.
-
-**Status**: all P0 code paths clean. Awaiting live hardware re-test to close this item.
-
-### P1 — Nemotron Super tool calling (NEW BUG FOUND AND FIXED)
-
-**Bug found**: `jinja-templates/nemotron_h.jinja` lines 91–93 unconditionally rendered the
-XML format instruction block in the system message whenever tools were provided:
-
-```
-{{- '\n\nIf you choose to call a function ONLY reply in the following format … ALWAYS use the
-<tool_call><function=...></function></tool_call> XML format … NEVER emit tool calls as JSON' }}
-```
-
-This instruction directly contradicts `tool_call_parser = "bare_json"`. With the instruction
-present, Nemotron Super sees "NEVER emit JSON" in its system message, so the bare_json grammar
-trigger (`{"name":"`) never fires — the model either follows the XML instruction (producing output
-the bare_json parser cannot parse) or describes intent in natural language. This is why the
-original test showed "model describes wanting to call tools but no structured output".
-
-The 2026-06-07 verification caught that the **generation-prompt** block correctly gated the
-`<tool_call>\n` steering prefix on `not disable_tool_steering`, but missed that the
-**system-message** block had no such guard.
-
-**Fix applied** (`jinja-templates/nemotron_h.jinja`):
-```jinja
-    {%- if not disable_tool_steering %}
-    {{- '\n\nIf you choose to call a function ONLY reply in the following format …
-        ALWAYS use the <tool_call><function=...></function></tool_call> XML format …' }}
-    {%- endif %}
-```
-
-When `disable_tool_steering = true` (Nemotron Super), the tool definitions still appear in
-the system message (so the model knows what tools exist) but the XML format mandate is
-suppressed. The model then falls back to its native bare-JSON output distribution, and the
-xgrammar `{"name":"` trigger enforces the schema once the model begins a JSON object.
-
-**Also noted**: `thinking_in_tools` changed from `false → true` on 2026-05-23 in MODEL.toml
-(project-wide default sweep). The previous verification noted `false`; the current value is
-`true`. A per-model revert to `false` is available if thinking-during-tools degrades output.
-
-**Status**: fix committed; re-test on live hardware will close this item.
-
-### P2 — 122B SSM pool memory
-
-**Verified** (unchanged from 2026-06-07 audit): `SsmStatePool` is always sized by
-`max_batch_size`; `SsmSnapshotPool` Marconi region is zeroed by `--ssm-cache-slots 0` but the
-decode-rollback ring (`DECODE_ROLLBACK_RING_SLOTS × max_batch_size` per SSM layer) is
-independent and correctly retained. The 1206 MB "SSM state pool" shown in the memory budget
-comes from `SsmStatePool`, not `SsmSnapshotPool`.
-
-**Status**: correct behavior, no code change needed.
-
----
-
 ## Codebase Verification — 2026-06-10 (spec_ssm branch)
 
 Independent deep audit of all three priorities against the current `spec_ssm` branch.
@@ -466,12 +382,12 @@ override remains available if thinking-during-tools degrades bare_json output in
 3. `nemotron_h.jinja` line 204: `{%- if tools and not disable_tool_steering %}` — with
    `disable_tool_steering=true`, the `<tool_call>\n` steering prefix is skipped and the
    `enable_thinking` branch fires instead, opening `<think>` naturally. ✓
-4. The jinja template still renders `<tools>…</tools>` + XML format instructions in the
-   system message (the `{% if tools %}` block is NOT gated on `disable_tool_steering`).
-   This is intentional: the model ignores the XML guidance and falls back to its bare-JSON
-   training distribution. The bare_json xgrammar (trigger mode in `tool_choice=auto`)
-   activates on the first `{` after `</think>` and constrains the output to a schema-valid
-   `{"name":…, "arguments":{…}}` object. ✓
+4. **⚠ This audit step was incorrect.** The jinja template was still rendering the XML format
+   instruction block unconditionally in the system message — NOT gated on `disable_tool_steering`.
+   This audit incorrectly assessed it as intentional. Subsequent investigation (2026-06-11)
+   confirmed this was the remaining bug: "NEVER emit JSON" in the system message prevented the
+   bare_json grammar trigger from activating. The fix (`{%- if not disable_tool_steering %}` at
+   line 93 of `nemotron_h.jinja`) was committed in `d192412`. See the 2026-06-11 section.
 5. `BareJsonParser::system_prompt()` generates a plain-text tool instruction but is NOT
    injected as an extra system message (injection removed 2026-05-25 to avoid competing
    with the jinja template's format block). ✓
@@ -506,3 +422,87 @@ main pool intact.
 
 **Status**: correct behavior, no code change needed. Documented in Action Items (P2). Use
 `--max-batch-size 1` to reduce `SsmStatePool` to ~151 MB for single-user deployments.
+
+---
+
+## Codebase Verification — 2026-06-11
+
+Deep investigation of all three issues against the current `spec_ssm` branch. One new bug
+found and fixed (P1 Nemotron jinja template). P0 Mistral and P2 SSM pool both confirmed clean.
+
+### P0 — Mistral long-context (MLA prefill, BF16 dispatch, buffer sizing)
+
+**Verified**: `yarn.rs` fix confirmed correct with numerical check:
+- `find_correction_dim(beta_fast=32)` = 7.36 → floor → `low = 7`
+- `find_correction_dim(beta_slow=1)` = 14.24 → ceil → `high = 15`
+- Linear ramp in j-space matches YaRN paper; full 1/128 interpolation for j > 15.
+
+**Verified**: `ssm_qkvz` buffer in `crates/spark-runtime/src/buffers/sizes.rs` is sized as:
+```
+max(…, m × 2 × kv_heads × hd × bf16, …)
+```
+This provides exactly `max_batch_tokens × 2 × kv_dim × 2` bytes — enough for K+V
+contiguous storage in both `paged_mla.rs` and `cache_skip_mla.rs`. No overflow possible
+for `num_tokens ≤ max_batch_tokens`.
+
+**Verified**: `v_contiguous` offset in both MLA prefill files:
+```rust
+let v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16);
+```
+`kv_dim = nkv × hd` where `hd = mla_nope + mla_rope`. Mistral sets `v_head_dim = head_dim`
+(default path in `parsers/mistral.rs:53`), so `mla_v_dim == hd` and the V offset is correct.
+
+**Verified**: `auto_high_precision_layers(Bf16, …)` → `None` (line 31 of `kv_dtypes.rs`).
+`--kv-high-precision-layers auto` is a no-op when the base dtype is already BF16; no
+accidental FP8/turbo mixing can occur for Mistral's BF16 KV cache.
+
+**Status**: all P0 code paths clean. Awaiting live hardware re-test to close this item.
+
+### P1 — Nemotron Super tool calling (NEW BUG FOUND AND FIXED)
+
+**Bug found**: `jinja-templates/nemotron_h.jinja` lines 91–93 unconditionally rendered the
+XML format instruction block in the system message whenever tools were provided:
+
+```
+{{- '\n\nIf you choose to call a function ONLY reply in the following format … ALWAYS use the
+<tool_call><function=...></function></tool_call> XML format … NEVER emit tool calls as JSON' }}
+```
+
+This instruction directly contradicts `tool_call_parser = "bare_json"`. With the instruction
+present, Nemotron Super sees "NEVER emit JSON" in its system message, so the bare_json grammar
+trigger (`{"name":"`) never fires — the model either follows the XML instruction (producing output
+the bare_json parser cannot parse) or describes intent in natural language. This is why the
+original test showed "model describes wanting to call tools but no structured output".
+
+The 2026-06-07 and 2026-06-10 verifications both caught that the **generation-prompt** block
+correctly gated the `<tool_call>\n` steering prefix on `not disable_tool_steering`, but both
+missed that the **system-message** block had no such guard.
+
+**Fix applied** (`jinja-templates/nemotron_h.jinja`, commit `d192412`):
+```jinja
+    {%- if not disable_tool_steering %}
+    {{- '\n\nIf you choose to call a function ONLY reply in the following format …
+        ALWAYS use the <tool_call><function=...></function></tool_call> XML format …' }}
+    {%- endif %}
+```
+
+When `disable_tool_steering = true` (Nemotron Super), the tool definitions still appear in
+the system message (so the model knows what tools exist) but the XML format mandate is
+suppressed. The model then falls back to its native bare-JSON output distribution, and the
+xgrammar `{"name":"` trigger enforces the schema once the model begins a JSON object.
+
+**Also noted**: `thinking_in_tools` changed from `false → true` on 2026-05-23 in MODEL.toml
+(project-wide default sweep). The previous verification noted `false`; the current value is
+`true`. A per-model revert to `false` is available if thinking-during-tools degrades output.
+
+**Status**: fix committed (`d192412`); re-test on live hardware will close this item.
+
+### P2 — 122B SSM pool memory
+
+**Verified** (unchanged from 2026-06-07 and 2026-06-10 audits): `SsmStatePool` is always
+sized by `max_batch_size`; `SsmSnapshotPool` Marconi region is zeroed by `--ssm-cache-slots 0`
+but the decode-rollback ring (`DECODE_ROLLBACK_RING_SLOTS × max_batch_size` per SSM layer) is
+independent and correctly retained. The 1206 MB "SSM state pool" shown in the memory budget
+comes from `SsmStatePool`, not `SsmSnapshotPool`.
+
+**Status**: correct behavior, no code change needed.
