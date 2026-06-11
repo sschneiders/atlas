@@ -98,6 +98,19 @@ impl Model for TransformerModel {
         )
     }
 
+    /// #110: override the trait default (which raced decode on `default_stream`
+    /// against prefill on `prefill_stream` over shared scratch/logits). The
+    /// dispatch serializes both halves on one stream and stages decode logits.
+    fn mixed_forward_batch(
+        &self,
+        decode_tokens: &[u32],
+        decode_seqs: &mut [&mut SequenceState],
+        prefill_streams: &mut [crate::traits::PrefillSlice<'_>],
+        stream: u64,
+    ) -> Result<crate::traits::MixedBatchResult> {
+        self.mixed_forward_batch_dispatch(decode_tokens, decode_seqs, prefill_streams, stream)
+    }
+
     /// Q12 Phase 4b override: try the model-level batched dispatch
     /// (`prefill_batch_chunk_dispatch`) first; on the not-yet-implemented
     /// stub failure, fall back to the trait's default per-stream loop.

@@ -40,6 +40,9 @@ pub struct BufferArena {
     moe_output: DevicePtr,
     /// Logits: [M, vocab_size] in BF16.
     logits: DevicePtr,
+    /// #110: private staging for decode-half logits in a mixed batch step
+    /// (the prefill half overwrites `logits` before the scheduler samples).
+    decode_logits_staging: DevicePtr,
     /// SSM QKVZ projection: [M, ssm_qkvz_size] in BF16.
     ssm_qkvz: DevicePtr,
     /// SSM beta-alpha projection: [M, ssm_ba_size] in BF16.
@@ -91,6 +94,7 @@ impl BufferArena {
         let gate_logits = gpu.alloc(sizes.gate_logits)?;
         let moe_output = gpu.alloc(sizes.moe_output)?;
         let logits = gpu.alloc(sizes.logits)?;
+        let decode_logits_staging = gpu.alloc(sizes.decode_logits_staging)?;
         let ssm_qkvz = gpu.alloc(sizes.ssm_qkvz)?;
         let ssm_ba = gpu.alloc(sizes.ssm_ba)?;
         let ssm_deinterleaved = gpu.alloc(sizes.ssm_deinterleaved)?;
@@ -127,6 +131,7 @@ impl BufferArena {
             gate_logits,
             moe_output,
             logits,
+            decode_logits_staging,
             ssm_qkvz,
             ssm_ba,
             ssm_deinterleaved,
@@ -166,6 +171,10 @@ impl BufferArena {
     }
     pub fn logits(&self) -> DevicePtr {
         self.logits
+    }
+    /// #110: private decode-logits staging for mixed batch steps.
+    pub fn decode_logits_staging(&self) -> DevicePtr {
+        self.decode_logits_staging
     }
     pub fn ssm_qkvz(&self) -> DevicePtr {
         self.ssm_qkvz

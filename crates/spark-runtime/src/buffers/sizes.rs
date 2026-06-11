@@ -15,6 +15,7 @@ pub struct BufferSizes {
     pub gate_logits: usize,
     pub moe_output: usize,
     pub logits: usize,
+    pub decode_logits_staging: usize,
     pub ssm_qkvz: usize,
     pub ssm_ba: usize,
     pub ssm_deinterleaved: usize,
@@ -183,6 +184,12 @@ impl BufferSizes {
             },
             moe_output: m * h * bf16,
             logits: logits_tokens * config.vocab_size * bf16, // BF16 from LM head kernel
+            // #110: private staging for the decode half of a mixed batch step.
+            // The decode and prefill halves share `logits`; the prefill half's
+            // zero_all + finalize_last overwrite decode logits before the
+            // scheduler samples them. Decode logits are copied here (8 = max
+            // batched-decode rows) so they survive the prefill half.
+            decode_logits_staging: 8 * config.vocab_size * bf16,
             // SSM buffers are also reused by attention prefill/multi-seq as scratch:
             //   ssm_qkvz: K+V contiguous storage in prefill [M, 2*kv_dim]
             //             Mamba-2 in_proj output [M, in_proj_size]
@@ -247,6 +254,7 @@ impl BufferSizes {
             + self.gate_logits
             + self.moe_output
             + self.logits
+            + self.decode_logits_staging
             + self.ssm_qkvz
             + self.ssm_ba
             + self.ssm_deinterleaved
