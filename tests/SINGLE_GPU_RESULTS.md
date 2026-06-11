@@ -497,6 +497,23 @@ xgrammar `{"name":"` trigger enforces the schema once the model begins a JSON ob
 
 **Status**: fix committed (`d192412`); re-test on live hardware will close this item.
 
+**Additional kernel audit** — two MLA-specific CUDA files not covered in prior audits:
+
+- `kernels/gb10/mistral-small-4/nvfp4/mla_fused_prefill.cu`: implements `mla_fused_prefill`
+  (fused Q-absorption + causal attention + V-extraction in a single CTA-per-token kernel).
+  The kernel is registered in `init.rs` via `try_kernel` and stored as
+  `mla_fused_prefill_k: KernelHandle`. It is **never invoked** in any prefill code path —
+  no call site in `paged_mla.rs`, `cache_skip_mla.rs`, or any other Rust file. Zero
+  correctness impact.
+- `kernels/gb10/mistral-small-4/nvfp4/mla_prefill_attn.cu`: implements `mla_prefill_attn_320`
+  (scalar BF16 attention at HDIM=320, the absorbed MLA dimension). Also loaded via
+  `try_kernel` and stored as `mla_prefill_attn_320_k`. Also **never invoked**. The actual
+  prefill attention uses `ops::prefill_attention` (standard BR=32 tile, HDIM=128) from the
+  common kernel pool — correct for the unabsorbed expanded K/V at `hd=128`.
+
+Both kernels are dead code: optionally loaded to avoid build failures when the `.cu` file
+is present, but no call site exists. They do not affect correctness.
+
 ### P2 — 122B SSM pool memory
 
 **Verified** (unchanged from 2026-06-07 and 2026-06-10 audits): `SsmStatePool` is always
