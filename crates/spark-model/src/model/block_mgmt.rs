@@ -54,6 +54,18 @@ pub(crate) fn apply_evicted_blocks(
     kv_cache: &mut PagedKvCache,
 ) {
     for block in &evicted.physical {
+        // #110 RC3 tripwire: eviction force-zeroes the physical block, so a
+        // block reaching here must be held only by the cache's own baseline
+        // ref (count <= 1). A live sequence's inc_ref (prefill/adopt/cache)
+        // pushes the count >= 2; force-zeroing such a block is a
+        // use-after-evict. Fail loud in debug if a future change re-creates
+        // an evictable live block (the class of bug RC3 closed).
+        debug_assert!(
+            kv_cache.ref_count(*block) <= 1,
+            "evicting block {} still referenced (ref_count={}) — use-after-evict",
+            block,
+            kv_cache.ref_count(*block),
+        );
         kv_cache.return_evicted_block(*block);
     }
     if !evicted.disk_block_ids.is_empty()

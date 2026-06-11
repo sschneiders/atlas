@@ -122,21 +122,27 @@ impl TransformerModel {
         } else {
             &[][..]
         };
-        // Intermediate checkpoint inserts tree nodes as a placeholder for
-        // the snapshot boundary — the final chunk's insert will bump
-        // ref_counts for seq-ownership over the full tokens range. Passing
-        // matched_tokens = end_token here makes is_seq_owned=false for every
-        // block in this checkpoint, avoiding a double-bump that would leak
-        // the cache's baseline ref by +1 per checkpointed block after the
-        // eventual release().
-        let acquired = self.prefix_cache.insert(
-            boundary_tokens,
-            boundary_blocks,
-            boundary_disk,
-            bs,
-            end_token,
-        );
-        super::super::super::block_mgmt::cache_acquires_disk_refs(&acquired);
+        // #110 RC3 fix: do NOT insert radix tree nodes for the mid-prefill
+        // checkpoint boundary. Those nodes were created with
+        // matched_tokens=end_token => is_seq_owned=false => ref_count=1, which
+        // makes them immediately evictable WHILE this sequence is still
+        // mid-prefill (more chunks pending) and its device block-table —
+        // uploaded delta-only — still points at those physical blocks. Under
+        // block pressure (concurrency>=4 + deep multi-chunk prefills, the
+        // #110 regime) the next chunk's ensure_blocks->evict force-zeroes and
+        // reallocates a live block => use-after-evict / batch=4 brick.
+        //
+        // The tree nodes were redundant: the SSM snapshot is found via the
+        // independent SsmSnapshotIndex (insert_intermediate_snapshot below),
+        // keyed by hash_token_prefix and gated only by token_count <=
+        // matched_tokens — it does not read tree nodes. The matched path that
+        // lets a future warm hit reach this boundary is supplied by the
+        // full-range leaf insert in cache_sequence after this sequence
+        // finishes. Dropping the insert removes the evictable-live-block
+        // window with zero refcount-accounting change (no leak): the seq's
+        // blocks stay pinned by their alloc ref in seq.block_table and only
+        // become radix-visible at cache_sequence, after the seq is no longer
+        // in-flight.
         if let Some(old) = self.prefix_cache.insert_intermediate_snapshot(
             boundary_tokens,
             boundary_blocks,

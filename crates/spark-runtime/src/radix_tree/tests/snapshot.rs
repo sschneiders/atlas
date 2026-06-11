@@ -42,6 +42,40 @@ fn test_intermediate_snapshot_on_partial_match() {
 }
 
 #[test]
+fn test_intermediate_snapshot_found_without_checkpoint_tree_nodes() {
+    // #110 RC3: the mid-prefill checkpoint no longer inserts radix tree
+    // nodes (they were evictable while the sequence was live -> UAF). This
+    // reproduces the new production order: the intermediate snapshot is
+    // registered at the boundary FIRST (no tree insert), and only later does
+    // the finish-leaf insert (cache_sequence) supply the matched path. The
+    // snapshot must still be found on the next warm lookup.
+    let tree = RadixTree::new();
+
+    // Mid-prefill: register the boundary snapshot at block 2 — NO tree insert.
+    let tokens_at_2: Vec<u32> = (0..32).collect();
+    tree.insert_intermediate_snapshot(&tokens_at_2, &[10, 20], &[], 16, 50, 0, 0);
+
+    // Before the finish-leaf insert there are no tree nodes, so a lookup of
+    // the boundary prefix matches nothing (snapshot unreachable — bounded,
+    // self-healing per the fix's abort-orphan note).
+    let pre = tree.lookup(&tokens_at_2, 16, 0);
+    assert_eq!(pre.matched_tokens, 0);
+    assert_eq!(pre.ssm_snapshot, None);
+
+    // Sequence finishes -> cache_sequence inserts the full range, supplying
+    // the matched path the snapshot lookup needs.
+    let tokens: Vec<u32> = (0..64).collect();
+    tree.insert(&tokens, &[10, 20, 30, 40], &[], 16, 0);
+
+    // Warm hit next turn: the intermediate snapshot at block 2 is found.
+    let m = tree.lookup(&tokens, 16, 0);
+    assert_eq!(m.matched_tokens, 64);
+    assert_eq!(m.ssm_snapshot, Some(50));
+    assert_eq!(m.ssm_snapshot_tokens, 32);
+    tree.release(&tokens, 16);
+}
+
+#[test]
 fn test_intermediate_snapshot_deepest_wins() {
     let tree = RadixTree::new();
 
