@@ -13,6 +13,23 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+// HIP/gfx1151 (hipcc, __HIP_PLATFORM_AMD__): no `__nv_*` FP8 intrinsics and no
+// `cvt.rn.satfinite.e4m3x2.f32` PTX codegen, so E4M3 encode goes through this
+// pure-bit-math helper (standard 1-4-3 bias-7 SATFINITE, matching the quantizer
+// and the port's strix-hip-real scl_fp8/scl_enc_fp8). NVIDIA/SCALE never see it.
+#if defined(__HIP_PLATFORM_AMD__)
+__device__ __forceinline__ unsigned char scl_enc_fp8(float v) {
+    if (v != v) return 0x7F;
+    unsigned int bb = __float_as_uint(v); unsigned int sign = (bb >> 31) & 1u;
+    int e = (int)((bb >> 23) & 0xFF) - 127; unsigned int man = bb & 0x7FFFFFu;
+    int ee = e + 7; unsigned int em;
+    if (ee < 1) { ee = 0; em = 0; if (e >= -10) { float a = v < 0 ? -v : v; em = (unsigned int)(a / 0.001953125f + 0.5f); if (em > 7u) em = 7u; } }
+    else if (ee > 15) { ee = 15; em = 6; }
+    else { em = (man + (1u << 19)) >> 20; if (em > 7u) { em = 0; ee++; if (ee > 15) { ee = 15; em = 6; } } }
+    return (unsigned char)((sign << 7) | ((unsigned)ee << 3) | em);
+}
+#endif
+
 // SCALE/gfx1151: the `cvt.rn.satfinite.e4m3x2.f32` inline PTX has no codegen
 // (SCALE lacks the internal __nv_cvt_floatraw_to_fp8 lowering helper).
 // __nv_cvt_float_to_fp8 is NVIDIA's own documented intrinsic with identical
@@ -25,6 +42,10 @@ __device__ __forceinline__ unsigned short atlas_cvt_e4m3x2_f32(float a_hi, float
 #if defined(__SCALE__)
     unsigned a8 = (unsigned)__nv_cvt_float_to_fp8(a_hi, __NV_SATFINITE, __NV_E4M3);
     unsigned b8 = (unsigned)__nv_cvt_float_to_fp8(b_lo, __NV_SATFINITE, __NV_E4M3);
+    return (unsigned short)((a8 << 8) | (b8 & 0xFFu));
+#elif defined(__HIP_PLATFORM_AMD__)
+    unsigned a8 = (unsigned)scl_enc_fp8(a_hi);
+    unsigned b8 = (unsigned)scl_enc_fp8(b_lo);
     return (unsigned short)((a8 << 8) | (b8 & 0xFFu));
 #else
     unsigned short d;
@@ -41,6 +62,14 @@ __device__ __forceinline__ unsigned short atlas_cvt_e4m3x2_f32(float a_hi, float
 // NOTE: this kernel is COMPILE-ONLY for FP8 serving (FP8 dispatches
 // moe_fp8_grouped_gemm); the proof still guarantees correctness if the
 // NVFP4 grouped path is ever used.
+//
+// HIP/gfx1151 NOTE: no __HIP_PLATFORM_AMD__ branch here — same reason as
+// w4a16_gemm.cu. The AMD WMMA port (port branch
+// kernels/strix-hip-real/qwen3.6-27b/nvfp4/moe_w4a16_grouped_gemm.cu) rewrites
+// the grouped-GEMM bodies into n16 WMMA + synchronous copies (BF16-only path,
+// no FP8 round-trip), which cannot be expressed at this n8 helper without
+// disturbing the NVIDIA kernel bodies. This .cu HIP-compiles via the
+// strix-hip-real symlink in the follow-up stage, not this shared gb10 source.
 #if defined(__SCALE__)
 __device__ __forceinline__ float atlas_e4m3_to_f32(unsigned char b) {
     return __half2float(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)b, __NV_E4M3));

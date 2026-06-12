@@ -17,7 +17,10 @@
 // __nv_fp8_e4m3->float decode is a NON-STANDARD narrow format (verified: 1.0->1.5,
 // 0.5->1.0, 3.5->2.75) which mismatches the standard E4M3 scales written by
 // quantize_bf16_to_nvfp4 -> corrupts every block scale. Use this to match the encoder.
-#if defined(__SCALE__)
+// HIP/gfx1151 (hipcc, __HIP_PLATFORM_AMD__) shares the same software path: it has
+// no `cvt.rn.satfinite.e4m3x2.f32` PTX codegen, so it also routes E4M3 encode/decode
+// through these pure-bit-math helpers (same recipe the port's strix-hip-real uses).
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
 __device__ __forceinline__ float scl_fp8(unsigned char b) {
     unsigned int s = (b >> 7) & 1u, e = (b >> 3) & 0xFu, m = b & 0x7u; float v;
     if (e == 0u)               v = (float)m * 0.001953125f;            // subnormal m*2^-9
@@ -51,6 +54,12 @@ __device__ __forceinline__ unsigned short atlas_cvt_e4m3x2_f32(float a_hi, float
     unsigned a8 = (unsigned)scl_enc_fp8(a_hi);
     unsigned b8 = (unsigned)scl_enc_fp8(b_lo);
     return (unsigned short)((a8 << 8) | (b8 & 0xFFu));
+#elif defined(__HIP_PLATFORM_AMD__)
+    // gfx1151 has no e4m3x2.f32 PTX; same software bit-math as SCALE / the
+    // port's strix-hip-real atlas_cvt_e4m3x2_f32 (numerically exact SATFINITE E4M3).
+    unsigned a8 = (unsigned)scl_enc_fp8(a_hi);
+    unsigned b8 = (unsigned)scl_enc_fp8(b_lo);
+    return (unsigned short)((a8 << 8) | (b8 & 0xFFu));
 #else
     unsigned short d;
     asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(d) : "f"(a_hi), "f"(b_lo));
@@ -65,6 +74,19 @@ __device__ __forceinline__ unsigned short atlas_cvt_e4m3x2_f32(float a_hi, float
 // mma.m16n8k16.bf16 (K split 0..15 / 16..31). #else is the verbatim
 // original e4m3 PTX so __forceinline__ keeps NVIDIA codegen
 // byte-identical (zero NVFP4/FP8 regression).
+//
+// HIP/gfx1151 NOTE: there is intentionally NO __HIP_PLATFORM_AMD__ branch here.
+// The AMD WMMA port (`__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32`, port branch
+// kernels/strix-hip-real/qwen3.6-27b/nvfp4/w4a16_gemm.cu) restructures the whole
+// kernel body — n8→n16 fragment tiling, v8f accumulators, synchronous smem copies
+// replacing cp.async — so the MMA cannot be confined behind this n8-shaped helper
+// without rewriting the surrounding NVIDIA kernel bodies (which would break PTX
+// bit-identity). The raw `mma.sync`/`cp.async` PTX still present in the GEMM
+// bodies below also is not hipcc-compilable. This whole .cu therefore HIP-compiles
+// only via the strix-hip-real WMMA rewrite (symlinked in the follow-up stage),
+// NOT through this shared gb10 source. The HIP-portable helper above
+// (atlas_cvt_e4m3x2_f32) IS guarded, since elementwise kernels that use it
+// (predequant_nvfp4_to_fp8, bf16_to_fp8) have no mma.sync/cp.async.
 #if defined(__SCALE__)
 __device__ __forceinline__ float atlas_e4m3_to_f32(unsigned char b) {
     return scl_fp8(b);  // standard E4M3, matches quantizer (SCALE __NV_E4M3 is non-standard)
