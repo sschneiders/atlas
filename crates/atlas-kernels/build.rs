@@ -179,9 +179,21 @@ fn main() {
         .get("hardware")
         .and_then(|h| h.get("vendor"))
         .and_then(|v| v.as_str());
+    // Force the BR=32 prefill path (skip the BR64=64 large-chunk kernels)
+    // on targets that can't fit the _64 kernel's LDS (e.g. RDNA3.5's hard
+    // 64 KB/workgroup cap). Only emitted when the HW opts in; absent on
+    // NVIDIA → option_env! None → BR64 dispatch unchanged.
+    if hw_toml
+        .get("hardware")
+        .and_then(|h| h.get("force_br32_prefill"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        println!("cargo:rustc-env=ATLAS_HW_FORCE_BR32=true");
+    }
     let compute_target = resolve_compute_target(vendor_str);
     let output_ext = compute_target.output_extension();
-    let output_is_text = compute_target.output_is_text();
+    let uses_cuda_api = compute_target.uses_cuda_module_api();
 
     // Per-target: (target_idx, vec of (stem, module_name))
     let mut all_target_modules: Vec<Vec<(String, String)>> = Vec::new();
@@ -365,7 +377,7 @@ fn main() {
 
     // ── Generate target_ptx.rs ──
     let generated =
-        generate_target_ptx_rs(&targets, &all_target_modules, output_ext, output_is_text);
+        generate_target_ptx_rs(&targets, &all_target_modules, output_ext, uses_cuda_api);
     let gen_path = out_dir.join("target_ptx.rs");
     std::fs::write(&gen_path, &generated)
         .unwrap_or_else(|e| panic!("Failed to write {}: {e}", gen_path.display()));

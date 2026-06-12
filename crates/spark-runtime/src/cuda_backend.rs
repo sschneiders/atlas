@@ -78,7 +78,7 @@ impl AtlasCudaBackend {
     /// Use `atlas_kernels::ptx_for_model()` or `ptx_modules()` to
     /// obtain the correct module set for the target model.
     /// Subsequent calls reuse the cached singleton.
-    pub fn new(ordinal: usize, ptx_modules: &[(&'static str, &str)]) -> Result<Self> {
+    pub fn new(ordinal: usize, ptx_modules: &[(&'static str, &'static [u8])]) -> Result<Self> {
         let registry = AtlasRegistry::get_or_init(ordinal, ptx_modules)
             .map_err(|e| anyhow::anyhow!("AtlasRegistry init failed: {e}"))?;
         let default_stream = registry.raw_stream();
