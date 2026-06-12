@@ -836,8 +836,9 @@ remain uniform BF16. No FP8 mixing possible. ✓
   and opens `<think>` naturally. ✓
 
 **`kernels/gb10/nemotron-super-120b-a12b/MODEL.toml`** — confirmed:
-`disable_tool_steering = true`, `tool_call_parser = "bare_json"`, `thinking_in_tools = true`,
-`enable_loop_watchdog = true`. ✓
+`disable_tool_steering = true`, `tool_call_parser = "bare_json"`, `thinking_in_tools = false`
+(restored from `true` by commit `e1fb159` after this section was written; see 2026-06-12
+follow-up audit for root cause), `enable_loop_watchdog = true`. ✓
 
 **`tool_parser/bare_json.rs`** — `BareJsonParser` implemented; emits `{"name":"...","arguments":{...}}`
 without `<tool_call>` wrapper; uses xgrammar `{"name":"` trigger for constrained decoding. ✓
@@ -867,3 +868,49 @@ All three issues from the original task spec are resolved:
   `disable_tool_steering` in `nemotron_h.jinja`; MODEL.toml configured for bare_json.
 - **P2** (SSM pool memory estimate): `preflight.rs` now uses `DECODE_ROLLBACK_RING_SLOTS`
   to match actual `SsmSnapshotPool` decode-ring allocation in `impl_a1.rs`.
+
+---
+
+## Codebase Verification — 2026-06-12 (session 018SZFf)
+
+Independent re-investigation per original task spec. All source files named in the task
+were read; all control-flow paths traced. One stale documentation error corrected; no
+new code bugs found.
+
+### Files audited (P0 — Mistral MLA prefill)
+
+| File | Finding |
+|------|---------|
+| `prefill/paged_mla.rs` | V offset, flash-attn scale, buffer reuse — all correct ✓ |
+| `prefill/cache_skip_mla.rs` | Same invariants, `prefill_attention_64` (BR=64); `kv_latent` preserved across KV-assembly and WKV_b GEMM reads ✓ |
+| `decode/write_kv_cache.rs` | `KvCacheDtype::Bf16` arm dispatches to `ops::reshape_and_cache` with no head-count or head-dim restrictions; correct for MLA (nkv=1, head_dim=320) ✓ |
+| `mistral_loader/loader_impl/yarn.rs` | `find_correction_dim` formula matches HF reference; low=7, high=15 for Mistral params ✓ |
+| `main_modules/kv_dtypes.rs` | `auto_high_precision_layers(Bf16,…)→None`; all Mistral layers stay BF16 ✓ |
+| `kernels/gb10/mistral-small-4/MODEL.toml` | `default_kv_dtype = "bf16"` safety guard present ✓ |
+
+**Result**: no remaining bugs. P0 awaits live hardware re-test.
+
+### Files audited (P1 — Nemotron tool calling)
+
+| File | Finding |
+|------|---------|
+| `kernels/gb10/nemotron-super-120b-a12b/MODEL.toml` | `disable_tool_steering=true`, `tool_call_parser=bare_json`, `thinking_in_tools=false` — all three flags correct ✓ |
+| `jinja-templates/nemotron_h.jinja` | Both guards in place: line 93 gates XML system-message mandate; line 206 gates steering prefix ✓ |
+| `crates/spark-server/src/tool_parser/bare_json.rs` | `BareJsonParser` implemented; xgrammar `{"name":"` trigger; no XML format strings ✓ |
+
+**Documentation fix**: "final independent pass" section incorrectly said `thinking_in_tools = true`
+(written before commit `e1fb159` restored it to `false`). Corrected in place above.
+
+**Result**: all three tool-call fixes confirmed. P1 awaits live hardware re-test.
+
+### Files audited (P2 — SSM cache slots)
+
+| File | Finding |
+|------|---------|
+| `crates/spark-server/src/cli.rs` | `ssm_cache_slots` flag, default 16 ✓ |
+| `crates/spark-model/src/model/impl_a1.rs` | `SsmStatePool::new(…, max_batch_size, …)` line 136; `SsmSnapshotPool::new(ssm_cache_slots, …)` line 158 — independent ✓ |
+| `serve_phases/preflight.rs` | `decode_ring_slots = DECODE_ROLLBACK_RING_SLOTS` (= 8) lines 99–100; matches `impl_a1.rs` exactly ✓ |
+
+**Result**: preflight.rs fix (`c1840fa`) confirmed in place. Correct minimum footprint with
+`--ssm-cache-slots 0 --max-batch-size 1` is ~1357 MB (151 MB state pool + 1206 MB decode ring),
+as documented in the "2026-06-12" section above. P2 correct behavior confirmed.
