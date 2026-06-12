@@ -46,6 +46,7 @@ pub fn prefill_request(
     let req_session_hash = req.session_hash();
     let req_enable_thinking = req.enable_thinking();
     let req_thinking_budget = req.thinking_budget();
+    let req_repetition_detection = req.repetition_detection();
     if req_enable_thinking {
         tracing::info!("Thinking enabled, budget={:?}", req_thinking_budget);
     }
@@ -216,6 +217,8 @@ pub fn prefill_request(
             inside_thinking: req_enable_thinking && think_end_token.is_some(),
             enable_thinking: req_enable_thinking,
             thinking_budget: req_thinking_budget,
+            repetition_detection: req_repetition_detection,
+            finish_reason_override: None,
             spontaneous_think_budget,
             thinking_tokens: 0,
             cached_prompt_tokens: cached_prompt_tok,
@@ -286,6 +289,8 @@ pub fn prefill_request(
         } else {
             req_thinking_budget
         },
+        repetition_detection: req_repetition_detection,
+        finish_reason_override: None,
         spontaneous_think_budget,
         thinking_tokens: 0,
         cached_prompt_tokens: cached_prompt_tok,

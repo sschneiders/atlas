@@ -380,6 +380,9 @@ pub fn process_decode_logits(
             // leaving every dependent gate (close-tag mask, AM1, B1,
             // A1) silently dead under `mtp=false`.
             crate::scheduler::emit_step::update_tool_param_state(a, tok);
+            // vLLM-parity repetition stop (opt-in per request; SSOT
+            // with the MTP/verify path's call in `emit_token`).
+            crate::scheduler::emit_step::check_repetition_stop(a);
             // #155 iter3: block-aligned Marconi checkpoint on the
             // non-MTP decode path (live SSM state is canonical here).
             if !a.inside_thinking {

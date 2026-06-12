@@ -208,6 +208,20 @@ impl InferenceRequest {
     }
 
 
+    /// vLLM-parity per-request repetition detection params (None = off).
+    pub fn repetition_detection(&self) -> Option<crate::openai::RepetitionDetectionParams> {
+        match self {
+            InferenceRequest::Blocking {
+                repetition_detection,
+                ..
+            } => *repetition_detection,
+            InferenceRequest::Streaming {
+                repetition_detection,
+                ..
+            } => *repetition_detection,
+        }
+    }
+
     /// Whether a tool call is required for this request.
     pub fn require_tool_call(&self) -> bool {
         match self {

@@ -246,6 +246,7 @@ pub(crate) async fn chat_completions_inner(
             logit_bias.clone(),
             enable_thinking,
             thinking_budget,
+            req.repetition_detection,
             tools_active,
             tool_choice_required,
             cwd_hint.clone(),
@@ -257,6 +258,7 @@ pub(crate) async fn chat_completions_inner(
         .await;
     }
 
+    let req_repetition_detection = req.repetition_detection;
     super::chat_blocking::run_blocking_path(super::chat_blocking::BlockingPathArgs {
         state,
         req,
@@ -282,6 +284,7 @@ pub(crate) async fn chat_completions_inner(
         stop_tokens,
         enable_thinking,
         thinking_budget,
+        repetition_detection: req_repetition_detection,
         tools_active,
         tool_choice_required,
         grammar_spec,

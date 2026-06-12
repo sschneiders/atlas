@@ -48,6 +48,7 @@ pub fn start_chunked_prefill(
     let req_session_hash = req.session_hash();
     let req_enable_thinking = req.enable_thinking();
     let req_thinking_budget = req.thinking_budget();
+    let req_repetition_detection = req.repetition_detection();
     if req_enable_thinking {
         tracing::info!("Thinking enabled, budget={:?}", req_thinking_budget);
     }
@@ -269,6 +270,8 @@ pub fn start_chunked_prefill(
                 inside_thinking: req_enable_thinking && think_end_token.is_some(),
                 enable_thinking: req_enable_thinking,
                 thinking_budget: req_thinking_budget,
+                repetition_detection: req_repetition_detection,
+                finish_reason_override: None,
                 spontaneous_think_budget,
                 thinking_tokens: 0,
                 cached_prompt_tokens: cached_prompt_tok,
@@ -343,6 +346,8 @@ pub fn start_chunked_prefill(
                 } else {
                     req_thinking_budget
                 },
+                repetition_detection: req_repetition_detection,
+                finish_reason_override: None,
                 spontaneous_think_budget,
                 thinking_tokens: 0,
                 cached_prompt_tokens: cached_prompt_tok,
@@ -412,6 +417,7 @@ pub fn start_chunked_prefill(
             logit_bias,
             enable_thinking: req_enable_thinking,
             thinking_budget: req_thinking_budget,
+            repetition_detection: req_repetition_detection,
             spontaneous_think_budget,
             require_tool_call: req_require_tool_call,
             disable_mtp: req_disable_mtp,

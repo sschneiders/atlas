@@ -20,6 +20,18 @@ use super::compact::{openai_error_response, openai_error_response_with_param};
 /// `?` directly into a Response.
 #[allow(clippy::result_large_err)]
 pub(super) fn validate_input(req: &ChatCompletionRequest) -> Result<(), Response> {
+    // vLLM-parity RepetitionDetectionParams validation (mirrors vLLM's
+    // __post_init__; a violated constraint is a 400, not a silent ignore).
+    if let Some(rd) = req.repetition_detection
+        && let Err(msg) = rd.validate()
+    {
+        return Err(openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            msg.into(),
+            Some("repetition_detection"),
+            None,
+        ));
+    }
     if req.messages.is_empty() {
         return Err(openai_error_response_with_param(
             StatusCode::BAD_REQUEST,

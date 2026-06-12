@@ -148,6 +148,7 @@ pub fn lower_responses_to_chat(
         }
     };
     Ok(ChatCompletionRequest {
+        repetition_detection: None,
         model: r.model,
         messages,
         max_tokens: r.max_output_tokens.unwrap_or_else(default_max_tokens),

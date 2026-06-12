@@ -13,7 +13,7 @@ use std::time::Instant;
 use anyhow::Result;
 use spark_model::traits::SequenceState;
 
-use crate::api::{InferenceRequest, InferenceResponse, StreamEvent};
+use crate::api::{InferenceRequest, InferenceResponse, RepetitionDetectionParams, StreamEvent};
 use crate::grammar::GrammarState;
 
 /// Shared queue between receiver thread and scheduler.
@@ -62,6 +62,8 @@ pub(super) struct PrefillInProgress {
     pub logit_bias: Vec<(u32, f32)>,
     pub enable_thinking: bool,
     pub thinking_budget: Option<u32>,
+    /// vLLM-parity per-request repetition detection (None = off).
+    pub repetition_detection: Option<RepetitionDetectionParams>,
     /// Per-server spontaneous-thinking budget (from MODEL.toml
     /// `[behavior].max_thinking_budget`). When the model emits a
     /// `<think>` token without the request having explicitly enabled
@@ -120,6 +122,12 @@ pub(super) struct ActiveSeq {
     pub enable_thinking: bool,
     /// Max thinking tokens before forcing `</think>`. None = unlimited.
     pub thinking_budget: Option<u32>,
+    /// vLLM-parity per-request repetition detection (None = off).
+    pub repetition_detection: Option<RepetitionDetectionParams>,
+    /// When a stop condition with a non-token finish reason fires
+    /// (vLLM-parity repetition detection), this overrides the
+    /// last-token-derived reason in `lifecycle::finish_sequence`.
+    pub finish_reason_override: Option<&'static str>,
     /// Per-server spontaneous-thinking budget (from MODEL.toml
     /// `[behavior].max_thinking_budget`).
     pub spontaneous_think_budget: Option<u32>,
@@ -289,6 +297,8 @@ pub(super) struct SwappedSeq {
     pub inside_thinking: bool,
     pub enable_thinking: bool,
     pub thinking_budget: Option<u32>,
+    /// vLLM-parity per-request repetition detection (None = off).
+    pub repetition_detection: Option<RepetitionDetectionParams>,
     pub spontaneous_think_budget: Option<u32>,
     pub thinking_tokens: u32,
     pub force_end_thinking: bool,

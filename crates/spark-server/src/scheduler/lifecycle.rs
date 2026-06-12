@@ -9,7 +9,12 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq) {
     let last_tok = a.output_tokens.last().copied();
     let is_eos = last_tok.is_some_and(|t| a.eos_tokens.contains(&t));
     let is_tool_call_end = last_tok == a.tool_call_end_token;
-    let reason = if is_eos {
+    let reason = if let Some(overridden) = a.finish_reason_override {
+        // Non-token stop condition (vLLM-parity repetition detection →
+        // finish_reason="repetition", mirroring vLLM's
+        // FINISHED_REPETITION → FinishReason.REPETITION mapping).
+        overridden
+    } else if is_eos {
         "stop"
     } else if is_tool_call_end {
         "tool_calls"
@@ -192,6 +197,7 @@ pub fn swap_out_sequence(
         inside_thinking: a.inside_thinking,
         enable_thinking: a.enable_thinking,
         thinking_budget: a.thinking_budget,
+        repetition_detection: a.repetition_detection,
         spontaneous_think_budget: a.spontaneous_think_budget,
         thinking_tokens: a.thinking_tokens,
         force_end_thinking: a.force_end_thinking,
@@ -271,6 +277,8 @@ pub fn resume_swapped_seq(
         inside_thinking: s.inside_thinking,
         enable_thinking: s.enable_thinking,
         thinking_budget: s.thinking_budget,
+        repetition_detection: s.repetition_detection,
+        finish_reason_override: None,
         spontaneous_think_budget: s.spontaneous_think_budget,
         thinking_tokens: s.thinking_tokens,
         force_end_thinking: s.force_end_thinking,

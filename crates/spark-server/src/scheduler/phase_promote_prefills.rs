@@ -144,6 +144,8 @@ fn build_active_seq_from_prefill(
         } else {
             p.thinking_budget
         },
+        repetition_detection: p.repetition_detection,
+        finish_reason_override: None,
         spontaneous_think_budget: p.spontaneous_think_budget,
         thinking_tokens: 0,
         cached_prompt_tokens: cached_prompt_tok,

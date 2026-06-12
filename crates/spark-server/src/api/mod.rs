@@ -68,7 +68,8 @@ pub use conversations::{
     get_conversation_item, list_conversation_items, update_conversation,
 };
 pub use inference_types::{
-    GrammarSpec, InferenceRequest, InferenceResponse, StreamEvent, TokenLogprobs,
+    GrammarSpec, InferenceRequest, InferenceResponse, RepetitionDetectionParams, StreamEvent,
+    TokenLogprobs,
 };
 #[allow(unused_imports)]
 pub use misc_handlers::{

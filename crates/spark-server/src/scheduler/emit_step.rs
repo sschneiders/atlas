@@ -162,6 +162,7 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     }
 
     a.output_tokens.push(tok);
+    check_repetition_stop(a);
 
     // Detect </think> transition. Track thinking token count for budget
     // enforcement. vLLM parity (2026-06-12): thinking tokens consume the
@@ -386,6 +387,32 @@ pub enum StartPrefillResult {
 //
 // Token IDs are Qwen3.6 byte-level BPE (verified via /tokenize 2026-05-25):
 //   27 = `<`, 28 = `=`, 29 = `>`, 510 = `</`, 15704 = `parameter`.
+
+/// vLLM-parity repetition stop — the `check_stop` repetition branch
+/// (`v1/core/sched/utils.py`, vLLM >= v0.17.0). Called after each
+/// committed token from BOTH decode paths (`emit_token` for MTP/verify,
+/// `process_decode_logits` for non-MTP — same SSOT pattern as
+/// `update_tool_param_state`). Inert unless the request opted in via
+/// `repetition_detection`; honors `min_tokens` like vLLM's check order.
+pub fn check_repetition_stop(a: &mut ActiveSeq) {
+    let Some(params) = a.repetition_detection else {
+        return;
+    };
+    if a.finished || a.output_tokens.len() < a.min_tokens {
+        return;
+    }
+    if crate::scheduler::helpers::detect_sequence_repetition(&a.output_tokens, &params) {
+        tracing::info!(
+            output_len = a.output_tokens.len(),
+            max_pattern_size = params.max_pattern_size,
+            min_count = params.min_count,
+            "repetition detected (vLLM-parity repetition_detection); ending \
+             generation with finish_reason=\"repetition\""
+        );
+        a.finish_reason_override = Some("repetition");
+        a.finished = true;
+    }
+}
 
 pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
     if a.inside_thinking {

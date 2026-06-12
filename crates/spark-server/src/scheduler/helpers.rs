@@ -175,3 +175,112 @@ pub fn set_boundary_token_mask(mask: std::sync::Arc<[bool]>) {
 pub fn boundary_token_mask() -> Option<std::sync::Arc<[bool]>> {
     BOUNDARY_TOKEN_MASK.get().cloned()
 }
+
+// ── vLLM-parity repetition detection (SamplingParams.repetition_detection) ──
+//
+// Port of vLLM's `v1/core/sched/utils.py::_has_repeating_pattern` +
+// the `check_stop` repetition branch (vLLM >= v0.17.0). OPT-IN per
+// request only — there is no server default and no heuristic gating;
+// when the request carries no `repetition_detection`, this code never
+// runs (vLLM parity).
+
+/// vLLM `_has_repeating_pattern`: compares the last `pattern_len`
+/// tokens against the preceding `min_count - 1` repetitions of the
+/// same length. End-anchored — historic patterns the model has moved
+/// past never match. Caller must ensure
+/// `tokens.len() >= pattern_len * min_count`.
+#[inline]
+fn has_repeating_pattern_anchored(tokens: &[u32], pattern_len: usize, min_count: usize) -> bool {
+    let n = tokens.len();
+    for offset_in_window in 1..=pattern_len {
+        let target = tokens[n - offset_in_window];
+        for m in 1..min_count {
+            let idx = n - (pattern_len * m + offset_in_window);
+            if tokens[idx] != target {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// vLLM `check_sequence_repetition`: scan pattern lengths
+/// `[max(min_pattern_size, 1) ..= max_pattern_size]` for an
+/// end-anchored repeat of `min_count` copies. `max_pattern_size == 0`
+/// disables (vLLM semantics; enforced again here so a non-validated
+/// caller cannot enable a zero-width scan).
+pub fn detect_sequence_repetition(
+    tokens: &[u32],
+    params: &crate::openai::RepetitionDetectionParams,
+) -> bool {
+    if params.max_pattern_size == 0 || params.min_count < 2 {
+        return false;
+    }
+    let min_count = params.min_count as usize;
+    let period_min = (params.min_pattern_size as usize).max(1);
+    let period_max = params.max_pattern_size as usize;
+    let n = tokens.len();
+    for pattern_len in period_min..=period_max {
+        if pattern_len * min_count > n {
+            return false;
+        }
+        if has_repeating_pattern_anchored(tokens, pattern_len, min_count) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod repetition_tests {
+    use super::detect_sequence_repetition;
+    use crate::openai::RepetitionDetectionParams;
+
+    fn params(min_p: u32, max_p: u32, min_c: u32) -> RepetitionDetectionParams {
+        RepetitionDetectionParams {
+            min_pattern_size: min_p,
+            max_pattern_size: max_p,
+            min_count: min_c,
+        }
+    }
+
+    #[test]
+    fn disabled_when_max_pattern_zero() {
+        let toks = [1, 2, 1, 2, 1, 2, 1, 2];
+        assert!(!detect_sequence_repetition(&toks, &params(0, 0, 3)));
+    }
+
+    #[test]
+    fn detects_period_two_loop() {
+        let toks = [9, 9, 9, 1, 2, 1, 2, 1, 2];
+        assert!(detect_sequence_repetition(&toks, &params(1, 4, 3)));
+    }
+
+    #[test]
+    fn end_anchored_ignores_historic_pattern() {
+        // The period-2 repeat is followed by fresh non-repeating output:
+        // an end-anchored detector must NOT fire (vLLM semantics).
+        let toks = [1, 2, 1, 2, 1, 2, 7, 8, 9, 10, 11];
+        assert!(!detect_sequence_repetition(&toks, &params(1, 4, 3)));
+    }
+
+    #[test]
+    fn respects_min_count() {
+        // Only 2 copies of the period-3 pattern at the tail.
+        let toks = [4, 5, 6, 4, 5, 6];
+        assert!(detect_sequence_repetition(&toks, &params(1, 4, 2)));
+        assert!(!detect_sequence_repetition(&toks, &params(1, 4, 3)));
+    }
+
+    #[test]
+    fn too_short_sequence_never_fires() {
+        let toks = [1, 2];
+        assert!(!detect_sequence_repetition(&toks, &params(1, 64, 3)));
+    }
+
+    #[test]
+    fn period_one_token_run() {
+        let toks = [3, 7, 7, 7, 7];
+        assert!(detect_sequence_repetition(&toks, &params(1, 2, 4)));
+    }
+}
