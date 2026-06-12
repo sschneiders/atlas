@@ -241,6 +241,14 @@ All MLA prefill code paths verified clean against spec_ssm:
 - `mla_absorbed.cu`: CUDA kernels verified clean; no seq_len limits or tile overflow ✓
 - `mistral-small-4/MODEL.toml`: `default_kv_dtype = "bf16"` safety guard present ✓
 
+Additional detail from 2026-06-12 audit:
+- `cache_skip_mla.rs:308`: `prefill_attention_64` with scale `1.0/sqrt(hd=128)` — no hard
+  seq_len cap; V buffer offset at lines 276–277 is exact (`kv_dim=nkv*hd=128=mla_v_dim`).
+- `mla_absorbed.cu`: `mla_batched_gemv` is decode-only single-token GEMV; batched prefill
+  helpers use grid-stride loops with no fixed seq_len upper bound.
+- `yarn.rs:58–60`: `find_correction_dim` matches HF `_compute_yarn_parameters` exactly;
+  no regression from commits `62c4342`, `a82e7a4`, `2080231`.
+
 ### P1 — Nemotron Super tool calling (2026-06-12 fix)
 
 **Bug**: `thinking_in_tools = true` in MODEL.toml despite the MODEL.toml comment warning:
@@ -260,16 +268,16 @@ With `thinking_in_tools = false`:
 
 **Fix applied**: `thinking_in_tools = false` in `kernels/gb10/nemotron-super-120b-a12b/MODEL.toml`.
 
+Also verified: `chat/mod.rs:100–118` confirms parser `system_prompt()` removed 2026-05-25;
+Jinja template is sole source of tool-call format instructions — no parser/template conflict.
+
 ### P2 — SSM cache slots (2026-06-12 re-verification)
 
-CLI propagation verified end-to-end:
-- `crates/spark-server/src/cli.rs`: `ssm_cache_slots: usize`, `default_value_t = 16` ✓
-- `crates/spark-server/src/main_modules/serve_phases/build.rs` line 71: `args.ssm_cache_slots`
-  passed to `spark_model::factory::build_model` ✓
-- `crates/spark-model/src/model/impl_a1.rs` line 158: `SsmSnapshotPool::new(ssm_cache_slots, ...)`
-  receives the CLI value ✓
-- `SsmStatePool` (line 136): sized by `max_batch_size`, NOT `ssm_cache_slots` → 1206 MB is
-  always present and correct for in-flight decode state
+CLI propagation verified end-to-end at exact constructor call sites in `impl_a1.rs`:
+- Line 136: `SsmStatePool::new(config, max_batch_size, ...)` — sized by `--max-batch-size`,
+  NOT `--ssm-cache-slots` → 1206 MB always present; correct for in-flight decode state.
+- Line 158: `SsmSnapshotPool::new(ssm_cache_slots, ...)` — receives CLI value directly;
+  `--ssm-cache-slots 0` zeroes the snapshot budget only.
 
 ---
 
