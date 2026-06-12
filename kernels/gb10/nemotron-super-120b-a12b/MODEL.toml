@@ -54,12 +54,16 @@ dry_multiplier = 0.0      # 2026-06-06: 0.5->0.0; no vendor DRY. Re-gate; target
 # loop. The watchdog (period-N detect + rollback to a clean boundary) is the PROPER loop mechanism
 # vs the rep_pen band-aid that mangles greedy argmax. Same lever that recovered qwen3-next.
 enable_loop_watchdog = true
-# 2026-05-23 sweep: false → true. Project-wide default flipped to true.
-# NOTE: Super specifically had a pass-30 regression where thinking-during-
-# tools degraded bare_json output. If that returns in practice, flip
-# back to false per-model here; the project-wide change is intentionally
-# permissive but per-model overrides remain authoritative.
-thinking_in_tools = true
+# Reverted to false (2026-06-12): project-wide sweep had changed this to
+# true (2026-05-23) but the pass-30 regression returned — thinking-during-
+# tools causes the model to describe tool calls in natural language rather
+# than emitting structured output. With disable_tool_steering=true the
+# generation prefix is already `<think></think>` (closed empty block) when
+# thinking_in_tools=false, which is consistent with the nemotron_h.jinja
+# instruction "Do NOT enter a <think> block before emitting a tool call".
+# With thinking_in_tools=true the prefix forces an OPEN <think>, directly
+# contradicting that instruction and causing the natural-language fall-through.
+thinking_in_tools = false
 # Skip the Nemotron-H chat template's `<tool_call>\n` steering prefix.
 # The prefix was added for Nano's "Think-Satisfy + JSON narration" fix
 # but on Super causes a `<tool_call>\n<tool_call>\n...` emission loop

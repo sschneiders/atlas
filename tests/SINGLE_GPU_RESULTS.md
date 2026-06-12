@@ -190,13 +190,15 @@ sudo docker run -d --name atlas-nemotron --gpus all --ipc=host --network host \
    **Fix**: `yarn.rs` now uses the correct YaRN formula in dimension-index space.
    **Re-test needed**: Run the same long-context suite against a fresh build from current main.
 
-2. **[P1] Nemotron tool calling — FIXED (additional fix applied 2026-06-11)**:
+2. **[P1] Nemotron tool calling — FIXED (two complementary fixes)**:
    `disable_tool_steering = true` + `tool_call_parser = "bare_json"` in MODEL.toml addressed
-   the steering-prefix loop. A second bug was then found and fixed: `nemotron_h.jinja` was
-   unconditionally injecting XML format instructions ("NEVER emit JSON") into the system message
+   the steering-prefix loop. A second bug was then found and fixed (2026-06-11): `nemotron_h.jinja`
+   was unconditionally injecting XML format instructions ("NEVER emit JSON") into the system message
    even when `disable_tool_steering = true`, causing the bare_json grammar trigger to never fire.
-   **Fix**: XML format instructions now gated on `{%- if not disable_tool_steering %}` in the
-   jinja template.
+   **Fix**: XML format instructions now gated on `{%- if not disable_tool_steering %}`.
+   A third complementary fix applied (2026-06-12): `thinking_in_tools` was left `true` by the
+   project-wide sweep despite the known pass-30 regression risk. Restored to `false` in MODEL.toml
+   so the generation prefix uses empty `<think></think>` rather than a full open thinking block.
    **Re-test needed**: Re-run the 2/2 tool call suite against a fresh build.
 
 3. **[P2] 122B SSM pool memory — BUG FIXED (2026-06-12)**:
@@ -216,10 +218,64 @@ sudo docker run -d --name atlas-nemotron --gpus all --ipc=host --network host \
 
 ---
 
+## Codebase Verification — 2026-06-12 (follow-up audit)
+
+Re-audit of all three action items against the current `spec_ssm` branch (which already
+contained the 2026-06-11 jinja template fix for Nemotron). One additional fix applied.
+
+### Summary of changes in this session
+
+| Item | Finding | Action |
+|------|---------|--------|
+| P0 — Mistral MLA prefill | YaRN fix in yarn.rs confirmed correct; all MLA prefill code paths and kv_dtypes verified clean (paged_mla.rs, cache_skip_mla.rs, kv_dtypes.rs) | No change |
+| P1 — Nemotron tool calling | `thinking_in_tools = true` still present despite known pass-30 regression risk; `thinking_in_tools = false` was the correct per-model override | **Fixed**: flipped to `false` |
+| P2 — SSM cache slots | CLI propagation verified end-to-end (cli.rs → build.rs:71 → factory → impl_a1.rs); 1206 MB is `SsmStatePool` (max_batch_size), `SsmSnapshotPool` is zeroed by `--ssm-cache-slots 0` | No change |
+
+### P0 — Mistral MLA prefill (2026-06-12 re-verification)
+
+All MLA prefill code paths verified clean against spec_ssm:
+- `yarn.rs`: correct YaRN formula in dimension-index space (low=7, high=15 for Mistral params) ✓
+- `paged_mla.rs`: correct attention scale `1/sqrt(hd=128)`, K/V assembled before cache write ✓
+- `cache_skip_mla.rs`: same scale, `prefill_attention_64` (BR=64 tile), no correctness gap ✓
+- `kv_dtypes.rs`: `build_layer_kv_dtypes(BF16, ...)` returns empty vec; no FP8 mixing ✓
+- `mla_absorbed.cu`: CUDA kernels verified clean; no seq_len limits or tile overflow ✓
+- `mistral-small-4/MODEL.toml`: `default_kv_dtype = "bf16"` safety guard present ✓
+
+### P1 — Nemotron Super tool calling (2026-06-12 fix)
+
+**Bug**: `thinking_in_tools = true` in MODEL.toml despite the MODEL.toml comment warning:
+> "Super specifically had a pass-30 regression where thinking-during-tools degraded
+> bare_json output. If that returns in practice, flip back to false per-model here."
+
+With `thinking_in_tools = true` AND `disable_tool_steering = true`:
+- Generation prefix: `<|im_start|>assistant\n<think>\n` (full open thinking block)
+- After thinking, model has seen no format instructions (jinja XML mandate suppressed by
+  the 2026-06-11 fix), but the bare_json grammar trigger (`{"name":"`) may not fire if
+  the model opens with natural-language prose rather than `{`
+
+With `thinking_in_tools = false`:
+- Generation prefix: `<|im_start|>assistant\n<think></think>\n` (empty, closed block)
+- Model immediately in "response" mode — more likely to go straight to bare JSON output
+- Grammar trigger fires on `{` → constrained to valid JSON tool call schema
+
+**Fix applied**: `thinking_in_tools = false` in `kernels/gb10/nemotron-super-120b-a12b/MODEL.toml`.
+
+### P2 — SSM cache slots (2026-06-12 re-verification)
+
+CLI propagation verified end-to-end:
+- `crates/spark-server/src/cli.rs`: `ssm_cache_slots: usize`, `default_value_t = 16` ✓
+- `crates/spark-server/src/main_modules/serve_phases/build.rs` line 71: `args.ssm_cache_slots`
+  passed to `spark_model::factory::build_model` ✓
+- `crates/spark-model/src/model/impl_a1.rs` line 158: `SsmSnapshotPool::new(ssm_cache_slots, ...)`
+  receives the CLI value ✓
+- `SsmStatePool` (line 136): sized by `max_batch_size`, NOT `ssm_cache_slots` → 1206 MB is
+  always present and correct for in-flight decode state
+
+---
+
 ## Codebase Verification — 2026-06-07
 
 Full code-level audit of all three action items against the current `spec_ssm` branch.
-No new bugs found; all previously-noted fixes are correctly in place.
 
 ### P0 — Mistral long-context (YaRN inv_freq)
 
@@ -257,24 +313,32 @@ Additional MLA prefill code paths also verified clean:
 - `thinking_in_tools = true` — project-wide default flipped 2026-05-23; per-model override
   available if thinking-during-tools degrades bare_json output in practice
 
+**Note (2026-06-12)**: `thinking_in_tools` was subsequently flipped back to `false`; see the
+2026-06-12 session audit below for the root cause and fix.
+
 **Verified**: `jinja-templates/nemotron_h.jinja` generation-prompt block correctly gates the
 steering prefix on `not disable_tool_steering`:
 ```
 {%- if tools and not disable_tool_steering %}
     {{- '<|im_start|>assistant\n<think></think>\n<tool_call>\n' }}
 {%- elif enable_thinking %}
-    ...
+    {{- '<|im_start|>assistant\n<think>\n' }}
+{%- else %}
+    {{- '<|im_start|>assistant\n<think></think>\n' }}
 ```
-With `disable_tool_steering = true` the model instead enters the `enable_thinking` branch and
-opens `<think>` naturally, then closes it and emits the bare-JSON tool call on its own.
+With `disable_tool_steering = true` and `thinking_in_tools = false`:
+- `enable_thinking = false` in the tool context
+- Generation prefix: `<|im_start|>assistant\n<think></think>\n` (empty, closed)
+- Model emits the tool call immediately after the empty think block ✓
 
 **NOT verified in 2026-06-07 audit**: the system-message block (lines 48–93 of nemotron_h.jinja)
 also contained an XML format mandate ("NEVER emit tool calls as JSON") that was NOT gated on
 `disable_tool_steering`. This was missed during the 2026-06-07 audit and fixed on 2026-06-11.
 See the 2026-06-11 verification section below for details.
 
-**Status**: generation-prompt steering fix confirmed; system-message format conflict also fixed
-2026-06-11. Re-test on live hardware will close this item.
+**Status**: generation-prompt steering fix confirmed; system-message format conflict fixed
+2026-06-11; `thinking_in_tools = false` restored 2026-06-12. Re-test on live hardware will
+close this item.
 
 ### P2 — 122B SSM pool memory
 
@@ -288,6 +352,14 @@ See the 2026-06-11 verification section below for details.
 `SsmStatePool` holds the live recurrent hidden states for all in-flight decode sequences.
 It must always be pre-allocated; its size is `(max_batch_size + 1) × num_ssm_layers × h_bytes`.
 `--ssm-cache-slots 0` only zeroes the prefix-cache snapshot budget and does not affect this pool.
+
+**CLI propagation verified** (2026-06-12):
+- `cli.rs`: `ssm_cache_slots` field with `default_value_t = 16` ✓
+- `serve_phases/build.rs` line 71: `args.ssm_cache_slots` passed to `factory::build_model` ✓
+- `model/impl_a1.rs`: `ssm_cache_slots` parameter received and passed to `SsmSnapshotPool::new` ✓
+- When `--ssm-cache-slots 0` is passed, `SsmSnapshotPool` gets `ssm_cache_slots=0` (empty
+  snapshot pool). The reported 1206 MB is `SsmStatePool` — it is unaffected and correctly sized
+  by `max_batch_size=8` (default).
 
 `crates/spark-server/src/main_modules/serve_phases/preflight.rs` correctly projects both
 budgets independently for memory-check purposes.
