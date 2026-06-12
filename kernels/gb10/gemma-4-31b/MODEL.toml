@@ -86,8 +86,6 @@ dry_multiplier = 0.0      # 2026-06-06: 0.5->0.0; no vendor DRY. Re-gate; target
 # Gemma-4 uses <|channel>thought\n...<channel|> for thinking, which is
 # structurally separate from tool calls. Enable thinking with tools.
 thinking_in_tools = true
-# 2026-05-23 sweep: 512 → 2048 (project-wide reasoning headroom bump).
-max_thinking_budget = 2048
 # BF16 KV cache — Gemma-4's large final norm weights (mean=29, max=588)
 # exceed FP8 E4M3 range (±448), causing attention corruption with FP8/NVFP4 KV.
 default_kv_dtype = "bf16"

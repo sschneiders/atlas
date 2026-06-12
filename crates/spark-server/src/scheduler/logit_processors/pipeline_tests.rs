@@ -40,8 +40,7 @@ use crate::scheduler::confidence::{
 /// dashboards and any future per-stage opt-out config.
 #[test]
 fn stage_names_are_distinct_and_stable() {
-    let names: [&'static str; 8] = [
-        f2_confidence::F2ConfidenceEarlyStop.name(),
+    let names: [&'static str; 7] = [
         mid_word::MidWordThinkEndMask.name(),
         post_close::PostCloseThinkMask.name(),
         tool_during_think::ToolCallDuringThinkingMask.name(),
@@ -62,22 +61,19 @@ fn stage_names_are_distinct_and_stable() {
     }
     // Stable identifiers (pin exact strings so a rename is a visible
     // diff — these appear in tracing logs + future feature flags).
-    assert_eq!(names[0], "f2_confidence_early_stop");
-    assert_eq!(names[1], "mid_word_think_end_mask");
-    assert_eq!(names[2], "post_close_think_mask");
-    assert_eq!(names[3], "tool_call_during_thinking_mask");
-    assert_eq!(names[4], "forced_think_end_injector");
-    assert_eq!(names[5], "pin_to_tool_call_start");
-    assert_eq!(names[6], "forced_token_fastpath");
-    assert_eq!(names[7], "grammar_bitmask_apply");
+    assert_eq!(names[0], "mid_word_think_end_mask");
+    assert_eq!(names[1], "post_close_think_mask");
+    assert_eq!(names[2], "tool_call_during_thinking_mask");
+    assert_eq!(names[3], "forced_think_end_injector");
+    assert_eq!(names[4], "pin_to_tool_call_start");
+    assert_eq!(names[5], "forced_token_fastpath");
+    assert_eq!(names[6], "grammar_bitmask_apply");
 }
 
-/// The only stage that should advertise argmax-invariance is the
-/// F2 confidence accumulator (logits are read-only). Everything else
-/// mutates logits and must report `false`.
+/// Every remaining stage mutates logits and must report `false` for
+/// argmax-invariance (the read-only F2 stage was removed 2026-06-12).
 #[test]
 fn argmax_invariance_advertisement() {
-    assert!(f2_confidence::F2ConfidenceEarlyStop.is_argmax_invariant());
     assert!(!mid_word::MidWordThinkEndMask.is_argmax_invariant());
     assert!(!post_close::PostCloseThinkMask.is_argmax_invariant());
     assert!(!tool_during_think::ToolCallDuringThinkingMask.is_argmax_invariant());

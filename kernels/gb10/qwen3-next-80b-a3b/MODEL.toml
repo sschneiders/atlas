@@ -48,19 +48,11 @@ model_type = "qwen3_next"
 # (max_thinking_budget=256), which is too low for users running
 # extended reasoning prompts on Qwen3-Next-80B.
 [behavior]
-# Content-loop watchdog ENABLED 2026-06-06: robust-coherence probe showed Qwen3-Next-80B
-# answers correctly then RUNS ON into fabricated "Human:/assistant" turns (fails to emit
-# <|im_end|>). The watchdog rolls back run-on/loop attractors to a clean boundary.
-enable_loop_watchdog = true
 # Qwen3-Next-80B does not have an official thinking-mode template,
 # but supports `enable_thinking=true` via the chat-template kwargs.
 # When tools are active, leave thinking on — the model uses it
 # constructively for multi-step tool reasoning.
 thinking_in_tools = true
-# Generous ceiling for extended reasoning prompts. Per-request
-# `thinking.budget_tokens` still wins below this; CLI
-# `--max-thinking-budget` overrides this entirely.
-max_thinking_budget = 4096
 # 2026-06-06: thinking_default FALSE — Qwen3-Next-80B is the Instruct (non-thinking) variant with
 # no official thinking-mode template (see header). Forcing thinking_default=true made the reasoning
 # parser mis-capture output as 885-token "reasoning" and never stop. thinking_in_tools stays true.

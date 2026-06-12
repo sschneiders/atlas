@@ -21,7 +21,7 @@ pub(super) fn start_new_requests(
     prefill_stream: u64,
     prefill_event: u64,
     grammar_engine: &mut Option<GrammarEngine>,
-    spontaneous_think_budget: u32,
+    spontaneous_think_budget: Option<u32>,
     think_end_token: Option<u32>,
     think_start_token: Option<u32>,
     tool_call_start_token: Option<u32>,

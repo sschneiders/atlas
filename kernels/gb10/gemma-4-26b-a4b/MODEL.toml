@@ -78,10 +78,6 @@ dry_multiplier = 0.0      # 2026-06-06: 0.5->0.0; no vendor DRY. Re-gate; target
 
 [behavior]
 thinking_in_tools = true
-# 2026-05-23 sweep: 512 → 2048. Matches Qwen3.6-35B-A3B after F1
-# removal; chain-of-thought reasoning needs the headroom and the
-# safety cap in api/chat/thinking.rs caps content side anyway.
-max_thinking_budget = 2048
 # BF16 KV cache default — large final norm weights (mean=29, max=588) produce
 # K/V values exceeding FP8 E4M3 range (±448). Even with calibration, FP8
 # precision is insufficient for this model. vLLM also uses BF16 for Gemma 4.

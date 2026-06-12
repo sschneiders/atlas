@@ -148,16 +148,6 @@ dry_multiplier = 0.0
 # calibration disabled).
 fp8_kv_calibration_tokens = 256
 
-# Content-loop watchdog ENABLED (2026-05-23 numerical-drift sweep):
-# the 2026-05-05 chess-game pass was too short to expose the late-
-# layer divergence — 18920-token opencode prompts produce ~7%
-# accumulated cosine drift vs HF BF16 reference (mean cos 0.967, see
-# project_qwen36_numerical_drift_2026_05_23.md). When the late-layer
-# distribution drifts enough to flip MoE expert selection (3/8
-# overlap at L38), the model occasionally lands in sentence-repeat
-# attractors. The watchdog catches and rolls back to a sentence
-# boundary, breaking the loop.
-enable_loop_watchdog = true
 # Server-side sampling SAFETY FLOOR/CEILING — binds even when the client
 # omits/lowers these, so stability does not depend on the client. The FP8
 # weights + NVFP4 lm-head are drift-prone: with min_p=0 the degenerate tail is
@@ -210,80 +200,6 @@ thinking_default = true
 #   room. Combined with PR 73's qwen3_xml parser, the model can think then
 #   emit clean typed args.
 thinking_in_tools = true
-# PR 73 qwen3_xml REVERTED 2026-05-25 PM. Live opencode v40 test:
-# under thinking_in_tools=true + qwen3_xml, the model emitted COMPLETELY
-# garbled tool args — `command: '/tmp/test-rust-axum-v40'` (path as
-# command), `command: 'description'` (field name as value),
-# `command: ': No such file or directory'` (error message echoed back as
-# command). The qwen3_xml type-coercion path interacted poorly with
-# the FP8 model's reasoning under the long opencode system prompt.
-# Default qwen3_coder is the proven path for our "MUCH better" state
-# (the user's recall: thinking + tool-calling working nicely, didn't
-# completely finish the job).
-# tool_call_parser = "qwen3_xml"  # disabled
-# Maximum thinking budget (tokens). Prevents overthinking.
-# Client-specified budget takes precedence if lower.
-#
-# 2026-05-23: 512 → 2048 after F1 reflection-penalty removal — model
-# needed room for ~600-1500 token reasoning chains.
-# 2026-05-24 (phaseAB sweep #2): 2048 → 768. Live opencode session
-# (opencode-phaseAB.jsonl) showed two failure modes traced to the
-# 2048 budget:
-#   - seq=1 (title-gen, 3 msgs, 0 tools): model burned 2068 thinking
-#     tokens to produce a 7-token title. The default-thinking-on
-#     stance is correct, but 2k tokens to title a chat is absurd.
-#   - seq=8 (turn 9 of agentic flow): model thought for the full
-#     2048 budget, was force-closed via `</think>` injection, then
-#     emitted EOS with zero content tokens. 33s of stall for nothing.
-# 768 still lets Qwen3.6 reason through multi-step plans (typical
-# agentic thinking is 200-500 tokens) while bounding the worst-case
-# burn at ~30s. Clients that need more can pass `thinking_token_budget`
-# in the request body (vLLM-PR shape, supported since Phase B-2).
-max_thinking_budget = 768
-# Inter-tool prose budget — max tokens of free CONTENT (not thinking,
-# not tool body) the model can emit between successive tool calls
-# before Atlas truncates with finish_reason=length.
-#
-# 2026-05-24: bumped 384 → 2048. The default 384 was killing
-# opencode-style agentic sessions where the model legitimately needs
-# to write a longer explanation/plan between tool calls (post-Phase-2c
-# precision improvements let it reason for ~1000+ token explanations
-# without degenerating). Observed in opencode-vllm-detect.jsonl:
-# content-loop watchdog correctly rolled back from a real loop, model
-# re-steered cleanly, but then emitted 385 tokens of legitimate
-# explanation prose and was killed by the 384 budget.
-#
-# 2048 gives Qwen3.6 agentic ample room. Real degeneration still
-# tripped by content-loop watchdog (vLLM-anchored, fires within 4
-# tokens of a tight loop) and thinking-loop watchdog.
-#
-# F5 (2026-06-02): lowered 2048 → 1024. F1's post-think content cap is
-# the dominant runaway bound. 2026-06-10: restored to 384 — the 1024
-# budget (raised in #90) let temp-0.3 paraphrase loops run ~2.7x longer
-# per inter-tool gap on long warm-cache contexts (SimHash fires HINT-only
-# on paraphrase repeats; the period matcher misses them), turning
-# agentic runs into 360s cap-riders (tq12 gate 0/2). 384 is the value
-# the 2026-06-07 10/10 series and the CC2-CC6 Claude-Code validation
-# actually ran with.
-max_inter_tool_prose = 384
-# F1 (2026-06-02): unconditional post-`</think>` content-token cap for
-# tool-active requests. Backstops the grammar-legal-but-never-closing
-# tool-value runaway (a garbled/merged BPE `</parameter>` close leaves
-# the value rule unterminated → burns to max_tokens → 360s opencode
-# timeout). Ends any runaway well before max_tokens, returning the turn
-# budget to the agent. Never caps plain chat (runtime gate also requires
-# an attached grammar). In-code default is 100_000 (no-op).
-#
-# CC6 (2026-06-07): raised 1536 → 8192. This counter increments for EVERY
-# post-`</think>` token including a `<parameter=content>` VALUE, and is
-# cumulative across the whole turn — so 1536 truncated Claude Code's single
-# large file writes (a whole src/main.rs + #[tokio::test] blocks in one Write
-# ≈ 2000-6000 content tokens) mid-statement, breaking the build. 8192 gives a
-# ~6000-token file plus surrounding agentic narrative room in one turn. A true
-# runaway is still bounded: the tool-call ENVELOPE streak (MAX_TOOL_BODY_TOKENS),
-# the content-loop / fuzzy-repeat / inter-tool-prose watchdogs (fire OUTSIDE the
-# tool body), and the ultimate a.remaining==0 / max_tokens stop all remain active.
-max_post_think_content_tokens = 8192
 # Default num_drafts for speculative decoding (K = num_drafts + 1).
 # Benchmarked 2026-04-10 on GB10: K=2 (1 draft) yields 117.8 tok/s vs
 # K=3 (2 drafts) at 82.4 tok/s — 43% faster. The MoE verify overhead

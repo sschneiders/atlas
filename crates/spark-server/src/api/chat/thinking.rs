@@ -22,8 +22,6 @@ pub(super) fn resolve_thinking(
         return (false, None);
     }
     let (et, tb) = req.resolve_thinking(state.behavior.thinking_default);
-    let mt = req.max_tokens as u32;
-    let max_budget = state.behavior.max_thinking_budget;
     // `thinking_in_tools=false` is the MODEL.toml DEFAULT for tool-
     // active turns: it suppresses thinking when the client is silent.
     let et = if tools_active
@@ -34,20 +32,18 @@ pub(super) fn resolve_thinking(
     } else {
         et
     };
+    // vLLM parity (2026-06-12): no server-imposed thinking budget. A
+    // budget is enforced only when the client requests one
+    // (`thinking_token_budget` / `thinking.budget_tokens`) or the
+    // operator sets one (CLI `--max-thinking-budget` / MODEL.toml
+    // `[behavior].max_thinking_budget`, 0 = unset). The previous 90%-of-
+    // max_tokens implicit cap is gone — thinking tokens now consume the
+    // generation budget directly, so `max_tokens` is the natural bound.
     let budget = if et {
-        let b = tb.unwrap_or(max_budget);
-        // 2026-05-23 sweep: dropped the 70% special case for
-        // `tools_active && thinking_in_tools` (previously 7/10, now
-        // 9/10 uniformly). With `thinking_in_tools=true` as the
-        // project-wide default the 70% branch fired on every tool turn
-        // and silently undermined the MODEL.toml `max_thinking_budget`
-        // bump (opencode-style requests at max_tokens=2048 capped to
-        // 1433 instead of 2048). 90% leaves headroom for content +
-        // tool args without crippling reasoning chains that now run
-        // naturally after the F1 reflection-penalty removal.
-        let safety_cap_pct = 9;
-        let max = ((mt * safety_cap_pct) / 10).max(1);
-        Some(b.min(max))
+        tb.or(match state.behavior.max_thinking_budget {
+            0 => None,
+            b => Some(b),
+        })
     } else {
         None
     };

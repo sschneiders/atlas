@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! F2 confidence-run + code-fence pure helpers, extracted from
-//! `helpers.rs` to keep that file ≤500 LoC. These drive the F2
-//! confidence early-stop and the safe-boundary `</think>` injection
-//! gate; they are pure parity/accumulator functions, unit-tested
-//! directly without any `ActiveSeq` / logits mocking.
-
-use super::helpers::watchdog_params;
+//! Code-fence parity + safe-boundary `</think>` injection gate for the
+//! thinking-budget mechanism (client/CLI-requested budgets). Pure
+//! parity/accumulator functions, unit-tested directly without any
+//! `ActiveSeq` / logits mocking.
+//!
+//! The F2 confidence-early-stop accumulator that used to live here was
+//! removed 2026-06-12 for vLLM parity (the server no longer decides the
+//! model is "done reasoning").
 
 /// Flip `in_fence` when the just-sampled token `tok` is the model's
 /// atomic ``` code-fence token. `fence_tok == None` (tokenizer has no
@@ -20,38 +21,6 @@ pub fn toggle_code_fence(in_fence: bool, tok: u32, fence_tok: Option<u32>) -> bo
     match fence_tok {
         Some(f) if f == tok => !in_fence,
         _ => in_fence,
-    }
-}
-
-/// `CONFIDENCE_RUN_LIMIT` is the default streak length before F2's
-/// confidence-early-stop arms `</think>`. The live limit is
-/// `watchdog_params().confidence_run_length` (MODEL.toml-tunable).
-///
-/// 2026-05-23 sweep: 30 → 60. With the project-wide `max_thinking_budget`
-/// bump to 2048 reasoning chains genuinely span hundreds of tokens, and
-/// the previous 30-token streak fired inside legitimate confident
-/// reasoning (e.g. dictating boilerplate path strings, listing imports,
-/// or a model-card cite). 60 still catches genuine collapse — a stuck
-/// model emits ≥60 high-confidence tokens within ~2 s — without firing
-/// during normal extended thinking.
-pub const CONFIDENCE_RUN_LIMIT: u32 = 60;
-
-/// F2 confidence-run accumulator. Given whether the current token is
-/// high-confidence (top-1 softmax ≥ 0.95) and the prior consecutive
-/// run length, return `(new_run, should_arm_force_end)`.
-///
-/// Pure accumulator — runs the SAME inside and outside a ``` fence.
-/// We deliberately keep *detecting* inside code: a model that drafts
-/// an unbounded code block in its reasoning still needs braking. What
-/// must NOT happen is the forced `</think>` landing mid-statement —
-/// that boundary decision is [`should_inject_think_end`] below, which
-/// defers the injection until the fence closes (a safe boundary).
-pub fn confidence_run_step(confident: bool, prev_run: u32) -> (u32, bool) {
-    if confident {
-        let run = prev_run + 1;
-        (run, run >= watchdog_params().confidence_run_length)
-    } else {
-        (0, false)
     }
 }
 

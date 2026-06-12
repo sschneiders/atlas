@@ -141,20 +141,11 @@ impl TransformerModel {
             gpu.as_ref(),
         )?);
 
-        // SSM snapshot pool: Marconi prefix-cache slots + Phase-C
-        // decode-rollback ring. The decode-rollback region is only sized
-        // for SSM models — `num_ssm_layers == 0` makes both regions
-        // collapse to empty. The ring retains DECODE_ROLLBACK_RING_SLOTS
-        // boundary snapshots per sequence (DECOUPLED from ROLLBACK_RESTEER_CAP:
-        // the cap bounds re-steer attempts, the ring must retain enough
-        // boundaries that a clean PRE-loop one survives — `CAP+1=3` was too
-        // small and forced NoSsmSnapshot declines). Sized for every
-        // active-sequence pool slot (`max_batch_size`).
-        let decode_ring_slots = if ssm_pool.num_ssm_layers > 0 {
-            atlas_kernels::DECODE_ROLLBACK_RING_SLOTS
-        } else {
-            0
-        };
+        // SSM snapshot pool: Marconi prefix-cache slots only. The Phase-C
+        // decode-rollback ring region is no longer allocated (0 slots) —
+        // the watchdog rollback machinery it served was removed
+        // 2026-06-12 for vLLM parity, freeing its per-sequence VRAM.
+        let decode_ring_slots = 0;
         let ssm_snapshots = SsmSnapshotPool::new(
             ssm_cache_slots,
             ssm_pool.h_bytes,

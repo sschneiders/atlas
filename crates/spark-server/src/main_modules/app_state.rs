@@ -49,8 +49,6 @@ pub struct AppState {
     /// detection Atlas would never enforce `max_thinking_budget` and
     /// the model can ramble for the full `max_tokens`.
     pub think_start_token_id: Option<u32>,
-    /// Max output tokens for tool-calling requests (CLI --tool-max-tokens).
-    pub tool_max_tokens: usize,
     /// Model-specific sampling presets from MODEL.toml (per-category defaults).
     pub sampling_presets: atlas_kernels::SamplingPresets,
     /// Token ID for `<tool_call>` — used for logit bias boost when tools are active.

@@ -41,15 +41,6 @@ pub(super) struct StreamState {
     /// Sanitiser state: suppressing content while waiting for a
     /// matching `</parameter>` close after an orphan `<parameter=`.
     pub(super) suppressing_param_leak: bool,
-    /// Consecutive tokens spent in `suppressing_param_leak=true`
-    /// without a matching close arriving. When this exceeds
-    /// `MAX_SUPPRESS_STREAK_TOKENS` (handle_token.rs), the stream is
-    /// killed — the model is in an orphan-tool-call doom loop
-    /// emitting partial envelopes that never close (observed
-    /// opencode-hotfix.jsonl 2026-05-24 seq=10: 8192 tokens of
-    /// suppressed content until max_tokens, no watchdog fire
-    /// because the partial-envelope period exceeded 64).
-    pub(super) suppress_streak_tokens: u32,
     /// Sanitiser state: currently inside a tool-call envelope opener
     /// (e.g. `<minimax:tool_call>`); inner `<invoke ...>` etc. are
     /// legitimate content while this is true.
@@ -63,72 +54,20 @@ pub(super) struct StreamState {
     pub(super) reasoning_suppressing_leak: bool,
     /// Tag-scan buffer for the reasoning sanitiser.
     pub(super) reasoning_tag_scan_buf: String,
-    /// Repetition-loop watchdog: tail buffer for line-level
-    /// duplicate detection.
-    pub(super) loop_scan_buf: String,
-    /// Set true when the watchdog or SimHash guard fires.
-    pub(super) loop_watchdog_triggered: bool,
-    /// Set true when the watchdog salvages a fenced/XML tool intent
-    /// into a synthetic `tool_call` so the Done arm picks the right
+    /// Set true when a fenced/XML tool intent is salvaged into a
+    /// synthetic `tool_call` so the Done arm picks the right
     /// `finish_reason`.
     pub(super) salvaged_tool_call: bool,
-    /// F4: SimHash semantic-loop guard for paraphrased restarts.
-    pub(super) simhash_guard: crate::loop_simhash::SimHashLoopGuard,
-    /// F4: pending bytes accumulated until a sentence-boundary or
-    /// 1KB force-flush triggers a `simhash_guard.check()`.
-    pub(super) simhash_pending: String,
-    /// F5: cross-flush tool-arg dedup (default thresholds).
-    pub(super) tool_arg_dedup: crate::tool_arg_dedup::ToolArgDedup,
-    /// F11: tighter within-response tool-arg dedup for the
-    /// streaming `ToolCallEnd` path.
-    pub(super) tool_arg_dedup_within: crate::tool_arg_dedup::ToolArgDedup,
-    /// F11: per-streaming-toolcall accumulator keyed by `oa_idx`.
-    /// Holds (name, args_so_far) until `ToolCallEnd` runs the dedup.
+    /// Per-streaming-toolcall accumulator keyed by `oa_idx`.
+    /// Holds (name, args_so_far) until `ToolCallEnd` logs the call.
     pub(super) streaming_tool_args: HashMap<usize, (String, String)>,
-    /// F12: per-response total tool-call count.
-    pub(super) tool_calls_emitted_count: usize,
-    /// Bug-2 (OpenClaw 2026-05-08): per-tool-name consecutive-call
-    /// guard. F11 keys on `(name, canonical_args)` and is defeated by
-    /// runaway loops where the model varies args slightly each
-    /// iteration (e.g. timestamps, sequence numbers, IDs). This
-    /// counter trips whenever the same tool name fires in N
-    /// successive `ToolCallEnd` events regardless of args drift,
-    /// catching the `cron`+`exec` alternation pattern observed when
-    /// the streaming detector did successfully classify the calls.
-    /// `(last_name, run_length)`. `last_name = None` means the run
-    /// was just broken by a different tool name.
-    pub(super) name_run: Option<(String, u32)>,
-    /// Set true when ANY tool-call loop guard forcibly ends the
-    /// response: the Bug-2 name-run cap, F11 within-response dedup,
-    /// F5 cross-flush dedup, or F44 permanent-failure circuit-breaker.
-    /// `handle_done` reads this and overrides `finish_reason` to
-    /// `"length"` — without the override the response otherwise looks
-    /// like a normal `"tool_calls"` completion (because tool calls
-    /// were emitted), and agent clients (opencode, etc.) cheerfully
-    /// run the tools and send the next request, perpetuating the loop
-    /// from the outside. `"length"` is the OpenAI-spec slot for
-    /// "response was forcibly truncated" and gives every agent a
-    /// clean hook to break its outer retry loop.
-    pub(super) tool_loop_capped: bool,
     /// Cooperative cancellation flag shared with the scheduler. Flipped
-    /// true on any forced-stop condition (`tool_loop_capped`, loop-
-    /// watchdog fire, …); the scheduler reads it in
+    /// true on a forced-stop condition (stop-string match, tool-call
+    /// validation hard-fail); the scheduler reads it in
     /// `emit_step::emit_token` and finalises the sequence. Without
     /// this, `stop_string_triggered` only suppresses output and the
     /// scheduler keeps generating until natural EOS / max_tokens.
     pub(super) cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Rolling tail (≤256 chars) of decoded reasoning text, used by the
-    /// in-think tool-call leak scanner. Accumulated cross-delta so a
-    /// boundary-split opener (e.g. `<too` in one delta + `l_call>` in
-    /// the next) is still visible when the buffer is scanned. Only
-    /// populated during the thinking phase.
-    pub(super) reasoning_xml_scan_buf: String,
-    /// One-shot flag: true once the scanner has detected a literal
-    /// `<tool_call>` / `<function=` / `<parameter=` / `<invoke ` opener
-    /// inside the reasoning stream. After it flips, subsequent
-    /// thinking-phase tokens short-circuit with empty SSE output until
-    /// the scheduler picks up the cancel_flag and finalises.
-    pub(super) reasoning_xml_leak_detected: bool,
     /// Streaming tool-call detector (`Some` iff `tools_active`).
     pub(super) detector: Option<tool_parser::StreamingToolDetector>,
     /// True iff the reasoning/`<think>` phase has finished. Starts
@@ -175,26 +114,14 @@ impl StreamState {
             refusal_scan_buf: String::new(),
             stop_string_triggered: false,
             suppressing_param_leak: false,
-            suppress_streak_tokens: 0,
             inside_envelope: false,
             reasoning_inside_envelope: false,
             tag_scan_buf: String::new(),
             reasoning_suppressing_leak: false,
             reasoning_tag_scan_buf: String::new(),
-            loop_scan_buf: String::new(),
-            loop_watchdog_triggered: false,
             salvaged_tool_call: false,
-            simhash_guard: crate::loop_simhash::SimHashLoopGuard::new(),
-            simhash_pending: String::new(),
-            tool_arg_dedup: crate::tool_arg_dedup::ToolArgDedup::new(),
-            tool_arg_dedup_within: crate::tool_arg_dedup::ToolArgDedup::with_params(4, 2, 3),
             streaming_tool_args: HashMap::new(),
-            tool_calls_emitted_count: 0,
-            name_run: None,
-            tool_loop_capped: false,
             cancel_flag,
-            reasoning_xml_scan_buf: String::new(),
-            reasoning_xml_leak_detected: false,
             detector: if tools_active {
                 Some(tool_parser::StreamingToolDetector::new_with_tools(
                     tool_defs,

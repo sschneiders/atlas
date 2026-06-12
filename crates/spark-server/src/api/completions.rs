@@ -163,7 +163,6 @@ pub async fn completions(
             logit_bias.clone(),
             stop_tokens,
             req.seed,
-            req.repetition_detection,
         )
         .await
         {
@@ -200,9 +199,7 @@ pub async fn completions(
         stop_tokens,
         enable_thinking: false,
         thinking_budget: None,
-        repetition_detection: req.repetition_detection,
         require_tool_call: false,
-        suppress_tool_call: false,
         disable_mtp: false,
         grammar_spec: None,
         seed: req.seed,
@@ -302,7 +299,6 @@ pub(super) async fn completions_stream(
     logit_bias: Vec<(u32, f32)>,
     stop_tokens: Vec<u32>,
     seed: Option<u64>,
-    repetition_detection: Option<crate::openai::RepetitionDetectionParams>,
 ) -> Result<Response, (StatusCode, String)> {
     // Match chat_stream/mod.rs sizing; see comment there.
     let (token_tx, token_rx) = tokio::sync::mpsc::channel::<StreamEvent>(1024);
@@ -332,9 +328,7 @@ pub(super) async fn completions_stream(
         stop_tokens,
         enable_thinking: false,
         thinking_budget: None,
-        repetition_detection,
         require_tool_call: false,
-        suppress_tool_call: false,
         disable_mtp: false,
         grammar_spec: None,
         seed,

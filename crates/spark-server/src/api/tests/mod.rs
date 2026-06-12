@@ -10,6 +10,5 @@ mod common;
 // `f44_check_permanent_failure`, etc.). Files left on disk; un-comment
 // these once the assertions are updated against the current API.
 // mod sanitizer;
-// mod watchdog_f7;
 // mod f28_f32;
 // mod f49;

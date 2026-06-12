@@ -13,22 +13,23 @@
 //!
 //! ## Stage order
 //!
-//! 1. [`f2_confidence::F2ConfidenceEarlyStop`] — arms `force_end_thinking`
-//!    when top-1 probability stays ≥ 0.95 for the configured run.
-//! 2. [`mid_word::MidWordThinkEndMask`] — suppresses `</think>` when
+//! 1. [`mid_word::MidWordThinkEndMask`] — suppresses `</think>` when
 //!    the previous token decoded to mid-word text.
-//! 3. [`post_close::PostCloseThinkMask`] — after `</think>` fires,
+//! 2. [`post_close::PostCloseThinkMask`] — after `</think>` fires,
 //!    masks `</think>` + `<think>` so the model can't re-enter.
-//! 4. [`tool_during_think::ToolCallDuringThinkingMask`] — masks
-//!    `<tool_call>` during thinking; biases it down on tool-loop.
-//! 5. [`forced_think_end::ForcedThinkEndInjector`] — when budget
+//! 3. [`tool_during_think::ToolCallDuringThinkingMask`] — masks
+//!    `<tool_call>` during thinking.
+//! 4. [`forced_think_end::ForcedThinkEndInjector`] — when budget
 //!    + sentence-boundary policy says inject, blanket-mask to `</think>`.
-//! 6. [`pin_tool_call::PinToToolCallStart`] — one-shot pin to
+//! 5. [`pin_tool_call::PinToToolCallStart`] — one-shot pin to
 //!    `<tool_call>` immediately after `</think>` when require_tool_call.
-//! 7. [`forced_token::ForcedTokenFastPath`] — when grammar admits
+//! 6. [`forced_token::ForcedTokenFastPath`] — when grammar admits
 //!    exactly one next token, short-circuit pipeline + sampling.
-//! 8. [`grammar_bitmask::GrammarBitmaskApply`] — apply grammar's
+//! 7. [`grammar_bitmask::GrammarBitmaskApply`] — apply grammar's
 //!    next-token bitmask.
+//!
+//! (The F2 confidence-early-stop stage was removed 2026-06-12 for vLLM
+//! parity — the server no longer decides the model is "done reasoning".)
 //!
 //! ## Out of scope
 //!
@@ -44,7 +45,6 @@ use spark_runtime::sampler::{SamplingParams, apply_penalties_and_bias};
 
 pub mod adadec_diag;
 mod b1_margin;
-pub mod f2_confidence;
 pub mod forced_think_end;
 pub mod forced_token;
 pub mod grammar_bitmask;
@@ -128,8 +128,7 @@ pub fn run_pipeline_with_path(
     ctx: &LogitsContext,
     path: &'static str,
 ) -> Option<u32> {
-    let stages: [&dyn LogitsProcessor; 8] = [
-        &f2_confidence::F2ConfidenceEarlyStop,
+    let stages: [&dyn LogitsProcessor; 7] = [
         &mid_word::MidWordThinkEndMask,
         &post_close::PostCloseThinkMask,
         &tool_during_think::ToolCallDuringThinkingMask,

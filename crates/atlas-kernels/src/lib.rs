@@ -162,18 +162,6 @@ pub struct ModelBehavior {
     /// a different parser than its siblings (e.g. Nemotron-Super-120B uses
     /// `bare_json` while Nemotron-Nano-30B stays on `qwen3_coder`).
     pub tool_call_parser: &'static str,
-    /// Enable the content-loop watchdog (period-N token-repetition detector
-    /// at `decode_logits_step.rs:230`). Default: `false` — most models
-    /// terminate cleanly via EOS / `max_tokens` without it. Models with a
-    /// known prose-attractor failure mode (Qwen3.5-35B-A3B's "Running:```bash
-    /// cmd```Executing:" loop, observed during agentic Claude Code sessions)
-    /// should set this `true` in MODEL.toml `[behavior]`.
-    ///
-    /// The watchdog has false-positives on legitimate structured output
-    /// (chess board JS init `{color:BLACK,type:'P'},` × 8, HTML tables,
-    /// JSON arrays of similar objects, multiplication tables). Enable only
-    /// when the model has been observed to need it.
-    pub enable_loop_watchdog: bool,
     /// Server-side min-p FLOOR (0.0 = disabled). Applied as `min_p.max(floor)`
     /// AFTER request/preset resolution, so it binds even when a client sends
     /// `min_p = 0` (or omits it on a server without `--default-min-p`). On
@@ -187,33 +175,6 @@ pub struct ModelBehavior {
     /// AFTER resolution — defense-in-depth net against a client sending a high
     /// temperature; min_p_floor is the dominant lever. Set in MODEL.toml.
     pub temperature_max: f32,
-    /// Thinking-loop watchdog: substring-occurrence count that trips a
-    /// forced `</think>`. Default 3 (historical `THINK_LOOP_MIN_REPEATS`).
-    pub think_loop_min_repeats: u32,
-    /// Thinking-loop watchdog: trailing-token scan window. Default 160.
-    pub think_loop_scan_window: u32,
-    /// F2 confidence-run early-stop enabled. Default `true`. Set false
-    /// for models whose deterministic code drafting trips the heuristic.
-    pub confidence_early_stop: bool,
-    /// F2 confidence run length before arming forced `</think>`.
-    /// Default 30.
-    pub confidence_run_length: u32,
-    /// Fuzzy-repetition detector Hamming tolerance divisor: a
-    /// `pattern_len`-token window tolerates `pattern_len / div`
-    /// mismatches. Default 12 (~8%).
-    pub fuzzy_repeat_tolerance_div: u32,
-    /// Cap on free-text tokens between successive `<tool_call>` opens in
-    /// `tool_choice=auto`. Default 384. Agentic coding may want larger.
-    pub max_inter_tool_prose: u32,
-    /// Unconditional per-generation cap on post-`</think>` content tokens
-    /// for tool-active requests (grammar attached). Bounds a runaway where
-    /// a grammar-legal-but-never-closing tool value burns to `max_tokens`
-    /// (the dominant opencode `webserver_ok` 360s-timeout cause). Default
-    /// 100_000 — effectively unbounded, the historical no-op — so a model
-    /// that sets nothing is byte-identical to before. Set a small value
-    /// (e.g. 1536) per-model to backstop the runaway. Never caps plain
-    /// chat: the runtime gate also requires `grammar_state.is_some()`.
-    pub max_post_think_content_tokens: u32,
     /// TSCG (Tool-Schema Compilation) enabled — compile tool JSON
     /// schemas to compact function signatures before prompting.
     /// Default `false`; the TAS operator is tokenizer-specific so
@@ -225,24 +186,6 @@ pub struct ModelBehavior {
     /// reliably unconstrained. When `true`, tool calls are parsed but
     /// not grammar-enforced.
     pub disable_tool_grammar: bool,
-    /// Phase-C: when a decode-time watchdog (content-loop, fuzzy-repeat,
-    /// inter-tool prose) detects degeneration, roll the sequence back to
-    /// the last well-formed boundary and let generation re-steer, instead
-    /// of hard-stopping the response. Default `true` (recovers responses,
-    /// especially mid-tool-call — arXiv:2603.27905 ATLAS-RTC). Set `false`
-    /// to keep the legacy hard-stop behavior. Capped at
-    /// [`crate::ROLLBACK_RESTEER_CAP`] rollbacks per sequence, after which
-    /// the hard-stop fires regardless.
-    pub rollback_resteer: bool,
-    /// Phase-C ROM (arXiv:2603.22016) scaffold. Path to a trained
-    /// repetition-onset detection head artifact. Empty string = no ROM
-    /// head; the F2 confidence heuristic stays as the fallback. A trained
-    /// artifact can be dropped in later via MODEL.toml
-    /// `[behavior].rom_head` without further code changes — the runtime
-    /// loads it through the `RomHead` trait seam. The detector
-    /// itself is intentionally NOT implemented (no per-model trained head
-    /// is available); only the optional hook is wired.
-    pub rom_head: &'static str,
     /// Tier 5c (2026-05-26): one-shot tool-call re-roll on hard
     /// validation failure. When `true`, `validate_tool_calls` errors on
     /// the chat path fire a single retry inference with the same
@@ -257,50 +200,21 @@ pub struct ModelBehavior {
     pub tool_retry: bool,
 }
 
-/// Phase-C: maximum number of watchdog-triggered rollbacks a single
-/// sequence may perform before the watchdog reverts to a hard stop.
-/// Bounds the worst case where re-steering re-enters the same attractor
-/// — without this a degenerate sequence could rollback indefinitely.
-pub const ROLLBACK_RESTEER_CAP: u32 = 2;
-
-/// Phase-C: number of boundary SSM-state snapshots retained per sequence in
-/// the decode-rollback ring (hybrid GDN/Mamba models). DECOUPLED from
-/// [`ROLLBACK_RESTEER_CAP`]: the cap bounds how many times we re-steer, but
-/// the ring must retain enough *boundary* snapshots that a clean PRE-loop
-/// boundary survives long enough to roll back to. Sizing it at the old
-/// `CAP + 1 = 3` meant a loop spanning ≥3 sentence/newline boundaries evicted
-/// the clean boundary before the fuzzy detector (3 repeats) fired, forcing a
-/// `NoSsmSnapshot` decline → hard-stop (observed: Claude-Code @ nvfp4-head,
-/// 2026-06-07). 8 covers the 3-repeat detector with margin at modest cost
-/// (8 × max_batch × per-layer GDN state, allocated once). Pure-attention
-/// models ignore this (their ring is 0; they roll back to any boundary).
-pub const DECODE_ROLLBACK_RING_SLOTS: usize = 8;
-
 impl Default for ModelBehavior {
     fn default() -> Self {
         Self {
             thinking_in_tools: true,
-            max_thinking_budget: 256,
+            max_thinking_budget: 0,
             thinking_default: false,
             fp8_kv_calibration_tokens: 0,
             default_kv_dtype: "",
             default_num_drafts: 0,
             disable_tool_steering: false,
             tool_call_parser: "",
-            enable_loop_watchdog: false,
             min_p_floor: 0.0,
             temperature_max: 0.0,
-            think_loop_min_repeats: 3,
-            think_loop_scan_window: 160,
-            confidence_early_stop: true,
-            confidence_run_length: 30,
-            fuzzy_repeat_tolerance_div: 12,
-            max_inter_tool_prose: 384,
-            max_post_think_content_tokens: 100_000,
             tscg: false,
             disable_tool_grammar: false,
-            rollback_resteer: true,
-            rom_head: "",
             tool_retry: true,
         }
     }

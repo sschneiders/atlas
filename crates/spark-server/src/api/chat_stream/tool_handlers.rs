@@ -10,7 +10,7 @@ use axum::response::sse::Event;
 use crate::openai::ChatCompletionChunk;
 use crate::tool_parser;
 
-use super::super::stream_guards::{bump_f12_tool_call_count, flush_content_sanitizer};
+use super::super::stream_guards::flush_content_sanitizer;
 use super::ctx::StreamCtx;
 use super::state::{PendingRetry, StreamState};
 
@@ -114,11 +114,6 @@ pub(super) fn handle_complete_tool_call(
             tool = %tc.function.name,
             "tool call validation error (soft): {e}; passing through to opencode"
         );
-        bump_f12_tool_call_count(
-            &mut state.tool_calls_emitted_count,
-            ctx.max_tool_calls_per_response,
-            &mut state.stop_string_triggered,
-        );
         let preview: String = tc.function.arguments.chars().take(120).collect();
         let s = if tc.function.arguments.len() > preview.len() {
             "…"
@@ -140,43 +135,7 @@ pub(super) fn handle_complete_tool_call(
         sse_events.push(Ok(
             Event::default().data(serde_json::to_string(&frag).unwrap_or_default())
         ));
-    } else if state
-        .tool_arg_dedup
-        .check(&tc.function.name, &tc.function.arguments)
-    {
-        tracing::warn!(
-            tool = %tc.function.name,
-            "tool-arg dedup tripped: refusing redundant tool_call and ending response"
-        );
-        state.stop_string_triggered = true;
-        state.tool_loop_capped = true;
-        state
-            .cancel_flag
-            .store(true, std::sync::atomic::Ordering::Release);
     } else {
-        // Bug-2 name-run cap (mirrors handle_tool_call_end): catches
-        // runaway loops in the complete-tool-call path that
-        // tool_arg_dedup misses because of args drift.
-        let run_len = match &state.name_run {
-            Some((prev, n)) if prev == &tc.function.name => n + 1,
-            _ => 1,
-        };
-        state.name_run = Some((tc.function.name.clone(), run_len));
-        if run_len >= MAX_CONSEC_SAME_NAME_CALLS {
-            tracing::warn!(
-                tool = %tc.function.name,
-                run = run_len,
-                "Bug-2 name-run cap tripped (complete-call path): {run_len} successive `{}` tool calls; ending response",
-                tc.function.name
-            );
-            state.stop_string_triggered = true;
-            state.tool_loop_capped = true;
-        }
-        bump_f12_tool_call_count(
-            &mut state.tool_calls_emitted_count,
-            ctx.max_tool_calls_per_response,
-            &mut state.stop_string_triggered,
-        );
         // Successful complete-call path — log + metric to match the
         // blocking and incremental-streaming paths.
         let preview: String = tc.function.arguments.chars().take(120).collect();
@@ -235,11 +194,6 @@ pub(super) fn handle_tool_call_start(
             arguments: String::new(),
         },
     };
-    bump_f12_tool_call_count(
-        &mut state.tool_calls_emitted_count,
-        ctx.max_tool_calls_per_response,
-        &mut state.stop_string_triggered,
-    );
     let start = ChatCompletionChunk::tool_call_start_chunk(&ctx.model, &ctx.id, &tc, idx);
     let start_json = serde_json::to_string(&start).unwrap_or_default();
     emit_or_buffer_tool_chunk(state, ctx, idx, start_json, sse_events);
@@ -404,64 +358,21 @@ pub(super) fn handle_tool_call_args_fragment(
     ));
 }
 
-/// `DetectorOutput::ToolCallEnd` — F11 within-response dedup +
-/// F44 cross-turn permanent-failure check + Bug-2 name-run cap.
-///
-/// Bug-2 cap (`MAX_CONSEC_SAME_NAME_CALLS`): trips when the same tool
-/// name fires N times in a row regardless of args. F11 keys on
-/// `(name, canonical_args)` and is defeated by runaway loops where
-/// the model rolls a fresh timestamp / sequence number / id into the
-/// payload each iteration; the F12 total cap (default 12) is the
-/// only other server-side circuit, but a runaway can already have
-/// flooded the SSE channel before F12 fires. The name-run cap is
-/// strictly tighter than F11 and F12 for the runaway pattern.
-///
-/// A3 (2026-05-26): tightened from 6 → 3 to match opencode's
-/// `DOOM_LOOP_THRESHOLD = 3`. Live Wave-1/3 traces showed the model
-/// emitting 4-6 same-name bash calls with drifted args before any
-/// guard tripped, by which point ~MB-long degenerate commands had
-/// already flooded the stream and the .git/ artifact pollution was
-/// already created. Three same-name calls is the empirical threshold
-/// at which opencode itself bails to the user for permission. Atlas
-/// matching this means we end the response slightly before opencode
-/// would surrender, giving the outer retry loop a clean signal.
-const MAX_CONSEC_SAME_NAME_CALLS: u32 = 3;
-
+/// `DetectorOutput::ToolCallEnd` — close out the streaming accumulator
+/// for `idx` and log the completed call. The dedup / name-run / total
+/// caps that used to end the response here were removed 2026-06-12 for
+/// vLLM parity (the server never vetoes a tool call).
 pub(super) fn handle_tool_call_end(state: &mut StreamState, _ctx: &StreamCtx, idx: usize) {
     if let Some((name, args_json)) = state.streaming_tool_args.remove(&idx) {
-        if state.tool_arg_dedup_within.check(&name, &args_json) {
-            tracing::warn!(
-                tool = %name,
-                "F11 within-response dedup tripped: 2+ identical streaming tool calls; ending response"
-            );
-            state.stop_string_triggered = true;
-            state.tool_loop_capped = true;
-        }
-        let run_len = match &state.name_run {
-            Some((prev, n)) if prev == &name => n + 1,
-            _ => 1,
+        // Successful streaming tool call — log + metric to match the
+        // blocking and complete-call paths.
+        let preview: String = args_json.chars().take(120).collect();
+        let s = if args_json.len() > preview.len() {
+            "…"
+        } else {
+            ""
         };
-        state.name_run = Some((name.clone(), run_len));
-        if run_len >= MAX_CONSEC_SAME_NAME_CALLS && !state.stop_string_triggered {
-            tracing::warn!(
-                tool = %name,
-                run = run_len,
-                "Bug-2 name-run cap tripped: {run_len} successive `{name}` tool calls; ending response (F11 missed because args drift)"
-            );
-            state.stop_string_triggered = true;
-            state.tool_loop_capped = true;
-        }
-        if !state.stop_string_triggered {
-            // Successful streaming tool call — log + metric to match the
-            // blocking and complete-call paths.
-            let preview: String = args_json.chars().take(120).collect();
-            let s = if args_json.len() > preview.len() {
-                "…"
-            } else {
-                ""
-            };
-            tracing::info!("Tool call: {name}({preview}{s})");
-            crate::metrics::TOOL_CALLS_TOTAL.inc();
-        }
+        tracing::info!("Tool call: {name}({preview}{s})");
+        crate::metrics::TOOL_CALLS_TOTAL.inc();
     }
 }

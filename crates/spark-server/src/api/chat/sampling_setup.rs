@@ -64,8 +64,6 @@ pub(super) fn build_sampling(
     req: &ChatCompletionRequest,
     enable_thinking: bool,
     tools_active: bool,
-    suppress_tool_call: bool,
-    tool_call_repeat_count: usize,
 ) -> Result<SamplingSetup, Response> {
     // Preset selection.
     let preset = if tools_active {
@@ -170,7 +168,10 @@ pub(super) fn build_sampling(
     }
 
     // Logit bias from OpenAI (string keys) → Vec<(u32, f32)>.
-    let mut logit_bias: Vec<(u32, f32)> = if force_temp_zero {
+    // Client-supplied only — the server never injects its own bias
+    // (vLLM parity; the tool_call decay table and tool max_tokens cap
+    // were removed 2026-06-12).
+    let logit_bias: Vec<(u32, f32)> = if force_temp_zero {
         Vec::new()
     } else {
         req.logit_bias.as_ref().map_or(Vec::new(), |map| {
@@ -180,39 +181,7 @@ pub(super) fn build_sampling(
         })
     };
 
-    // Exponential `<tool_call>` bias decay. Skipped under ATLAS_FORCE_TEMP_ZERO
-    // so the argmax is determined purely by raw logits (matches vLLM's path).
-    if !force_temp_zero
-        && tools_active
-        && !suppress_tool_call
-        && let Some(tc_id) = state.tool_call_start_token_id
-    {
-        let bias = match tool_call_repeat_count {
-            0 | 1 => 3.0,
-            2 => 0.0,
-            3 => -5.0,
-            _ => -10.0,
-        };
-        if bias != 0.0 {
-            logit_bias.push((tc_id, bias));
-        }
-    }
-
-    // max_tokens cap when tools are active.
-    let max_tokens = if tools_active {
-        let capped = req.max_tokens.min(state.tool_max_tokens);
-        if capped < req.max_tokens {
-            tracing::info!(
-                "Tool max_tokens cap: {} → {} (tool_max_tokens={})",
-                req.max_tokens,
-                capped,
-                state.tool_max_tokens
-            );
-        }
-        capped
-    } else {
-        req.max_tokens
-    };
+    let max_tokens = req.max_tokens;
 
     // Stop tokens.
     let mut stop_tokens = tokenize_stop_sequences(&state.tokenizer, &req.stop);

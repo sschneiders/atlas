@@ -207,20 +207,6 @@ impl InferenceRequest {
         }
     }
 
-    /// Per-request override for the vLLM-anchored token-loop detector.
-    /// `None` = use the boot-global watchdog parameters.
-    pub fn repetition_detection(&self) -> Option<crate::openai::RepetitionDetectionParams> {
-        match self {
-            InferenceRequest::Blocking {
-                repetition_detection,
-                ..
-            } => *repetition_detection,
-            InferenceRequest::Streaming {
-                repetition_detection,
-                ..
-            } => *repetition_detection,
-        }
-    }
 
     /// Whether a tool call is required for this request.
     pub fn require_tool_call(&self) -> bool {
@@ -234,17 +220,6 @@ impl InferenceRequest {
         }
     }
 
-    /// Whether `<tool_call>` should be suppressed (loop detected).
-    pub fn suppress_tool_call(&self) -> bool {
-        match self {
-            InferenceRequest::Blocking {
-                suppress_tool_call, ..
-            } => *suppress_tool_call,
-            InferenceRequest::Streaming {
-                suppress_tool_call, ..
-            } => *suppress_tool_call,
-        }
-    }
 
     /// F60 (2026-04-27): whether MTP speculative decoding should be
     /// disabled for this request (set when tools are active and the

@@ -167,7 +167,6 @@ pub fn lower_responses_to_chat(
         enable_thinking: false,
         thinking: None,
         thinking_token_budget: None,
-        repetition_detection: None,
         reasoning: r.reasoning,
         chat_template_kwargs: None,
         tools,

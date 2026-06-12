@@ -205,19 +205,7 @@ pub(super) fn handle_done(
         response_tokens_per_second: tps,
     };
 
-    let fr = if state.tool_loop_capped {
-        // A tool-call loop guard (Bug-2 name-run cap, F11 within-dedup,
-        // F5 cross-flush dedup, or F44 perm-fail) forcibly ended the
-        // response. Signal "length" — OpenAI's slot for a truncated
-        // response — so agent clients can break their outer retry
-        // loop. Without this override the response otherwise looks like
-        // a normal "tool_calls" completion (tool calls *were* emitted)
-        // and agents (opencode, etc.) cheerfully run the tools and ask
-        // the model to continue, perpetuating the loop one round at a
-        // time.
-        "length"
-    } else if state.detector.as_ref().is_some_and(|d| d.has_tool_calls())
-        || state.salvaged_tool_call
+    let fr = if state.detector.as_ref().is_some_and(|d| d.has_tool_calls()) || state.salvaged_tool_call
     {
         "tool_calls"
     } else {
@@ -284,8 +272,6 @@ pub(super) fn handle_done(
             "has_tool_calls": has_tool_calls,
             "usage": usage_for_dump,
             "stop_string_triggered": state.stop_string_triggered,
-            "loop_watchdog_triggered": state.loop_watchdog_triggered,
-            "tool_loop_capped": state.tool_loop_capped,
             "_note": "Synthesized from post-sanitizer accumulators; \
                       per-chunk capture is a follow-up.",
         });

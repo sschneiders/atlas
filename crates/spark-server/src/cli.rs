@@ -293,13 +293,6 @@ pub struct ServeArgs {
     #[arg(long, value_name = "FORMAT")]
     pub tool_call_parser: Option<String>,
 
-    /// Maximum output tokens per tool-calling request. Caps max_tokens from the
-    /// client when tools are active to prevent unbounded generation if the model
-    /// doesn't emit a </tool_call> stop token. Must be high enough for Write
-    /// tool calls with large file content. Default 8192.
-    #[arg(long, default_value_t = 8192)]
-    pub tool_max_tokens: usize,
-
     /// Number of SSM state snapshot slots for Marconi prefix caching.
     /// Each slot stores SSM h_state + conv_state for all SSM layers,
     /// enabling full prefix skip (KV + SSM) on cache hits.

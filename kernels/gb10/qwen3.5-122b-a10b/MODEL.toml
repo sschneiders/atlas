@@ -66,18 +66,11 @@ repetition_penalty = 1.0  # 2026-06-06: 1.1->1.0, align with qwen3.6-35b 10/10 c
 dry_multiplier = 0.0      # 2026-06-06: 0.5->0.0, campaign temp=0 finding
 
 [behavior]
-# Content-loop watchdog disabled: 2026-05-05 chess-game stress sweep
-# showed Qwen3.5-122B-A10B EP=2 finishes naturally with EOS on long-code
-# prompts (33.3 t/s, finish=stop, zero loops). Only the dense Qwen 27B
-# variants need the watchdog.
-enable_loop_watchdog = false
 # Thinking on by default for all Qwen reasoning-tier models (sweep 2026-05-20).
 thinking_default = true
 # 2026-05-23 sweep: false → true. Project-wide default after Qwen3.6
 # Layer-A scanner and F1 removal landed.
 thinking_in_tools = true
-# 2026-05-23 sweep: 512 → 2048 (project-wide reasoning headroom bump).
-max_thinking_budget = 2048
 
 [[model_types]]
 model_type = "qwen3_5_moe"

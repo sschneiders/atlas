@@ -172,35 +172,15 @@ pub fn process_decode_logits(
         }
 
         // Spontaneous <think>: model generates <think> even when thinking
-        // was not requested. Enter thinking mode so EOS is suppressed and
-        // thinking content is stripped. Matches vLLM's behavior of always
-        // parsing <think>...</think> regardless of enable_thinking setting.
-        //
-        // F9+F10 (2026-04-26): the sample-time logit mask at line ~1716
-        // hard-blocks `<think>` when `think_ended=true`, so this branch
-        // should not fire after a watchdog has force-closed thinking.
-        // Defence-in-depth: if the model somehow still emits <think>
-        // (e.g. the start token differs from the masked one in edge
-        // cases), decay the budget by `>> watchdog_fires.min(4)` so
-        // each successive re-entry has a tighter window. After 4+
-        // fires, the budget is 1/16 of normal — the watchdog kills
-        // re-entry within a handful of tokens.
+        // was not requested. Enter thinking mode so the thinking content
+        // is stripped. Matches vLLM's behavior of always parsing
+        // <think>...</think> regardless of enable_thinking setting.
         if !a.inside_thinking && think_start_token == Some(tok) {
-            let decay_shift = a.think_watchdog_fires.min(4);
-            let decayed = a.spontaneous_think_budget >> decay_shift;
             a.inside_thinking = true;
             a.think_ended = false; // reset so </think> detection path works
             a.think_skip_count = 0;
-            a.thinking_budget = Some(decayed.max(8)); // floor to keep watchdog functional
-            if a.think_watchdog_fires > 0 {
-                tracing::debug!(
-                    fires = a.think_watchdog_fires,
-                    decayed_budget = decayed,
-                    "Spontaneous <think> re-entry after watchdog; decayed budget"
-                );
-            } else {
-                tracing::debug!("Spontaneous <think> detected, entering thinking mode");
-            }
+            a.thinking_budget = a.spontaneous_think_budget;
+            tracing::debug!("Spontaneous <think> detected, entering thinking mode");
             continue; // don't emit <think> as content
         }
 
@@ -230,13 +210,16 @@ pub fn process_decode_logits(
             gs.accept_token(tok);
         }
 
-        // Thinking tokens don't count toward remaining (thinking is "free").
+        // vLLM parity (2026-06-12): thinking tokens consume the generation
+        // budget like any other output token — `max_tokens` bounds the
+        // whole turn, reasoning included.
         if a.inside_thinking {
+            a.consume_generation_budget();
             if think_end_token == Some(tok) {
                 a.inside_thinking = false;
                 a.force_end_thinking = false;
                 a.sentence_defer_count = 0;
-                a.consecutive_confident = 0;
+
                 a.in_code_fence = false;
                 a.think_ended = true;
                 // One-shot: pin the next sampled token to the
@@ -268,27 +251,6 @@ pub fn process_decode_logits(
                          deferring up to {MAX_SENTENCE_DEFER_TOKENS} tokens for sentence boundary"
                     );
                 }
-                // Token-level fence-loop detection. Catches the Qwen3.5-35B
-                // phrase attractor (`Running:\`\`\`bash cmd\`\`\`Executing:…`
-                // cycling) within ~24-60 tokens of the loop starting,
-                // instead of waiting for the 256-token thinking budget.
-                if !crate::scheduler::helpers::disable_watchdogs()
-                    && !a.force_end_thinking
-                    && a.thinking_tokens >= THINK_LOOP_MIN_TOKENS
-                    && a.thinking_tokens.is_multiple_of(THINK_LOOP_CHECK_STRIDE)
-                    && detect_thinking_token_loop_with(&a.output_tokens, a.repetition_detection)
-                {
-                    a.force_end_thinking = true;
-                    a.sentence_defer_count = 0;
-                    a.think_watchdog_fires = a.think_watchdog_fires.saturating_add(1);
-                    tracing::warn!(
-                        thinking_tokens = a.thinking_tokens,
-                        watchdog_fires = a.think_watchdog_fires,
-                        "Thinking-loop watchdog fired (period-{}…{} repeat in tail); forcing </think> early",
-                        THINK_LOOP_PERIOD_MIN,
-                        THINK_LOOP_PERIOD_MAX,
-                    );
-                }
             }
         } else {
             // Content-phase token: budget bookkeeping + the content-loop
@@ -305,13 +267,6 @@ pub fn process_decode_logits(
         if a.require_tool_call && tool_call_start_token == Some(tok) && !a.inside_thinking {
             a.require_tool_call = false;
             a.tool_call_opened = true;
-        }
-        // F2 (2026-04-26): reset the inter-tool prose budget on
-        // every `<tool_call>` open. This keeps the budget scoped to
-        // "free-text since the last tool call started" rather than
-        // accumulating across the whole response.
-        if tool_call_start_token == Some(tok) && !a.inside_thinking {
-            a.prose_tokens_since_last_tool = 0;
         }
         // Safety: if require_tool_call is still set after 512 tokens, the model
         // isn't generating a tool call (grammar may have failed to compile).
@@ -392,64 +347,18 @@ pub fn process_decode_logits(
             continue;
         }
 
-        // EOS handling: grammar-based, legacy, or min_tokens.
-        // Grammar-based: grammar controls when EOS is allowed (is_terminated()).
-        // Legacy: require_tool_call suppresses EOS until <tool_call> is seen.
-        // min_tokens: suppress EOS until output_tokens.len() >= min_tokens.
-        // Fix A (2026-06-05, kill-switch): in tool_choice="auto" the grammar's
-        // is_terminated() never becomes true after a tool call, so EOS is
-        // suppressed forever — trapping the model into a hallucinated-transcript
-        // runaway. When enabled and a tool call has completed (and we're not
-        // inside a tool body / thinking), lift the grammar suppression so the
-        // model's natural EOS ends the turn. Inert unless ATLAS_TOOL_EOS_ESCAPE=1.
-        let eos_escape = tool_eos_escape_enabled()
-            && a.tool_call_completed
-            && !a.inside_tool_body
-            && !a.inside_thinking;
-        let grammar_suppresses_eos = a
-            .grammar_state
-            .as_ref()
-            .is_some_and(|gs| !gs.is_terminated())
-            && !eos_escape;
+        // EOS handling. vLLM parity (2026-06-12): a natural EOS always ends
+        // the turn except when the request explicitly requires a tool call
+        // that has not happened yet (`tool_choice="required"`/specific —
+        // vLLM also forces the call there) or while `min_tokens` is unmet
+        // (also a vLLM feature). The auto-mode grammar suppression, the
+        // EOS-escape kill-switch, the in-thinking suppression, and the
+        // POST_THINK_MIN_CONTENT guard were all removed — each had been
+        // observed forcing the model past its natural stop into template
+        // artefacts or hallucinated transcripts.
         let legacy_suppresses_eos = a.require_tool_call;
         let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
-        // Suppress EOS during thinking: <|im_end|> inside <think> is spurious.
-        // Only </think> (think_end_token) should end the thinking phase.
-        let thinking_suppresses_eos = a.inside_thinking;
-        // Post-thinking EOS guard. Empirically (dump fix22b 2026-04-25
-        // ses_23b4781f7ffebc7UgkKWedTmjd seq=43): when the thinking-loop
-        // watchdog force-closes `</think>` mid-narration, the model can
-        // emerge into content mode briefly (often emitting a bare
-        // `<write>\n\n` opener) and immediately sample EOS — the
-        // session ends with a partial tool-call shell but no real
-        // call. POST_THINK_MIN_CONTENT requires N non-thinking tokens
-        // after `think_ended` before EOS is allowed, giving the model
-        // room to actually open a `<tool_call>` block.
-        //
-        // 2026-05-24 narrowing (verified live against Qwen3.6-35B-A3B-FP8
-        // T1-T6 battery): the guard was firing UNCONDITIONALLY for every
-        // post-`</think>` response under 16 content tokens, including
-        // genuine short-answer turns ("2+2"→"4", "first 5 primes"
-        // →"2,3,5,7,11", "haiku featuring blue"→single line). The model
-        // had emitted a perfectly valid short answer + `<|im_end|>` —
-        // the guard then forced the model to keep generating, and it
-        // collapsed into chat-template artefacts (`\nuser\nassistant\n`)
-        // because there's no natural continuation. Scope the guard to
-        // tool-call-eligible turns: when tools are armed (require_tool_call
-        // OR `tools_active` per-seq) we keep the suppression; otherwise
-        // a short post-thinking answer is the expected output and EOS
-        // should fire normally. `min_tokens_suppresses` still enforces
-        // any explicit caller-set floor.
-        const POST_THINK_MIN_CONTENT: u32 = 16;
-        let post_think_content_tokens =
-            (a.output_tokens.len() as u32).saturating_sub(a.thinking_tokens);
-        let post_think_suppresses_eos =
-            a.think_ended && post_think_content_tokens < POST_THINK_MIN_CONTENT;
-        let suppress_eos = grammar_suppresses_eos
-            || legacy_suppresses_eos
-            || min_tokens_suppresses
-            || thinking_suppresses_eos
-            || post_think_suppresses_eos;
+        let suppress_eos = legacy_suppresses_eos || min_tokens_suppresses;
 
         if a.eos_tokens.contains(&tok) && !suppress_eos {
             // Stop/EOS token: do NOT stream to client (OpenAI spec: returned text
@@ -471,20 +380,9 @@ pub fn process_decode_logits(
             // leaving every dependent gate (close-tag mask, AM1, B1,
             // A1) silently dead under `mtp=false`.
             crate::scheduler::emit_step::update_tool_param_state(a, tok);
-            // Phase-C: if this committed token is a content-phase
-            // boundary token (sentence end / newline) and the model is
-            // hybrid (attention + SSM), snapshot the recurrent SSM
-            // state now so a later watchdog rollback to this boundary
-            // can also rewind h_state/conv_state — not just the KV
-            // cache. Gated to content tokens because the watchdogs that
-            // roll back all fire post-`</think>`, and `apply_rollback`
-            // requires every dropped token to be a content token. No-op
-            // for pure-attention models / disabled rings (see
-            // `rollback::snapshot_boundary_if_ssm`).
+            // #155 iter3: block-aligned Marconi checkpoint on the
+            // non-MTP decode path (live SSM state is canonical here).
             if !a.inside_thinking {
-                rollback::snapshot_boundary_if_ssm(a, model);
-                // #155 iter3: block-aligned Marconi checkpoint on the
-                // non-MTP decode path (live SSM state is canonical here).
                 model.decode_marconi_checkpoint(&mut a.seq);
             }
             // OPENCODE FIX: when the model spontaneously emits `<think>` even
@@ -542,58 +440,6 @@ pub fn process_decode_logits(
                 .is_some_and(|gs| gs.is_terminated())
             {
                 a.finished = true;
-            }
-
-            // Intra-response fuzzy repetition detection: if the last 2*W tokens
-            // approximately match the same W-token pattern, the model is looping.
-            // Uses Hamming distance with ~12% tolerance to catch loops where the
-            // model narrates the same plan with slight wording variations.
-            // Skip during tool calls: XML parameter tags have natural repetition
-            // (<parameter=..>...</parameter>) that triggers false positives.
-            // Use last occurrence positions — completed tool calls shouldn't
-            // disable the detector for subsequent text generation.
-            let last_tc_start = a
-                .tool_call_start_token
-                .and_then(|t| a.output_tokens.iter().rposition(|&tok| tok == t));
-            let last_tc_end = a
-                .tool_call_end_token
-                .and_then(|t| a.output_tokens.iter().rposition(|&tok| tok == t));
-            let inside_tool_call = match (last_tc_start, last_tc_end) {
-                (Some(start), Some(end)) => start > end,
-                (Some(_), None) => true,
-                _ => false,
-            };
-            if enable_loop_watchdog()
-                && !a.finished
-                && !a.inside_thinking
-                && !inside_tool_call
-                && let Some((pattern_len, mis_a, mis_b)) = detect_fuzzy_repetition(&a.output_tokens)
-            {
-                // Phase-C: roll back past the repeated window and
-                // re-steer. `min_keep` = pattern_len * 3 guarantees all
-                // three near-copies of the detected pattern are dropped
-                // so generation cannot resume straight back into the
-                // loop. Falls back to the hard stop when declined.
-                let min_keep = pattern_len * 3;
-                match rollback_to_boundary(a, min_keep, model) {
-                    RollbackOutcome::RolledBack { dropped } => {
-                        tracing::warn!(
-                            pattern_len,
-                            mismatches = mis_a + mis_b,
-                            dropped,
-                            rollback = a.rollback_count,
-                            "Fuzzy repetition detected; rolled back to boundary, re-steering"
-                        );
-                    }
-                    RollbackOutcome::Fallback(reason) => {
-                        tracing::warn!(
-                            "Fuzzy repetition: {pattern_len}-tok pattern x3 ({mis_a}+{mis_b} \
-                             mismatches), stopping at {} tokens (rollback declined: {reason:?})",
-                            a.output_tokens.len()
-                        );
-                        a.finished = true;
-                    }
-                }
             }
 
             // Check request timeout.

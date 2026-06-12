@@ -70,7 +70,6 @@ top_k = 20
 [behavior]
 thinking_default = true
 thinking_in_tools = false
-max_thinking_budget = 2048
 
 [[model_types]]
 model_type = "step3p7"

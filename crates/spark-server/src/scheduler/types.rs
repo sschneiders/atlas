@@ -15,7 +15,6 @@ use spark_model::traits::SequenceState;
 
 use crate::api::{InferenceRequest, InferenceResponse, StreamEvent};
 use crate::grammar::GrammarState;
-use crate::openai::RepetitionDetectionParams;
 
 /// Shared queue between receiver thread and scheduler.
 pub(super) struct PendingQueue {
@@ -63,19 +62,14 @@ pub(super) struct PrefillInProgress {
     pub logit_bias: Vec<(u32, f32)>,
     pub enable_thinking: bool,
     pub thinking_budget: Option<u32>,
-    /// Per-request override for the vLLM-anchored token-loop detector.
-    /// Propagated to `ActiveSeq` on promotion. `None` = use the
-    /// boot-global watchdog parameters.
-    pub repetition_detection: Option<RepetitionDetectionParams>,
     /// Per-server spontaneous-thinking budget (from MODEL.toml
     /// `[behavior].max_thinking_budget`). When the model emits a
     /// `<think>` token without the request having explicitly enabled
     /// thinking, this caps how many thinking tokens it can produce
     /// before `</think>` is force-emitted. Replaces a previous
     /// hard-coded 512-token fallback.
-    pub spontaneous_think_budget: u32,
+    pub spontaneous_think_budget: Option<u32>,
     pub require_tool_call: bool,
-    pub suppress_tool_call: bool,
     /// F60 (2026-04-27): MTP-disable flag (propagated to ActiveSeq).
     pub disable_mtp: bool,
     pub grammar_state: Option<GrammarState>,
@@ -126,13 +120,9 @@ pub(super) struct ActiveSeq {
     pub enable_thinking: bool,
     /// Max thinking tokens before forcing `</think>`. None = unlimited.
     pub thinking_budget: Option<u32>,
-    /// Per-request override for the vLLM-anchored token-loop detector
-    /// (content-loop + thinking-loop). `None` = use the boot-global
-    /// watchdog parameters. Mirrors vLLM's `RepetitionDetectionParams`.
-    pub repetition_detection: Option<RepetitionDetectionParams>,
     /// Per-server spontaneous-thinking budget (from MODEL.toml
     /// `[behavior].max_thinking_budget`).
-    pub spontaneous_think_budget: u32,
+    pub spontaneous_think_budget: Option<u32>,
     /// Number of thinking tokens generated so far (counted while inside_thinking).
     pub thinking_tokens: u32,
     /// When true, the next decode step must produce the `</think>` token.
@@ -146,8 +136,6 @@ pub(super) struct ActiveSeq {
     /// past that the caller computes `hard_override = true` and
     /// `should_inject_think_end` fires unconditionally.
     pub sentence_defer_count: u32,
-    /// Consecutive tokens where top-1 softmax prob >= 0.95 (for confidence early stop).
-    pub consecutive_confident: u32,
     /// True while the model is inside an unclosed ``` code fence within
     /// the current thinking block. Toggled on each sampled code-fence
     /// token. The F2 confidence early-stop is suppressed while this is
@@ -189,17 +177,6 @@ pub(super) struct ActiveSeq {
     /// Fix A (2026-06-05): true once a complete `</tool_call>` has been emitted;
     /// gates the EOS-escape (helpers::tool_eos_escape_enabled).
     pub tool_call_completed: bool,
-    /// Consecutive tokens emitted while `inside_tool_body=true`. When
-    /// this exceeds `MAX_TOOL_BODY_TOKENS` (emit_step.rs), the response
-    /// is force-ended: the model has emitted a `<tool_call>` opener but
-    /// never reached a matching close — observed live 2026-05-24 on
-    /// NVFP4 Qwen3.6 (opencode-nvfp4.jsonl seq=15: 8221 tokens, all
-    /// suppressed by sanitizer as unclosed tool-call envelope, hit
-    /// max_tokens=8192). 1024 tokens is enough headroom for legitimate
-    /// long tool-call bodies (large `content` field on a `write` call)
-    /// while bounding worst-case wasted decode at ~15s @ 65 tok/s.
-    /// Resets to 0 on tool_call_end emission.
-    pub tool_body_streak_tokens: u32,
     /// Tier-1 (Epoch 1) sampler byte counter: True between the model
     /// emitting `<parameter=KEY>` and the matching `</parameter>` close.
     /// While true AND `param_body_chars_emitted == 0`, decode_logits_seq.rs
@@ -217,31 +194,10 @@ pub(super) struct ActiveSeq {
     /// Increments by 1 per token while inside; used as the mask-gate.
     pub param_body_chars_emitted: u32,
     /// When true, `<tool_call>` token logit is set to -inf during decode.
-    pub suppress_tool_call: bool,
     /// F60 (2026-04-27): when true, MTP speculative decoding is bypassed.
     pub disable_mtp: bool,
     /// True after the first non-thinking content token has been generated.
     pub content_started: bool,
-    /// Number of content tokens emitted post-`</think>`.
-    pub content_tokens: u32,
-    /// Free-text tokens emitted since the last `<tool_call>` opened.
-    pub prose_tokens_since_last_tool: u32,
-    /// F10 (2026-04-26): how many times the thinking-loop watchdog has fired.
-    pub think_watchdog_fires: u32,
-    /// Phase-C: how many times a degeneration watchdog has rolled this
-    /// sequence back to a boundary and re-steered. Capped at
-    /// [`atlas_kernels::ROLLBACK_RESTEER_CAP`]; once the cap is hit the
-    /// watchdog reverts to a hard stop. See
-    /// [`super::rollback::rollback_to_boundary`].
-    pub rollback_count: u32,
-    /// Phase-C: decode-time SSM-snapshot ring for hybrid (attention +
-    /// Mamba/SSM) models. Records a bounded set of SSM `h_state` +
-    /// `conv_state` snapshots taken at boundary tokens so a watchdog
-    /// rollback can restore the recurrent state — not just the KV
-    /// cache — to the chosen boundary. Disabled (`capacity == 0`,
-    /// every op a no-op) for pure-attention models. See
-    /// [`super::ssm_decode_ring::SsmDecodeRing`].
-    pub ssm_rollback_ring: super::ssm_decode_ring::SsmDecodeRing,
     /// Grammar state for constrained decoding (tool_choice="required").
     pub grammar_state: Option<GrammarState>,
     /// MTP draft tokens awaiting verification.
@@ -333,14 +289,10 @@ pub(super) struct SwappedSeq {
     pub inside_thinking: bool,
     pub enable_thinking: bool,
     pub thinking_budget: Option<u32>,
-    /// Per-request override for the vLLM-anchored token-loop detector,
-    /// preserved across snapshot/restore.
-    pub repetition_detection: Option<RepetitionDetectionParams>,
-    pub spontaneous_think_budget: u32,
+    pub spontaneous_think_budget: Option<u32>,
     pub thinking_tokens: u32,
     pub force_end_thinking: bool,
     pub sentence_defer_count: u32,
-    pub consecutive_confident: u32,
     pub in_code_fence: bool,
     pub think_end_token: Option<u32>,
     pub think_start_token: Option<u32>,
@@ -352,15 +304,9 @@ pub(super) struct SwappedSeq {
     /// snapshot/restore (the grammar state itself is not serializable, so
     /// this is the only signal that a resumed sequence was tool-active).
     pub tool_request: bool,
-    pub suppress_tool_call: bool,
     /// F60 (2026-04-27): MTP-disable flag preserved across snapshot/restore.
     pub disable_mtp: bool,
     pub content_started: bool,
-    pub content_tokens: u32,
-    pub prose_tokens_since_last_tool: u32,
-    pub think_watchdog_fires: u32,
-    /// Phase-C: watchdog rollback counter, preserved across snapshot/restore.
-    pub rollback_count: u32,
     pub tool_call_start_token: Option<u32>,
     pub tool_call_opened: bool,
     pub tool_call_end_token: Option<u32>,

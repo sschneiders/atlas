@@ -67,7 +67,6 @@ pub(super) fn promote_completed_prefills(
             think_start_token,
             tool_call_start_token,
             tool_call_end_token,
-            model.decode_rollback_ring_slots(),
         );
         if immediate_finish {
             finish_sequence(model, &mut a);
@@ -94,8 +93,6 @@ fn build_active_seq_from_prefill(
     think_start_token: Option<u32>,
     tool_call_start_token: Option<u32>,
     tool_call_end_token: Option<u32>,
-    // Phase-C decode-rollback ring capacity (`model.decode_rollback_ring_slots()`).
-    ssm_ring_capacity: usize,
 ) -> ActiveSeq {
     let temperature = p.temperature;
     // F4: sticky tool-request flag — grammar attached OR legacy tool path.
@@ -143,17 +140,15 @@ fn build_active_seq_from_prefill(
         },
         enable_thinking: p.enable_thinking,
         thinking_budget: if !immediate_finish && spontaneous_think {
-            Some(p.spontaneous_think_budget)
+            p.spontaneous_think_budget
         } else {
             p.thinking_budget
         },
-        repetition_detection: p.repetition_detection,
         spontaneous_think_budget: p.spontaneous_think_budget,
         thinking_tokens: 0,
         cached_prompt_tokens: cached_prompt_tok,
         force_end_thinking: false,
         sentence_defer_count: 0,
-        consecutive_confident: 0,
         in_code_fence: false,
         think_end_token,
         think_start_token,
@@ -173,17 +168,10 @@ fn build_active_seq_from_prefill(
         tool_call_opened: false,
         inside_tool_body: false,
         tool_call_completed: false,
-        tool_body_streak_tokens: 0,
         inside_parameter_body: false,
         param_body_chars_emitted: 0,
-        suppress_tool_call: p.suppress_tool_call,
         disable_mtp: p.disable_mtp,
         content_started: false,
-        content_tokens: 0,
-        prose_tokens_since_last_tool: 0,
-        think_watchdog_fires: 0,
-        rollback_count: 0,
-        ssm_rollback_ring: SsmDecodeRing::new(ssm_ring_capacity),
         tool_call_end_token,
         grammar_state: p.grammar_state,
         last_token_time: now,

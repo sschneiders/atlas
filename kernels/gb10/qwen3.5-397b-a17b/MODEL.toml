@@ -103,10 +103,6 @@ frequency_penalty = 0.0
 # itself into wrong answers. Clients opt in per-request via thinking_token_budget.
 thinking_default = false
 thinking_in_tools = false
-max_thinking_budget = 128
-# A10B/A17B-class MoE finishes cleanly on long prompts (no period-N loops);
-# the content-loop watchdog is only needed on the dense Qwen 27B variants.
-enable_loop_watchdog = false
 # MTP is a confirmed dead end on the NVFP4 397B (2026-05-22): excellent
 # acceptance (80-97%) but accepted throughput collapses to 4-5 tok/s vs
 # ~19 tok/s without. NVFP4 checkpoint ships no MTP head weights → no drafts.

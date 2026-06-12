@@ -17,7 +17,7 @@ pub fn start_chunked_prefill(
     prefill_stream: u64,
     prefill_event: u64,
     grammar_engine: &mut Option<GrammarEngine>,
-    spontaneous_think_budget: u32,
+    spontaneous_think_budget: Option<u32>,
 ) -> Result<StartPrefillResult> {
     // Merge user-supplied stop tokens with model EOS tokens.
     let stop_tokens = req.take_stop_tokens();
@@ -48,12 +48,10 @@ pub fn start_chunked_prefill(
     let req_session_hash = req.session_hash();
     let req_enable_thinking = req.enable_thinking();
     let req_thinking_budget = req.thinking_budget();
-    let req_repetition_detection = req.repetition_detection();
     if req_enable_thinking {
         tracing::info!("Thinking enabled, budget={:?}", req_thinking_budget);
     }
     let req_require_tool_call = req.require_tool_call();
-    let req_suppress_tool_call = req.suppress_tool_call();
     let req_disable_mtp = req.disable_mtp();
     let req_seed = req.seed();
     let req_top_logprobs = req.top_logprobs();
@@ -271,13 +269,11 @@ pub fn start_chunked_prefill(
                 inside_thinking: req_enable_thinking && think_end_token.is_some(),
                 enable_thinking: req_enable_thinking,
                 thinking_budget: req_thinking_budget,
-                repetition_detection: req_repetition_detection,
                 spontaneous_think_budget,
                 thinking_tokens: 0,
                 cached_prompt_tokens: cached_prompt_tok,
                 force_end_thinking: false,
                 sentence_defer_count: 0,
-                consecutive_confident: 0,
                 in_code_fence: false,
                 think_end_token,
                 think_start_token,
@@ -290,17 +286,10 @@ pub fn start_chunked_prefill(
                 tool_call_opened: false,
                 inside_tool_body: false,
                 tool_call_completed: false,
-                tool_body_streak_tokens: 0,
                 inside_parameter_body: false,
                 param_body_chars_emitted: 0,
-                suppress_tool_call: req_suppress_tool_call,
                 disable_mtp: req_disable_mtp,
                 content_started: false,
-                content_tokens: 0,
-                prose_tokens_since_last_tool: 0,
-                think_watchdog_fires: 0,
-                rollback_count: 0,
-                ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
                 tool_call_end_token,
                 grammar_state,
                 last_token_time: now,
@@ -350,17 +339,15 @@ pub fn start_chunked_prefill(
                     || (req_enable_thinking && think_end_token.is_some()),
                 enable_thinking: req_enable_thinking,
                 thinking_budget: if spontaneous_think {
-                    Some(spontaneous_think_budget)
+                    spontaneous_think_budget
                 } else {
                     req_thinking_budget
                 },
-                repetition_detection: req_repetition_detection,
                 spontaneous_think_budget,
                 thinking_tokens: 0,
                 cached_prompt_tokens: cached_prompt_tok,
                 force_end_thinking: false,
                 sentence_defer_count: 0,
-                consecutive_confident: 0,
                 in_code_fence: false,
                 think_end_token,
                 think_start_token,
@@ -377,17 +364,10 @@ pub fn start_chunked_prefill(
                 tool_call_opened: false,
                 inside_tool_body: false,
                 tool_call_completed: false,
-                tool_body_streak_tokens: 0,
                 inside_parameter_body: false,
                 param_body_chars_emitted: 0,
-                suppress_tool_call: req_suppress_tool_call,
                 disable_mtp: req_disable_mtp,
                 content_started: false,
-                content_tokens: 0,
-                prose_tokens_since_last_tool: 0,
-                think_watchdog_fires: 0,
-                rollback_count: 0,
-                ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
                 tool_call_end_token,
                 grammar_state,
                 last_token_time: now,
@@ -432,10 +412,8 @@ pub fn start_chunked_prefill(
             logit_bias,
             enable_thinking: req_enable_thinking,
             thinking_budget: req_thinking_budget,
-            repetition_detection: req_repetition_detection,
             spontaneous_think_budget,
             require_tool_call: req_require_tool_call,
-            suppress_tool_call: req_suppress_tool_call,
             disable_mtp: req_disable_mtp,
             grammar_state,
             seed: req_seed,

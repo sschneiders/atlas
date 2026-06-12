@@ -132,20 +132,10 @@ pub(super) struct ParsedBehavior {
     pub default_num_drafts: u32,
     pub disable_tool_steering: bool,
     pub tool_call_parser: String,
-    pub enable_loop_watchdog: bool,
     pub min_p_floor: f32,
     pub temperature_max: f32,
-    pub think_loop_min_repeats: u32,
-    pub think_loop_scan_window: u32,
-    pub confidence_early_stop: bool,
-    pub confidence_run_length: u32,
-    pub fuzzy_repeat_tolerance_div: u32,
-    pub max_inter_tool_prose: u32,
-    pub max_post_think_content_tokens: u32,
     pub tscg: bool,
     pub disable_tool_grammar: bool,
-    pub rollback_resteer: bool,
-    pub rom_head: String,
     pub tool_retry: bool,
 }
 
@@ -153,27 +143,17 @@ impl Default for ParsedBehavior {
     fn default() -> Self {
         Self {
             thinking_in_tools: true,
-            max_thinking_budget: 256,
+            max_thinking_budget: 0,
             thinking_default: false,
             fp8_kv_calibration_tokens: 0,
             default_kv_dtype: String::new(),
             default_num_drafts: 0,
             disable_tool_steering: false,
             tool_call_parser: String::new(),
-            enable_loop_watchdog: false,
             min_p_floor: 0.0,
             temperature_max: 0.0,
-            think_loop_min_repeats: 3,
-            think_loop_scan_window: 160,
-            confidence_early_stop: true,
-            confidence_run_length: 30,
-            fuzzy_repeat_tolerance_div: 12,
-            max_inter_tool_prose: 384,
-            max_post_think_content_tokens: 100_000,
             tscg: false,
             disable_tool_grammar: false,
-            rollback_resteer: true,
-            rom_head: String::new(),
             tool_retry: true,
         }
     }
@@ -200,7 +180,7 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.get("max_thinking_budget"))
         .and_then(|v| v.as_integer())
         .map(|v| v as u32)
-        .unwrap_or(256);
+        .unwrap_or(0);
     let thinking_default = b
         .and_then(|v| v.get("thinking_default"))
         .and_then(|v| v.as_bool())
@@ -229,10 +209,6 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let enable_loop_watchdog = b
-        .and_then(|v| v.get("enable_loop_watchdog"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
     // Server-side sampling safety floor/ceiling (0.0 = disabled). See
     // ModelBehavior::{min_p_floor,temperature_max} for rationale.
     let min_p_floor = b
@@ -243,40 +219,6 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.get("temperature_max"))
         .and_then(|v| v.as_float())
         .unwrap_or(0.0) as f32;
-    let think_loop_min_repeats = b
-        .and_then(|v| v.get("think_loop_min_repeats"))
-        .and_then(|v| v.as_integer())
-        .map(|v| v as u32)
-        .unwrap_or(3);
-    let think_loop_scan_window = b
-        .and_then(|v| v.get("think_loop_scan_window"))
-        .and_then(|v| v.as_integer())
-        .map(|v| v as u32)
-        .unwrap_or(160);
-    let confidence_early_stop = b
-        .and_then(|v| v.get("confidence_early_stop"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    let confidence_run_length = b
-        .and_then(|v| v.get("confidence_run_length"))
-        .and_then(|v| v.as_integer())
-        .map(|v| v as u32)
-        .unwrap_or(30);
-    let fuzzy_repeat_tolerance_div = b
-        .and_then(|v| v.get("fuzzy_repeat_tolerance_div"))
-        .and_then(|v| v.as_integer())
-        .map(|v| v as u32)
-        .unwrap_or(12);
-    let max_inter_tool_prose = b
-        .and_then(|v| v.get("max_inter_tool_prose"))
-        .and_then(|v| v.as_integer())
-        .map(|v| v as u32)
-        .unwrap_or(384);
-    let max_post_think_content_tokens = b
-        .and_then(|v| v.get("max_post_think_content_tokens"))
-        .and_then(|v| v.as_integer())
-        .map(|v| v as u32)
-        .unwrap_or(100_000);
     let tscg = b
         .and_then(|v| v.get("tscg"))
         .and_then(|v| v.as_bool())
@@ -285,15 +227,6 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.get("disable_tool_grammar"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let rollback_resteer = b
-        .and_then(|v| v.get("rollback_resteer"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    let rom_head = b
-        .and_then(|v| v.get("rom_head"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
     let tool_retry = b
         .and_then(|v| v.get("tool_retry"))
         .and_then(|v| v.as_bool())
@@ -307,20 +240,10 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         default_num_drafts,
         disable_tool_steering,
         tool_call_parser,
-        enable_loop_watchdog,
         min_p_floor,
         temperature_max,
-        think_loop_min_repeats,
-        think_loop_scan_window,
-        confidence_early_stop,
-        confidence_run_length,
-        fuzzy_repeat_tolerance_div,
-        max_inter_tool_prose,
-        max_post_think_content_tokens,
         tscg,
         disable_tool_grammar,
-        rollback_resteer,
-        rom_head,
         tool_retry,
     }
 }

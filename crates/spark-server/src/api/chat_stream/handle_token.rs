@@ -14,7 +14,6 @@ use crate::openai::ChatCompletionChunk;
 use crate::tool_parser;
 
 use super::super::sanitizer::sanitize_content_chunk;
-use super::super::stream_guards::{bump_f12_tool_call_count, check_loop_watchdog};
 use super::ctx::StreamCtx;
 use super::state::StreamState;
 use super::strip::{
@@ -27,59 +26,10 @@ use super::tool_handlers::{
 
 type SseVec = Vec<Result<Event, std::convert::Infallible>>;
 
-/// Maximum consecutive tokens the stream may spend with
-/// `state.suppressing_param_leak == true` (sanitizer holding content
-/// because of an orphan `<parameter=` / `<tool_call>` opener without
-/// a matching close). When the model degenerates into a doom-loop of
-/// partial-envelope leakage — observed 2026-05-24 on
-/// opencode-hotfix.jsonl seq=10: 8192 tokens emitted after Atlas
-/// rejected a `write({})` call, all suppressed by the sanitizer, no
-/// content-loop watchdog fire (the period exceeded 64) — this
-/// threshold ends the stream cleanly instead of burning to
-/// `max_tokens=8192`. 256 tokens is enough headroom for legitimately
-/// long tool-call bodies that take many tokens to close (long
-/// `content` field on a `write` call) while bounding worst-case
-/// wasted decode at ~10s @ 30 tok/s.
-const MAX_SUPPRESS_STREAK_TOKENS: u32 = 256;
-
 /// Process one token. Returns the SSE events to forward to the
 /// client (empty `Vec` is valid).
-///
-/// Thin wrapper around [`handle_token_inner`] that runs the
-/// orphan-suppression streak watchdog after every token regardless
-/// of which early-return branch fired in the body. The watchdog
-/// can't live inside `handle_token_inner` because that function has
-/// many early returns (one per emission path) — putting the check
-/// at the end of the body would only fire when the natural fall-
-/// through is taken, leaving the doom-loop case (long suppressed
-/// stream of orphan `<tool_call>` openers) uncaught.
 pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> SseVec {
-    let result = handle_token_inner(state, ctx, tok);
-
-    // Orphan-suppression streak watchdog. The sanitizer flips
-    // `suppressing_param_leak=true` when it sees an orphan
-    // `<tool_call>` / `<parameter=` opener without a matching close.
-    // Suppressing forever (until max_tokens) burns the user's
-    // patience and decode budget — observed live as an 8192-token
-    // doom loop. If the streak exceeds the bound, end the stream.
-    if state.suppressing_param_leak && !state.stop_string_triggered {
-        state.suppress_streak_tokens = state.suppress_streak_tokens.saturating_add(1);
-        if state.suppress_streak_tokens > MAX_SUPPRESS_STREAK_TOKENS {
-            tracing::warn!(
-                streak = state.suppress_streak_tokens,
-                "orphan tool-call suppression streak exceeded {MAX_SUPPRESS_STREAK_TOKENS} tokens; ending stream",
-            );
-            state.loop_watchdog_triggered = true;
-            state.stop_string_triggered = true;
-            state
-                .cancel_flag
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-    } else if !state.suppressing_param_leak {
-        state.suppress_streak_tokens = 0;
-    }
-
-    result
+    handle_token_inner(state, ctx, tok)
 }
 
 fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> SseVec {
@@ -153,16 +103,6 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
         }
         // Still in thinking — accumulate but don't emit as content
         if ctx.enable_thinking {
-            // Layer-A one-shot guard: after the in-think tool-call leak
-            // scanner has fired, suppress all subsequent reasoning
-            // deltas for this stream. The scheduler's `cancel_flag`
-            // (set when the scanner fired) finalises the sequence
-            // within one token via `emit_step::emit_token`; this
-            // guard catches the in-flight token race so the next
-            // opener never reaches the client.
-            if state.reasoning_xml_leak_detected {
-                return sse_events;
-            }
             // Open thinking: emit as reasoning_content
             let full = ctx
                 .state
@@ -221,60 +161,6 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
                     }
                 }
                 maybe_log_decode_trace(&raw, &cleaned, full.len(), stable_end - raw.len());
-                // Layer-A in-think tool-call leak scanner. The per-
-                // delta strippers above can miss boundary splits
-                // (e.g. `<too` in delta N + `l_call>` in delta N+1)
-                // and even when they strip, the model keeps emitting
-                // the next repetition because its own KV already
-                // contains the literal opener. This sliding-window
-                // detector across deltas catches the opener on
-                // arrival, drops the delta, sets the loop-cap flag
-                // (→ finish_reason="length" via the PR #87 override)
-                // and flips the scheduler cancel_flag so generation
-                // terminates within one token via PR #89.
-                let tools_active_request =
-                    !ctx.tool_defs_for_backfill.is_empty() || state.detector.is_some();
-                if tools_active_request {
-                    state.reasoning_xml_scan_buf.push_str(&cleaned);
-                    if state.reasoning_xml_scan_buf.len() > 256 {
-                        let drop_to = state.reasoning_xml_scan_buf.len() - 256;
-                        let cut = state
-                            .reasoning_xml_scan_buf
-                            .char_indices()
-                            .find(|&(i, _)| i >= drop_to)
-                            .map(|(i, _)| i)
-                            .unwrap_or(state.reasoning_xml_scan_buf.len());
-                        state.reasoning_xml_scan_buf.drain(..cut);
-                    }
-                    let opener = ["<tool_call>", "<function=", "<parameter=", "<invoke "]
-                        .iter()
-                        .copied()
-                        .find(|m| state.reasoning_xml_scan_buf.contains(m));
-                    if let Some(op) = opener {
-                        state.reasoning_xml_leak_detected = true;
-                        state.tool_loop_capped = true;
-                        state.stop_string_triggered = true;
-                        state
-                            .cancel_flag
-                            .store(true, std::sync::atomic::Ordering::Release);
-                        let tail_start = state
-                            .reasoning_xml_scan_buf
-                            .char_indices()
-                            .rev()
-                            .nth(63)
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                        let tail = &state.reasoning_xml_scan_buf[tail_start..];
-                        tracing::warn!(
-                            model = %ctx.model,
-                            request_id = %ctx.id,
-                            opener = op,
-                            tail = %tail,
-                            "in-think tool-call leak detected; cancelling sequence (finish_reason will be \"length\")"
-                        );
-                        return sse_events;
-                    }
-                }
                 // F19: final structured sanitisation pass catches
                 // any leak markers the hand-rolled cleanups missed.
                 let cleaned = sanitize_content_chunk(
@@ -471,10 +357,11 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Sse
     sse_events
 }
 
-/// Common processing for a sanitized content chunk: SimHash semantic
-/// guard, token-level loop watchdog, salvage on trip, otherwise
-/// emit a `content_chunk`. Returns `Some(events)` when the watchdog
-/// fired (caller must short-circuit), else `None` (caller continues).
+/// Common processing for a sanitized content chunk: emit a
+/// `content_chunk`. Returns `Some(events)` when there is output,
+/// else `None` (caller continues). The SimHash semantic guard and
+/// token-level loop watchdog that used to run here were removed
+/// 2026-06-12 for vLLM parity.
 ///
 /// Note: when called from the detector-active branch, `sanitized`
 /// has already been routed through `sanitize_content_chunk`. When
@@ -485,63 +372,7 @@ fn process_detector_content(
     ctx: &StreamCtx,
     sanitized_or_raw: &str,
 ) -> Option<SseVec> {
-    // From the detector-active branch the input is the Content(text)
-    // payload that still needs sanitization. From the no-detector
-    // branch the input is already sanitized. Distinguish via a thin
-    // wrapper: detector branch ALSO sanitizes; non-detector branch
-    // skips by passing the already-sanitized text. To keep the call
-    // site simple, we sanitize here only when the input contains the
-    // hallmark of an unfiltered Content payload — which we can't
-    // reliably detect. Solution: split into two paths.
-    //
-    // Inlining: this helper is only called once per branch with the
-    // correct input type; it never re-sanitizes. The parameter is the
-    // post-sanitizer text in both call sites.
     let sanitized = sanitized_or_raw;
-
-    // F4 SimHash guard.
-    let semantic_trip = if !state.loop_watchdog_triggered {
-        state.simhash_pending.push_str(sanitized);
-        let mut dup = false;
-        if crate::loop_simhash::ends_at_sentence_boundary(&state.simhash_pending).is_some()
-            || state.simhash_pending.len() >= 1024
-        {
-            dup = state.simhash_guard.check(&state.simhash_pending);
-            state.simhash_pending.clear();
-        }
-        if state.simhash_pending.len() > 4096 {
-            let drop_to = state.simhash_pending.len() / 2;
-            state.simhash_pending.drain(..drop_to);
-        }
-        dup
-    } else {
-        false
-    };
-
-    let token_trip = check_loop_watchdog(
-        sanitized,
-        &mut state.loop_scan_buf,
-        state.loop_watchdog_triggered,
-    );
-
-    if semantic_trip || token_trip {
-        if semantic_trip {
-            tracing::warn!(
-                ring_len = state.simhash_guard.len(),
-                "SimHash semantic-loop watchdog fired (paraphrased sentence repeat)"
-            );
-        }
-        state.loop_watchdog_triggered = true;
-        state.stop_string_triggered = true;
-        state
-            .cancel_flag
-            .store(true, std::sync::atomic::Ordering::Release);
-
-        // Watchdog fired: short-circuit the stream with no further
-        // content. The model emitted a degenerate loop; we end the
-        // response here rather than salvaging a synthetic tool call.
-        return Some(SseVec::new());
-    }
 
     if !sanitized.is_empty() {
         if state.refusal_scan_buf.len() < 16_384 {

@@ -87,44 +87,15 @@ pub(crate) fn resolve_tokenizer_runtime(
         .ok()
         .and_then(|ids| if ids.len() == 1 { Some(ids[0]) } else { None });
     if let Some(fid) = code_fence_token {
-        tracing::info!("Code-fence token: {} (``` — F2 fence guard active)", fid);
+        tracing::info!("Code-fence token: {} (``` — think-end fence defer active)", fid);
     }
 
-    // Digit-normalized content-loop watchdog mask (Qwen3.6-27B greedy
-    // template degeneration: `- B(46) = N\n- B(47) = M\n …` to the cap).
-    // `mask[id] == true` iff the token decodes to a pure ASCII-digit run
-    // with at most one leading space. `decode_with_special` drives the
-    // byte-level decoder so a leading space is ' ' (NOT the raw `Ġ` BPE
-    // marker that `id_to_token` would yield). Built unconditionally
-    // (cheap, model-agnostic, one-time); only *consumed* under the
-    // per-model `enable_loop_watchdog()` gate. Fail-open: any decode
-    // error leaves that id `false`.
-    {
-        let vocab_size = tokenizer.inner().get_vocab_size(true);
-        let mut mask: Vec<bool> = vec![false; vocab_size];
-        let mut numeric_count = 0usize;
-        for (id, slot) in mask.iter_mut().enumerate() {
-            if let Ok(s) = tokenizer.decode_with_special(&[id as u32]) {
-                let body = s.strip_prefix(' ').unwrap_or(&s);
-                if !body.is_empty() && body.bytes().all(|b| b.is_ascii_digit()) {
-                    *slot = true;
-                    numeric_count += 1;
-                }
-            }
-        }
-        crate::scheduler::set_numeric_token_mask(std::sync::Arc::from(mask));
-        tracing::info!(
-            "Numeric-token mask: {numeric_count}/{vocab_size} ids classified \
-             as digit-runs (digit-normalized content-loop path active)"
-        );
-    }
-
-    // Phase-C boundary-token mask (drives rollback-to-boundary). `mask[id]`
-    // is true iff the token decodes to text *ending* in a well-formed
-    // generation boundary: a newline, or sentence-ending punctuation
-    // (`.`/`!`/`?`) optionally trailed by a closing quote / bracket /
-    // whitespace. Built unconditionally (cheap, model-agnostic, one-time);
-    // consumed only when a watchdog fires under `rollback_resteer`.
+    // Boundary-token mask (drives the forced-`</think>` sentence-boundary
+    // deferral for client/CLI thinking budgets). `mask[id]` is true iff
+    // the token decodes to text *ending* in a well-formed generation
+    // boundary: a newline, or sentence-ending punctuation (`.`/`!`/`?`)
+    // optionally trailed by a closing quote / bracket / whitespace.
+    // Built unconditionally (cheap, model-agnostic, one-time).
     // Fail-open: any decode error leaves that id `false`.
     {
         let vocab_size = tokenizer.inner().get_vocab_size(true);
@@ -152,7 +123,7 @@ pub(crate) fn resolve_tokenizer_runtime(
         crate::scheduler::set_boundary_token_mask(std::sync::Arc::from(mask));
         tracing::info!(
             "Boundary-token mask: {boundary_count}/{vocab_size} ids end in a \
-             newline / sentence boundary (Phase-C rollback-to-boundary active)"
+             newline / sentence boundary (forced-</think> deferral active)"
         );
     }
 

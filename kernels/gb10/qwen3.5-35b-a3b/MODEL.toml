@@ -136,12 +136,6 @@ dry_allowed_length = 4
 # compensate for model quirks. Defaults are sane for most models; override
 # here when a model family has known failure modes.
 [behavior]
-# Content-loop watchdog disabled: 2026-05-05 chess-game stress
-# sweep showed this MoE A3B variant finishes cleanly on long-code
-# prompts (no period-N repetition observed). The watchdog also
-# false-positives on legitimate `[null × 8]` chess-board init rows.
-# Only the dense Qwen 27B variants need it.
-enable_loop_watchdog = false
 # Thinking on by default for all Qwen reasoning-tier models (sweep 2026-05-20).
 thinking_default = true
 # 2026-05-23 sweep: false → true. Project-wide default flipped after F1
@@ -151,12 +145,6 @@ thinking_default = true
 # distribution so the fix likely transfers; revert here per-model if
 # Think-Satisfy re-emerges in practice.
 thinking_in_tools = true
-# 2026-05-23 sweep: 256 → 2048. F54 lowered to 256 to avoid the long-
-# thinking BPE state corruption observed in opencode-fix36; that
-# corruption was traced to the same XML-leak path F1 was masking, now
-# fixed by the F1 deletion in Qwen3.6 work. Raise back to the project-
-# wide reasoning headroom default.
-max_thinking_budget = 2048
 # Default num_drafts for speculative decoding (K = num_drafts + 1).
 # Benchmarked 2026-04-10 on GB10: K=2 (1 draft) yields 117.8 tok/s vs
 # K=3 (2 drafts) at 82.4 tok/s — 43% faster. The MoE verify overhead

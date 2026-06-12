@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Unit tests for `confidence.rs` (F2 confidence-run + code-fence
-//! pure helpers). Split out of `helpers_tests.rs` when the F2 helpers
-//! moved to `confidence.rs` to keep both files ≤500 LoC. Logical child
-//! of `confidence` via `#[path]`; `use super::*` resolves to
-//! `confidence.rs` items.
+//! Unit tests for `confidence.rs` (code-fence parity + safe-boundary
+//! `</think>` injection gate). Logical child of `confidence` via
+//! `#[path]`; `use super::*` resolves to `confidence.rs` items.
 
 use super::*;
 
-// ── Code-fence guard for the F2 confidence early-stop ──────────────
-// Regression coverage for the 2026-05-17 thinkbrake bug: the model
-// drafting a ```python block inside <think> produced 30+ consecutive
-// ≥0.95 tokens, tripping F2 and force-injecting </think> mid-line.
+// ── Code-fence parity guard ─────────────────────────────────────────
 
 const FENCE: u32 = 71093; // Qwen3.x atomic ``` token
 
@@ -37,51 +32,6 @@ fn fence_unchanged_by_non_fence_token() {
 fn fence_guard_disabled_when_no_fence_token() {
     // Tokenizer split ``` → guard inert, never enters a fence.
     assert!(!toggle_code_fence(false, FENCE, None));
-}
-
-#[test]
-fn f2_arms_after_confidence_run_limit_tokens() {
-    // Pure accumulator: CONFIDENCE_RUN_LIMIT consecutive confident
-    // tokens arm the brake. Constant raised from 30 → 60 in the
-    // 2026-05-23 sweep — the assertion tracks the constant, so this
-    // test remains stable across future tuning.
-    let mut run = 0;
-    let mut fired = false;
-    for _ in 0..CONFIDENCE_RUN_LIMIT {
-        let (next, fire) = confidence_run_step(true, run);
-        run = next;
-        fired |= fire;
-    }
-    assert_eq!(run, CONFIDENCE_RUN_LIMIT);
-    assert!(
-        fired,
-        "CONFIDENCE_RUN_LIMIT consecutive confident tokens must arm F2"
-    );
-}
-
-#[test]
-fn f2_run_breaks_on_non_confident_token() {
-    let (run, fire) = confidence_run_step(false, 25);
-    assert_eq!(run, 0);
-    assert!(!fire);
-}
-
-#[test]
-fn f2_accumulates_inside_code_too() {
-    // Detection runs everywhere — code is finite and must still be
-    // brakeable. (Mid-statement safety is the *injection* gate's job,
-    // see `defer_*` tests below — NOT suppression of detection.)
-    // Pre-CONFIDENCE_RUN_LIMIT step: run advances, fire stays false.
-    let (run, fire) = confidence_run_step(true, CONFIDENCE_RUN_LIMIT - 2);
-    assert_eq!(run, CONFIDENCE_RUN_LIMIT - 1);
-    assert!(!fire);
-    // At-limit step: run hits the cap and fire flips true.
-    let (run, fire) = confidence_run_step(true, CONFIDENCE_RUN_LIMIT - 1);
-    assert_eq!(run, CONFIDENCE_RUN_LIMIT);
-    assert!(
-        fire,
-        "F2 arms even inside a fence; injection is what defers"
-    );
 }
 
 // ── should_inject_think_end: the safe-boundary defer gate ─────────

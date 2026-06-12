@@ -103,12 +103,6 @@ repetition_penalty = 1.1
 dry_multiplier = 0.5
 
 [behavior]
-# Content-loop watchdog enabled: dense Qwen3.6-27B has a known
-# prose-attractor failure mode (2026-04-26 field reports) and the
-# 2026-05-05 chess-game stress sweep confirmed it loops on long-code
-# prompts (CSS block repetition at 13.3 t/s for ~3990 tokens). MoE
-# A3B/A10B variants in the family don't need it.
-enable_loop_watchdog = true
 # Thinking on by default: dense Qwen3.6-27B is a reasoning model and
 # clients (Open WebUI etc.) send plain requests with no enable_thinking
 # flag. Without this the chat template injects an empty
@@ -117,8 +111,6 @@ enable_loop_watchdog = true
 thinking_default = true
 # 2026-05-23 sweep: false → true (project-wide default after F1 removal).
 thinking_in_tools = true
-# 2026-05-23 sweep: 512 → 2048 (project-wide reasoning headroom bump).
-max_thinking_budget = 2048
 default_num_drafts = 1
 
 # Upstream Qwen/Qwen3.6-27B reports `model_type = "qwen3_5"` in config.json.

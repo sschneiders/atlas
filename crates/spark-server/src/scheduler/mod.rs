@@ -31,11 +31,8 @@ mod phase_promote_prefills;
 mod phase_start_prefills;
 mod prefill_a_step;
 mod prefill_b_step;
-mod repetition;
-mod rollback;
 mod sample_step;
 mod spec_step;
-mod ssm_decode_ring;
 mod types;
 mod verify_dflash_step;
 mod verify_k2_step;
@@ -49,16 +46,11 @@ use decode_logits_seq::*;
 use decode_logits_step::*;
 use decode_step::*;
 use emit_step::*;
-pub use helpers::disable_watchdogs;
 pub use helpers::set_boundary_token_mask;
-pub use helpers::set_enable_loop_watchdog;
 pub use helpers::set_im_start_hard_stop;
 pub use helpers::set_mid_word_token_mask;
-pub use helpers::set_numeric_token_mask;
 pub use helpers::set_tool_response_hard_stop;
 use helpers::*;
-pub use helpers::{CONTENT_LOOP_PERIOD_MAX, CONTENT_LOOP_PERIOD_MIN};
-pub use helpers::{WatchdogParams, set_watchdog_params};
 use lifecycle::*;
 use logprobs::*;
 use mod_helpers::*;
@@ -67,11 +59,8 @@ use phase_continue_prefills::continue_in_progress_prefills;
 use phase_start_prefills::start_new_requests;
 use prefill_a_step::*;
 use prefill_b_step::*;
-use repetition::*;
-use rollback::{RollbackOutcome, rollback_to_boundary};
 use sample_step::*;
 use spec_step::*;
-use ssm_decode_ring::SsmDecodeRing;
 use types::*;
 use verify_dflash_step::*;
 use verify_k2_step::*;
@@ -127,7 +116,7 @@ pub fn run(
     mut grammar_engine: Option<GrammarEngine>,
     adaptive_sampling: bool,
     mut session_manager: crate::session_manager::SessionSsmManager,
-    spontaneous_think_budget: u32,
+    spontaneous_think_budget: Option<u32>,
 ) {
     model
         .bind_gpu_to_thread()
@@ -326,7 +315,6 @@ pub fn run(
             } else if use_mtp
                 && active.len() == 1
                 && !active[0].inside_thinking
-                && !active[0].suppress_tool_call
                 && !active[0].disable_mtp
             {
                 // MTP speculative decode: beneficial at all context lengths.

@@ -164,65 +164,11 @@ pub(crate) fn log_behavior_audit(args: &cli::ServeArgs, ptx_set: &atlas_kernels:
         },
         ptx_set.behavior.thinking_default,
     );
-    crate::scheduler::set_enable_loop_watchdog(ptx_set.behavior.enable_loop_watchdog);
-    if ptx_set.behavior.enable_loop_watchdog {
-        tracing::info!(
-            "Model behavior: content-loop watchdog ENABLED (period-{}…{} repetition detector)",
-            crate::scheduler::CONTENT_LOOP_PERIOD_MIN,
-            crate::scheduler::CONTENT_LOOP_PERIOD_MAX,
-        );
-    }
-    // 2026-05-24: ATLAS_DISABLE_WATCHDOGS env var disables ALL
-    // auto-watchdogs (content-loop, inter-tool prose, F2 confidence,
-    // mid-word </think>, thinking-loop). Empirical test toggle —
-    // surface its state prominently at boot.
-    if crate::scheduler::disable_watchdogs() {
-        tracing::warn!(
-            "Model behavior: ALL auto-watchdogs DISABLED via ATLAS_DISABLE_WATCHDOGS=1 \
-             (content-loop, inter-tool prose, F2 confidence early-stop, mid-word </think> \
-             defer, thinking-loop). User-set max_thinking_budget and safety masks unaffected. \
-             Use only for empirical-test runs — re-enable for production."
-        );
-    }
-    // Phase-A: per-model watchdog tunables from MODEL.toml [behavior].
+    // Watchdog wiring removed 2026-06-12 (vLLM parity): the loop
+    // detectors, prose budgets, content caps, F2 confidence early-stop,
+    // and rollback/re-steer machinery no longer exist — a turn ends only
+    // on EOS, client stop strings, max_tokens, or tool-call end.
     let b = &ptx_set.behavior;
-    crate::scheduler::set_watchdog_params(crate::scheduler::WatchdogParams {
-        think_loop_min_repeats: b.think_loop_min_repeats as usize,
-        think_loop_scan_window: b.think_loop_scan_window as usize,
-        confidence_early_stop: b.confidence_early_stop,
-        confidence_run_length: b.confidence_run_length,
-        fuzzy_repeat_tolerance_div: b.fuzzy_repeat_tolerance_div as usize,
-        max_inter_tool_prose: b.max_inter_tool_prose,
-        max_post_think_content_tokens: b.max_post_think_content_tokens,
-        rollback_resteer: b.rollback_resteer,
-    });
-    if !b.confidence_early_stop {
-        tracing::info!("Model behavior: F2 confidence early-stop DISABLED");
-    }
-    // Phase-C: watchdog rollback + re-steer (arXiv:2603.27905).
-    if b.rollback_resteer {
-        tracing::info!(
-            "Model behavior: watchdog rollback+re-steer ENABLED (cap {} per sequence)",
-            atlas_kernels::ROLLBACK_RESTEER_CAP,
-        );
-    } else {
-        tracing::info!("Model behavior: watchdog rollback+re-steer DISABLED (legacy hard-stop)");
-    }
-    // Phase-C ROM (arXiv:2603.22016) scaffold. A trained repetition-onset
-    // detection head can be dropped in via MODEL.toml [behavior].rom_head;
-    // the runtime would load the artifact and call `set_rom_head`. No
-    // trained head ships with Atlas, so when `rom_head` is empty (the
-    // default) the F2 confidence heuristic stays as the fallback —
-    // unchanged. Loading the artifact is intentionally a future step:
-    // only the optional hook (the `RomHead` trait seam) is wired now.
-    if !b.rom_head.is_empty() {
-        tracing::warn!(
-            rom_head = b.rom_head,
-            "Model behavior: [behavior].rom_head is set but ROM artifact \
-             loading is not yet implemented — F2 confidence heuristic \
-             remains the active detector (Phase-C scaffold only)"
-        );
-    }
     // Phase-B: TSCG tool-schema compilation (MODEL.toml [behavior].tscg).
     crate::tscg::set_tscg_enabled(b.tscg);
     if b.tscg {

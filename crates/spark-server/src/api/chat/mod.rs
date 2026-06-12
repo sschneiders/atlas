@@ -12,8 +12,6 @@
 //! - `msg_entry`      — `MsgEntry` + `build_msg_entries` (req →
 //!                      tokenisable shape, image preprocessing,
 //!                      cwd extraction)
-//! - `loop_detect`    — generic loop / spinning detection +
-//!                      task-pin re-anchor
 //! - `thinking`       — `(enable_thinking, thinking_budget)`
 //!                      resolution
 //! - `template`       — JSON-message build, auto-compact,
@@ -22,7 +20,6 @@
 //! - `sampling_setup` — preset / penalty / stop-token / grammar /
 //!                      timeout / logprobs resolution
 
-mod loop_detect;
 mod msg_entry;
 mod sampling_setup;
 mod template;
@@ -157,12 +154,6 @@ pub(crate) async fn chat_completions_inner(
     // ── Phase 2: thinking resolution (pre-template) ─────────────
     let (enable_thinking, thinking_budget) = thinking::resolve_thinking(&state, &req, tools_active);
 
-    // ── Phase 4: generic loop / spinning detection + task pin ───
-    let loop_detect::LoopDetectOut {
-        suppress_tool_call,
-        tool_call_repeat_count,
-    } = loop_detect::check_loops(&req, tools_active);
-
     // ── Phase 5: render Jinja template + image-pad expansion ────
     let template::TemplateOut {
         prompt_tokens,
@@ -224,8 +215,6 @@ pub(crate) async fn chat_completions_inner(
         &req,
         enable_thinking,
         tools_active,
-        suppress_tool_call,
-        tool_call_repeat_count,
     ) {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -259,7 +248,6 @@ pub(crate) async fn chat_completions_inner(
             thinking_budget,
             tools_active,
             tool_choice_required,
-            suppress_tool_call,
             cwd_hint.clone(),
             stop_tokens,
             grammar_spec.clone(),
@@ -296,7 +284,6 @@ pub(crate) async fn chat_completions_inner(
         thinking_budget,
         tools_active,
         tool_choice_required,
-        suppress_tool_call,
         grammar_spec,
         top_logprobs,
         timeout_at,

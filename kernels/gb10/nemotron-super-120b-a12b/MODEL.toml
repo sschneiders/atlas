@@ -49,11 +49,6 @@ repetition_penalty = 1.0  # 2026-06-06: 1.1->1.0; NVIDIA ships penalty-free — 
 dry_multiplier = 0.0      # 2026-06-06: 0.5->0.0; no vendor DRY. Re-gate; targeted dry on tools only if loop reappears
 
 [behavior]
-# 2026-06-06: ENABLE the content-loop watchdog. After removing the rep_pen=1.1/dry=0.5 band-aid
-# (vendor ships penalty-free), single-GPU coherence showed a temp=0 "READY\nREADY\n..." repetition
-# loop. The watchdog (period-N detect + rollback to a clean boundary) is the PROPER loop mechanism
-# vs the rep_pen band-aid that mangles greedy argmax. Same lever that recovered qwen3-next.
-enable_loop_watchdog = true
 # 2026-05-23 sweep: false → true. Project-wide default flipped to true.
 # NOTE: Super specifically had a pass-30 regression where thinking-during-
 # tools degraded bare_json output. If that returns in practice, flip
@@ -76,12 +71,6 @@ disable_tool_steering = true
 # (prevents hallucinated field names like "tool" instead of "name").
 # Nano-30B keeps the qwen3_coder default since it was trained on that format.
 tool_call_parser = "bare_json"
-# Nemotron-Super rambles deep in its thinking trace — pass-8 showed 256
-# wasn't enough for the Reasoning test ("Actually they'd ask..." leaked
-# because </think> was forced before a conclusion landed). 1024 gives
-# enough headroom for the full chain-of-thought on non-trivial questions
-# while still reserving budget headroom at typical max_tokens=1024-2048.
-max_thinking_budget = 2048
 # Nemotron-Super is a thinking-first model — it is TRAINED to produce a
 # <think>...</think> reasoning trace before the answer. Forcing
 # `enable_thinking=false` in the generation prompt prematurely closes the

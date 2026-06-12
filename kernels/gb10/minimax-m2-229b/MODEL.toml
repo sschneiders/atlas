@@ -101,8 +101,6 @@ dry_multiplier = 0.5
 # project-wide default. Existing MiniMax-M2 "spontaneous-thinking phase"
 # behavior is unchanged because thinking_default stays false.
 thinking_in_tools = true
-# 2026-05-23 sweep: 1024 → 2048 (project-wide reasoning headroom bump).
-max_thinking_budget = 2048
 thinking_default = false
 
 [[model_types]]

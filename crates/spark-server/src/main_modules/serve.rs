@@ -518,13 +518,15 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     let session_manager = session_manager::SessionSsmManager::new(600); // 10 min TTL
     // Spontaneous-thinking budget: when the model emits `<think>` without
     // the request having explicitly enabled thinking, this caps how many
-    // thinking tokens are allowed before `</think>` is force-emitted. CLI
-    // override beats MODEL.toml. Used by the scheduler in place of a
-    // previous hard-coded 512 fallback so MODEL.toml can right-size the
-    // cap per architecture.
-    let scheduler_spontaneous_think_budget = args
+    // thinking tokens are allowed before `</think>` is force-emitted.
+    // CLI override beats MODEL.toml; 0 / unset = no budget (vLLM parity:
+    // thinking counts toward max_tokens, which is the only bound).
+    let scheduler_spontaneous_think_budget: Option<u32> = args
         .max_thinking_budget
-        .unwrap_or(ptx_set.behavior.max_thinking_budget);
+        .or(match ptx_set.behavior.max_thinking_budget {
+            0 => None,
+            b => Some(b),
+        });
     std::thread::spawn(move || {
         scheduler::run(
             scheduler_model,
@@ -579,7 +581,6 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         reasoning_parser: reasoning_parser_box,
         think_end_token_id: think_end_token,
         think_start_token_id: think_start_token,
-        tool_max_tokens: args.tool_max_tokens,
         sampling_presets,
         tool_call_start_token_id: tool_call_start_token,
         auto_compact_threshold: args.auto_compact,

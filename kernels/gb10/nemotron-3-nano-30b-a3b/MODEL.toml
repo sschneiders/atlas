@@ -59,11 +59,6 @@ dry_multiplier = 0.0      # 2026-06-06: 0.5->0.0; no vendor DRY. Re-gate; if loo
 # disabling. If Nemotron-H Nano's Think-Satisfy reappears in practice,
 # re-disable per-model here; see project_qwen36_thinking_fix.md.
 thinking_in_tools = true
-# Bumped 256 → 1024 in pass-17: fib prompt's reasoning trace needs room to
-# complete (before bump, model hit budget mid-step and force-end-thinking
-# fired with the model still mid-reasoning, causing prose to spill into the
-# post-</think> content slot and break code extraction).
-max_thinking_budget = 2048
 # Nemotron-H Nano is a thinking-first model: it is trained to produce a
 # <think>...</think> reasoning trace before the final answer. Default to
 # thinking enabled so the server's reasoning parser (`deepseek_r1` style,
