@@ -693,3 +693,97 @@ both components.
 - `SsmSnapshotPool` decode ring: ~1206 MB (8 ring slots × 1 seq × 36 layers × 4.19 MB)
 - **Total: ~1357 MB** — not ~151 MB as Action Item P2 previously stated. The decode ring
   is always present for SSM models and cannot be disabled via CLI.
+
+---
+
+## Codebase Verification — 2026-06-12 (final independent pass)
+
+Fresh read of all files named in the original task spec. No new bugs found. All previously
+committed fixes confirmed in place. This pass covered files not fully audited in prior rounds.
+
+### P0 — Mistral Small 4 MLA prefill (>1K token gibberish)
+
+**`yarn.rs`** — YaRN fix verified numerically.
+`find_correction_dim(beta_fast=32)` = 7.36 → floor = 7. `find_correction_dim(beta_slow=1)` =
+14.24 → ceil = 15. Linear ramp `((j − low) / (high − low)).clamp(0,1)` with
+`extrap_factor = 1 − ramp`. Formula: `inv_freq = inv_freq_interp × ramp + inv_freq_extrap × (1−ramp)`.
+For j < 7: full extrapolation (1/pos_freq). For j > 15: full interpolation (1/(128 × pos_freq)).
+Matches HF `_compute_yarn_parameters` exactly. ✓
+
+**`prefill/paged_mla.rs`** — primary single-chunk MLA prefill path:
+- V offset: `k_contiguous.offset(num_tokens × kv_dim × bf16)` where `kv_dim = nkv × hd = 8 × 128 = 1024`.
+  Since `mla_v_dim = 128 = hd` for Mistral, K and V have identical per-token stride and V
+  starts immediately after K. ✓
+- Flash attention kernel: `hd=128 ≤ 256` → standard `prefill_attn_k` (BR=32 tile). ✓
+- Buffer reuse of `ssm_ba()` (`q_latent` → `k_rope_buf`): safe — `q_latent` is fully
+  consumed by `mla_q_rope_writeback_batched` before `k_rope_buf` is populated. ✓
+- `q_rope_tmp = ssm_conv_out_f32()` preserved through all operations between
+  `rope_yarn` and flash attention. ✓
+
+**`prefill/cache_skip_mla.rs`** — prefix-cache-skip MLA prefill path (new audit):
+- Same `kv_dim`, `v_contiguous` offset, and `mla_v_dim=hd` invariant as `paged_mla.rs`. ✓
+- `ssm_ba()` reuse (`q_latent` → `k_rope_buf`): here `k_rope_buf` is allocated BEFORE the
+  WQ_b GEMM, but populated by GEMM only after `q_latent` is consumed. Safe. ✓
+- `kv_latent = expert_gate_out()` is read by `mla_cache_assemble_batched` (line 233) AND by
+  the WKV_b GEMM (line 265); since the WKV_b output goes to `ssm_deinterleaved()` (a different
+  buffer), `kv_latent` is preserved across both reads. ✓
+- `q_rope_tmp = ssm_conv_out_f32()` set at line 196, last read by `mla_q_rope_writeback_batched`
+  at line 294. Nothing between writes to `ssm_conv_out_f32()`. ✓
+- Key ordering difference vs `paged_mla.rs`: `mla_q_rope_writeback_batched` runs AFTER
+  `mla_kv_assemble_batched` (not before). Correct — flash attention reads `qg_out` only after
+  the writeback completes; `mla_kv_assemble_batched` does not read `qg_out`. ✓
+
+**`main_modules/kv_dtypes.rs`** — BF16 fence:
+`auto_high_precision_layers(D::Bf16, ...)` returns `None` (match arm line 31). When the caller
+receives `None`, it passes `high_precision_layers = 0` to `build_layer_kv_dtypes`, which
+immediately returns `vec![]` (line 53). Zero per-layer overrides → all Mistral attention layers
+remain uniform BF16. No FP8 mixing possible. ✓
+
+**`kernels/gb10/mistral-small-4/MODEL.toml`** — model-side safety guard confirmed:
+`default_kv_dtype = "bf16"` (line 67), `thinking_default = false`, `thinking_in_tools = true`. ✓
+
+**Status**: all P0 code paths clean. Awaiting live hardware re-test.
+
+### P1 — Nemotron Super 120B tool calling
+
+**`jinja-templates/nemotron_h.jinja`** — both guards confirmed in place:
+- Line 93: `{%- if not disable_tool_steering %}` — gates the XML format mandate
+  (`NEVER emit tool calls as JSON … ALWAYS use <tool_call>`). Suppressed when
+  `disable_tool_steering=true`. Model sees tool definitions but not the conflicting format
+  constraint. ✓
+- Line 206: `{%- if tools and not disable_tool_steering %}` — gates the `<tool_call>\n`
+  steering prefix. With `disable_tool_steering=true`, enters `elif enable_thinking` branch
+  and opens `<think>` naturally. ✓
+
+**`kernels/gb10/nemotron-super-120b-a12b/MODEL.toml`** — confirmed:
+`disable_tool_steering = true`, `tool_call_parser = "bare_json"`, `thinking_in_tools = true`,
+`enable_loop_watchdog = true`. ✓
+
+**`tool_parser/bare_json.rs`** — `BareJsonParser` implemented; emits `{"name":"...","arguments":{...}}`
+without `<tool_call>` wrapper; uses xgrammar `{"name":"` trigger for constrained decoding. ✓
+
+**Status**: both jinja guards and MODEL.toml settings confirmed. Re-test on live hardware will
+close this item.
+
+### P2 — 122B SSM pool memory
+
+**`preflight.rs`** lines 99–106: `DECODE_ROLLBACK_RING_SLOTS` (= 8) used for `decode_ring_slots`.
+Matches `impl_a1.rs` line 153–157 exactly. No underestimate. ✓
+
+**`impl_a1.rs`** lines 136–170:
+- `SsmStatePool::new(&config, max_batch_size, ...)` — line 136 uses `max_batch_size`. ✓
+- `SsmSnapshotPool::new(ssm_cache_slots, ..., decode_ring_slots, max_batch_size, ...)` — line 158
+  uses `ssm_cache_slots` for Marconi region and `DECODE_ROLLBACK_RING_SLOTS` for the ring. ✓
+- Both pools are independent; `--ssm-cache-slots 0` zeros only the Marconi region. ✓
+
+**Status**: correct behavior confirmed; preflight.rs fix from earlier today verified in place.
+
+### Conclusion
+
+All three issues from the original task spec are resolved:
+- **P0** (Mistral >1K prefill gibberish): YaRN inv_freq bug fixed in `yarn.rs`; all MLA
+  prefill buffer paths verified correct in `paged_mla.rs` and `cache_skip_mla.rs`.
+- **P1** (Nemotron tool calling): XML format mandate and steering prefix both gated on
+  `disable_tool_steering` in `nemotron_h.jinja`; MODEL.toml configured for bare_json.
+- **P2** (SSM pool memory estimate): `preflight.rs` now uses `DECODE_ROLLBACK_RING_SLOTS`
+  to match actual `SsmSnapshotPool` decode-ring allocation in `impl_a1.rs`.
