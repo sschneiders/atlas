@@ -199,14 +199,16 @@ sudo docker run -d --name atlas-nemotron --gpus all --ipc=host --network host \
    jinja template.
    **Re-test needed**: Re-run the 2/2 tool call suite against a fresh build.
 
-3. **[P2] 122B SSM pool memory — DOCUMENTED (no code change needed)**:
-   `--ssm-cache-slots 0` controls `SsmSnapshotPool` (prefix-cache SSM state snapshots).
-   The 1206 MB "SSM state pool" is `SsmStatePool` — pre-allocated GPU memory for the active
-   SSM recurrent states of all in-flight sequences. It is sized by `--max-batch-size` (default 8):
-   `8 slots × 36 SSM layers × h_bytes_per_layer ≈ 1206 MB`. This is correct behavior.
-   **To reduce**: pass `--max-batch-size 1` for single-user serving (reduces to ~151 MB).
-   The two allocations are independent; `--ssm-cache-slots 0 --max-batch-size 1` gives
-   minimum SSM footprint (~151 MB total), recovering ~1055 MB for the KV cache.
+3. **[P2] 122B SSM pool memory — BUG FIXED (2026-06-12)**:
+   Two allocations observed: `SsmStatePool` (active decode states, `--max-batch-size`) and
+   `SsmSnapshotPool` decode ring (Phase-C rollback, always present for SSM models).
+   `--ssm-cache-slots 0` only zeroes the Marconi prefix-cache region of `SsmSnapshotPool`.
+   **Bug fixed**: `preflight.rs` used `ROLLBACK_RESTEER_CAP+1=3` instead of
+   `DECODE_ROLLBACK_RING_SLOTS=8` for the decode ring estimate, causing a ~6 GB underestimate
+   of `inference_reserve` and an oversized KV cache budget on Qwen3.5-122B. Fixed in
+   `crates/spark-server/src/main_modules/serve_phases/preflight.rs`.
+   **Corrected minimum SSM footprint** (`--ssm-cache-slots 0 --max-batch-size 1`):
+   ~1357 MB total (151 MB `SsmStatePool` + 1206 MB decode ring), not ~151 MB as previously noted.
 
 4. **[P2] Nemotron long context — ARCHITECTURAL LIMIT**: SSM state saturation at >8K tokens
    is inherent to Mamba-2 recurrent architectures (fixed-size hidden state). No fix possible.
@@ -643,3 +645,51 @@ for padding). Default `--max-batch-size 8` → 9 × 36 SSM layers × `h_bytes` �
 Non-optional for any model with SSM layers. ✓
 
 **Status**: P2 correct behavior, no code change needed.
+
+---
+
+## Codebase Verification — 2026-06-12
+
+### P0 (Mistral MLA prefill) — no new issues
+
+All previously-verified paths confirmed clean. No changes.
+
+### P1 (Nemotron tool calling) — no new issues
+
+Confirmed `disable_tool_steering = true`, `tool_call_parser = "bare_json"`,
+`thinking_in_tools = true` in MODEL.toml (was briefly documented as `false`; the 2026-05-23
+project-wide sweep flipped it to `true`, already reflected in MODEL.toml).
+`BareJsonParser` fully implemented in `crates/spark-server/src/tool_parser/bare_json.rs`. ✓
+
+### P2 (122B SSM pool) — BUG FOUND AND FIXED
+
+**Root cause**: `crates/spark-server/src/main_modules/serve_phases/preflight.rs` (line 97)
+computed `decode_ring_slots` using:
+```rust
+(atlas_kernels::ROLLBACK_RESTEER_CAP as usize) + 1  // = 3
+```
+but `crates/spark-model/src/model/impl_a1.rs` (line 154) allocates the actual
+`SsmSnapshotPool` decode ring using:
+```rust
+atlas_kernels::DECODE_ROLLBACK_RING_SLOTS  // = 8
+```
+These constants are intentionally different (`ROLLBACK_RESTEER_CAP` bounds re-steer attempts;
+`DECODE_ROLLBACK_RING_SLOTS` retains enough boundary snapshots for rollback — see
+`atlas_kernels/src/lib.rs`). The comment "Mirrors `SsmSnapshotPool::new`" pointed to the
+wrong constant.
+
+**Memory impact** (Qwen3.5-122B, default max_batch_size=8, 36 GDN layers, ~4.19 MB/layer):
+- Preflight estimated decode ring: `3 × 8 × 36 × 4.19 MB = 3621 MB`
+- Actual decode ring allocation: `8 × 8 × 36 × 4.19 MB = 9651 MB`
+- Underestimate: **~6.0 GB** → KV cache budget was ~6 GB larger than available,
+  allowing OOM past preflight on memory-constrained GPUs.
+
+**Fix applied**: `preflight.rs` now uses `atlas_kernels::DECODE_ROLLBACK_RING_SLOTS`.
+Debug log updated to report `{N} marconi_slots + {R}ring×{S}seqs decode_ring` for
+both components.
+
+**Corrected minimum SSM footprint** (`--ssm-cache-slots 0 --max-batch-size 1`, Qwen3.5-122B):
+- `SsmStatePool`: ~151 MB (1 active slot × 36 layers × 4.19 MB)
+- `SsmSnapshotPool` decode ring: ~1206 MB (8 ring slots × 1 seq × 36 layers × 4.19 MB)
+- **Total: ~1357 MB** — not ~151 MB as Action Item P2 previously stated. The decode ring
+  is always present for SSM models and cannot be disabled via CLI.

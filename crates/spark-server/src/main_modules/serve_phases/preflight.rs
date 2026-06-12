@@ -91,10 +91,13 @@ pub(crate) fn preflight_reserve(
     .total_bytes();
     // SSM snapshot pool = Marconi prefix-cache region + Phase-C
     // decode-rollback ring. The decode ring is sized per active
-    // sequence (`ROLLBACK_RESTEER_CAP + 1` slots × `max_batch_size`),
-    // and only allocated for SSM models. Mirrors `SsmSnapshotPool::new`.
+    // sequence (`DECODE_ROLLBACK_RING_SLOTS` slots × `max_batch_size`),
+    // and only allocated for SSM models. Must use DECODE_ROLLBACK_RING_SLOTS
+    // here (not ROLLBACK_RESTEER_CAP+1) to match SsmSnapshotPool::new in
+    // impl_a1.rs — the ring is larger than the resteer cap so a clean
+    // pre-loop boundary survives long enough for rollback.
     let decode_ring_slots = if config.num_ssm_layers() > 0 {
-        (atlas_kernels::ROLLBACK_RESTEER_CAP as usize) + 1
+        atlas_kernels::DECODE_ROLLBACK_RING_SLOTS
     } else {
         0
     };
@@ -176,7 +179,7 @@ pub(crate) fn preflight_reserve(
     tracing::debug!(
         "Preflight reserve breakdown: \
          ssm_pool={} MB ({}× max_batch × {} ssm_layers × (h+conv)), \
-         ssm_snapshot={} MB ({} slots), \
+         ssm_snapshot={} MB ({} marconi_slots + {}ring×{}seqs decode_ring), \
          gdn_two_phase={} MB ({} tokens), \
          cuda_headroom={} MB ({}), \
          spec_on={}, num_drafts={}",
@@ -185,6 +188,8 @@ pub(crate) fn preflight_reserve(
         config.num_ssm_layers(),
         ssm_snapshot_bytes / (1024 * 1024),
         args.ssm_cache_slots,
+        decode_ring_slots,
+        args.max_batch_size,
         gdn_two_phase_bytes / (1024 * 1024),
         max_batch_tokens_pre,
         cuda_headroom / (1024 * 1024),
