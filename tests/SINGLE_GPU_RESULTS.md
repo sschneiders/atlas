@@ -1047,3 +1047,52 @@ for `decode_ring_slots`; formula `(ssm_cache_slots + decode_ring_slots * max_bat
 | P0 — Mistral MLA prefill | yarn.rs, paged_mla.rs, cache_skip_mla.rs, attention_forward_mla.rs, mla_absorbed.cu, kv_dtypes.rs, chat/mod.rs, mistral-small-4/MODEL.toml | All clean ✓ | None |
 | P1 — Nemotron tool calling | nemotron-super-120b-a12b/MODEL.toml, nemotron_h.jinja, bare_json.rs, chat/mod.rs | All clean ✓ | None |
 | P2 — SSM cache slots | cli.rs, build.rs, impl_a1.rs, ssm_pool.rs, preflight.rs | All clean ✓ | None |
+
+---
+
+## Codebase Verification — 2026-06-12 (session investigation)
+
+Full independent read of all source files named in the original task spec. All three
+priorities re-verified clean against current spec_ssm. Confirmed prior audit findings
+are accurate and no new bugs exist.
+
+**P0 — Mistral Small 4 MLA prefill (>1K token gibberish)**
+
+Direct code verification of the five files named in the task:
+
+- `prefill/cache_skip_mla.rs`: Non-paged MLA flash attention path traced end-to-end.
+  `v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16)` at line 277 — offset
+  exact because `kv_dim = nkv*hd` and `mla_v_dim = hd = 128` for Mistral. `prefill_attention_64`
+  called with scale `1.0f32 / (hd as f32).sqrt()` (inline at line 320). No seq_len cap. ✓
+- `mla_absorbed.cu`: All batched kernels confirmed grid-stride or per-token-block, no
+  hardcoded N_max. `mla_batched_gemv` is decode-only single-token GEMV; never called in
+  prefill. `__shared__` memory is 64 bytes constant (not seq_len-dependent). ✓
+- `kv_dtypes.rs`: `--kv-high-precision-layers auto` is a no-op when base dtype is BF16 —
+  `auto_high_precision_layers(Bf16, …)` returns `None` and `build_layer_kv_dtypes(BF16, …)`
+  returns `vec![]`. Zero risk of FP8 injection into MLA latents. ✓
+- `decode/attention_forward_mla.rs`: Both prefill and decode paths use same `mla.yarn_inv_freq`
+  pointer and `effective_attn_scale(hd=128) = 1/√128`. No correctness divergence. ✓
+- `mistral_loader/loader_impl/yarn.rs`: `find_correction_dim` formula verified matches HF
+  `_compute_yarn_parameters` exactly. `low=7, high=15` for Mistral params confirmed. ✓
+
+**P1 — Nemotron Super 120B tool calling**
+
+- `MODEL.toml` confirmed: `disable_tool_steering = true`, `tool_call_parser = "bare_json"`,
+  `thinking_in_tools = false` (comment explains 2026-06-12 revert from `true`). ✓
+- `nemotron_h.jinja`: line 93 gates XML format mandate on `not disable_tool_steering`;
+  line 206 gates `<tool_call>\n` steering prefix on `tools and not disable_tool_steering`.
+  With `disable_tool_steering=true` and `thinking_in_tools=false`, generation prefix is
+  `<|im_start|>assistant\n<think></think>\n` — model enters response mode directly. ✓
+
+**P2 — 122B SSM cache slots**
+
+- `preflight.rs` lines 31–34: `ssm_pool_bytes = max_batch_size × num_ssm_layers × (h+conv)`.
+  Controlled by `--max-batch-size`, not `--ssm-cache-slots`. ✓
+- `preflight.rs` lines 99–106: `decode_ring_slots = DECODE_ROLLBACK_RING_SLOTS` (= 8).
+  `ssm_snapshot_bytes = (ssm_cache_slots + 8 × max_batch_size) × …`. With
+  `--ssm-cache-slots 0`: only the decode rollback ring is accounted. ✓
+- The 1206 MB reported in the Qwen3.5-122B memory budget is `SsmStatePool` (from
+  `max_batch_size=8`), not `SsmSnapshotPool`. The two pools are independent; `--ssm-cache-slots 0`
+  zeroes only the Marconi prefix-cache region of `SsmSnapshotPool`. ✓
+
+**All three priorities confirmed clean. No new bugs found. No code changes required.**
