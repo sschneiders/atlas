@@ -37,11 +37,19 @@ unsafe extern "C" {
     // CUDA graph capture/replay
     pub(super) fn cuStreamBeginCapture(hStream: u64, mode: u32) -> i32;
     pub(super) fn cuStreamEndCapture(hStream: u64, phGraph: *mut u64) -> i32;
+    // CUDA-graph instantiate. NVIDIA's libcuda exports the 3-arg
+    // `cuGraphInstantiateWithFlags`; SCALE's libcuda (gfx1151) exports only
+    // `cuGraphInstantiate` — same ABI `(CUgraphExec*, CUgraph, u64)`, no
+    // `WithFlags` alias. `atlas_scale` (set by build.rs from ATLAS_TARGET_HW)
+    // picks the symbol that exists so the binary links on both targets.
+    #[cfg(not(atlas_scale))]
     pub(super) fn cuGraphInstantiateWithFlags(
         phGraphExec: *mut u64,
         hGraph: u64,
         flags: u64,
     ) -> i32;
+    #[cfg(atlas_scale)]
+    pub(super) fn cuGraphInstantiate(phGraphExec: *mut u64, hGraph: u64, flags: u64) -> i32;
     pub(super) fn cuGraphLaunch(hGraphExec: u64, hStream: u64) -> i32;
     pub(super) fn cuGraphExecDestroy(hGraphExec: u64) -> i32;
     pub(super) fn cuGraphDestroy(hGraph: u64) -> i32;
