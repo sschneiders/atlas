@@ -914,3 +914,136 @@ new code bugs found.
 **Result**: preflight.rs fix (`c1840fa`) confirmed in place. Correct minimum footprint with
 `--ssm-cache-slots 0 --max-batch-size 1` is ~1357 MB (151 MB state pool + 1206 MB decode ring),
 as documented in the "2026-06-12" section above. P2 correct behavior confirmed.
+
+---
+
+## Codebase Verification — 2026-06-12 (fresh independent audit)
+
+Full fresh read of every source file named in the original task spec, plus adjacent call
+sites. No new bugs found; all previously committed fixes confirmed in place.
+
+### P0 — Mistral Small 4 MLA prefill (>1K token gibberish)
+
+**`mistral_loader/loader_impl/yarn.rs`** — confirmed correct:
+- `find_correction_dim` closure matches HF `_compute_yarn_parameters` exactly.
+- Mistral params (`rope_dim=64`, `theta=1e7`, `factor=128`, `beta_fast=32`, `beta_slow=1`,
+  `orig_ctx=8192`): `low=floor(7.36)=7`, `high=ceil(14.24)=15`.
+- `ramp = ((j - low) / (high - low)).clamp(0,1)`. For j<7: full extrapolation. j 7–15:
+  linear blend. j>15: full 1/128 interpolation. ✓
+
+**`prefill/paged_mla.rs`** — primary single-chunk prefill path, confirmed clean:
+- `kv_dim = nkv×hd = 8×128 = 1024`. `v_contiguous = k_contiguous.offset(N × kv_dim × bf16)`.
+  `mla_v_dim = v_head_dim = hd = 128` (Mistral default path), so K and V have identical
+  per-token stride and V pointer is exact. ✓
+- `q_latent = ssm_ba()` at line 68 is fully consumed by WQ_A / RMS norm / WQ_B (lines 69–102)
+  before `k_rope_buf = ssm_ba()` reuses the slot at line 143. No aliasing hazard on a single
+  CUDA stream. ✓
+- Flash attention kernel: `hd=128 ≤ 256` → `prefill_attn_k` (BR=32 tile). ✓
+- `effective_attn_scale(128) = 1/√128`. `attn_scale_override` is `None` for Mistral. ✓
+
+**`prefill/cache_skip_mla.rs`** — prefix-cache-skip path, confirmed clean:
+- Same `kv_dim`, `v_contiguous` offset, and `mla_v_dim=hd` invariant as `paged_mla.rs`. ✓
+- `k_rope_buf = ssm_ba()` allocated at line 168 after `q_latent` (also `ssm_ba()`) is consumed
+  by lines 67–128. Safe reuse. ✓
+- `kv_latent = expert_gate_out()` read by both `mla_cache_assemble_batched` (line 233) and
+  WKV_B GEMM (line 265). WKV_B output goes to `ssm_deinterleaved()` (different buffer), so
+  `kv_latent` is preserved across both reads. ✓
+- `mla_q_rope_writeback_batched` runs AFTER `mla_kv_assemble_batched` (reversed vs paged path).
+  Both orderings are correct — writeback modifies `qg_out`; assembly reads `kv_expanded`
+  and `k_rope_buf`. No data dependency between them. ✓
+- Uses `prefill_attention_64` (BR=64) with `1.0/sqrt(hd as f32)` inline — identical scale
+  to `paged_mla.rs`, no correctness gap. ✓
+
+**`decode/attention_forward_mla.rs`** — decode path comparison:
+- Q: single-token absorbed path (`mla_batched_gemv` + Q_nope → batched GEMV via `w_uk_t`).
+  Prefill: expanded multi-token path (WQ_B GEMM). Expected difference. ✓
+- KV: decode reads compressed latent from paged cache + paged decode attn at `mla_cache_dim=320`.
+  Prefill: expands via WKV_B, runs flash attn at `hd=128`. Algebraically equivalent outputs. ✓
+- Both use the same `mla.yarn_inv_freq` pointer (single pre-computed table from `yarn.rs`). ✓
+- Both use `effective_attn_scale(hd=128) = 1/√128`. ✓
+- No correctness divergence between decode and prefill. ✓
+
+**`kernels/gb10/mistral-small-4/nvfp4/mla_absorbed.cu`** — CUDA kernel audit:
+- `mla_kv_assemble_batched`: grid `(num_tokens, 2, 1)`. Each block handles one token
+  (`t = blockIdx.x`). For GB10 (Blackwell, SM 9.x) `gridDim.x` limit is 2^31−1 — no cap at
+  1K or 65K. Inner loops use `threadIdx` stride over per-token elements. ✓
+- `mla_q_rope_extract_batched`, `mla_q_rope_writeback_batched`, `mla_q_final_assemble_batched`,
+  `mla_cache_assemble_batched`: all use grid-stride outer loops
+  (`for idx = blockIdx.x*blockDim.x+threadIdx.x; idx < total; idx += gridDim.x*blockDim.x`).
+  No hardcoded `N_max`. ✓
+- `mla_batched_gemv`: decode-only single-token GEMV. Never called during prefill. ✓
+- Shared memory: `__shared__ float s_partial[N_PER_BLOCK*2][2]` = 64 bytes, constant. ✓
+- Entire file is pure `__nv_bfloat16` — no FP8/NVFP4 code path. ✓
+
+**`main_modules/kv_dtypes.rs`** — BF16 fence:
+- `auto_high_precision_layers(D::Bf16, …)` → `None` (match arm line 31). ✓
+- `build_layer_kv_dtypes(BF16, n, 0, BF16)` short-circuits at line 53 (`high_precision_layers==0`)
+  → returns `vec![]`. All 36 Mistral attention layers stay uniform BF16. ✓
+
+**`api/chat/mod.rs`** — system-prompt injection check:
+- Lines 100–118: comment confirms parser `system_prompt()` injection was REMOVED 2026-05-25.
+  No call to `parser.system_prompt()` exists in the serving path. `BareJsonParser::system_prompt()`
+  still exists as a method (trait implementation required), but is never invoked during request
+  handling. Jinja template is the sole source of format instructions. ✓
+
+**`kernels/gb10/mistral-small-4/MODEL.toml`**: `default_kv_dtype = "bf16"` safety guard ✓
+
+**Status**: all P0 code paths clean. YaRN fix verified. No new bugs. Hardware re-test will close.
+
+### P1 — Nemotron Super 120B tool calling
+
+**`kernels/gb10/nemotron-super-120b-a12b/MODEL.toml`** — confirmed:
+- `disable_tool_steering = true` — skips `<tool_call>\n` steering prefix ✓
+- `tool_call_parser = "bare_json"` — uses model's native top-level JSON format ✓
+- `thinking_in_tools = false` — generation prefix is `<think></think>\n` (closed empty block)
+  when tools are active, putting model immediately in response mode ✓
+
+**`jinja-templates/nemotron_h.jinja`** — both guards confirmed:
+- Line 93: `{%- if not disable_tool_steering %}` — gates the XML format mandate ("NEVER emit
+  JSON … ALWAYS use `<tool_call>`"). Suppressed for Nemotron Super. ✓
+- Line 206: `{%- if tools and not disable_tool_steering %}` — gates the `<tool_call>\n`
+  steering prefix. Falls through to `{%- else %}` branch (since `enable_thinking=false` when
+  `thinking_in_tools=false` in tools context) → prefix is `<|im_start|>assistant\n<think></think>\n`. ✓
+
+**`tool_parser/bare_json.rs`**: `BareJsonParser` implemented; xgrammar `{"name":"` trigger
+for `tool_choice="auto"`; `compile_tool_grammar` delegates to `engine.compile_bare_json_tool_grammar`. ✓
+
+**`api/chat/mod.rs`**: parser `system_prompt()` injection absent — confirmed above. No competing
+format instruction from server side. ✓
+
+**Status**: all P1 code paths clean. No new bugs. Hardware re-test will close.
+
+### P2 — 122B SSM pool with `--ssm-cache-slots 0`
+
+**`crates/spark-server/src/cli.rs`**: `ssm_cache_slots` field, `default_value_t = 16`. ✓
+
+**`serve_phases/build.rs` line 71**: `args.ssm_cache_slots` passed to `factory::build_model`. ✓
+
+**`crates/spark-model/src/model/impl_a1.rs`**:
+- Line 136: `SsmStatePool::new(&config, max_batch_size, ...)` — sized by `max_batch_size`,
+  NOT `ssm_cache_slots`. Always allocates `(max_batch_size + 1) × num_ssm_layers × h_bytes`
+  (the `+1` is a permanent dummy slot for padding, never claimable). ✓
+- Lines 153–157: `decode_ring_slots = atlas_kernels::DECODE_ROLLBACK_RING_SLOTS` (conditional
+  on `ssm_pool.num_ssm_layers > 0`). ✓
+- Line 158: `SsmSnapshotPool::new(ssm_cache_slots, ...)` — receives CLI value directly.
+  `--ssm-cache-slots 0` zeroes Marconi prefix-cache region only. ✓
+
+**`crates/spark-model/src/model/ssm_pool.rs`** — full read:
+- `total_slots = max_slots + 1` (dummy slot at `max_slots`). For default `--max-batch-size 8`:
+  `total_slots=9`. Free slots are `0..max_slots` (8 claimable); dummy is never in `free_slots`. ✓
+- Log line: `"SSM state pool: {max_slots} slots × {num_ssm_layers} layers = {total_mb} MB"` —
+  note it logs `max_slots` (8), not `total_slots` (9). The dummy slot's memory is allocated but
+  unlogged; actual allocation is slightly more than logged. This is cosmetic. ✓
+
+**`serve_phases/preflight.rs` lines 99–104**: uses `atlas_kernels::DECODE_ROLLBACK_RING_SLOTS`
+for `decode_ring_slots`; formula `(ssm_cache_slots + decode_ring_slots * max_batch_size) * num_ssm_layers * (h+conv)_bytes` matches `SsmSnapshotPool::new` in `impl_a1.rs`. ✓
+
+**Status**: correct behavior confirmed end-to-end. No code change needed.
+
+### Summary
+
+| Priority | Files read this session | Finding | Action |
+|----------|------------------------|---------|--------|
+| P0 — Mistral MLA prefill | yarn.rs, paged_mla.rs, cache_skip_mla.rs, attention_forward_mla.rs, mla_absorbed.cu, kv_dtypes.rs, chat/mod.rs, mistral-small-4/MODEL.toml | All clean ✓ | None |
+| P1 — Nemotron tool calling | nemotron-super-120b-a12b/MODEL.toml, nemotron_h.jinja, bare_json.rs, chat/mod.rs | All clean ✓ | None |
+| P2 — SSM cache slots | cli.rs, build.rs, impl_a1.rs, ssm_pool.rs, preflight.rs | All clean ✓ | None |
