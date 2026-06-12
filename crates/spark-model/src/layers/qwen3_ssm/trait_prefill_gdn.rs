@@ -50,7 +50,14 @@ impl Qwen3SsmLayer {
             self.gdn_prefill_persistent_k.0 != 0,
             self.gdn_prefill_split4_k.0 != 0
         );
-        if self.gdn_prefill_wy32_k.0 != 0 && total > 32 {
+        // gfx1151/SCALE (atlas_scale): the WY32 (~84KB) and WY4 (~68KB)
+        // persistent kernels keep the full kd*vd FP32 H-state in dynamic
+        // shared memory, which exceeds RDNA3.5's hard 64KB LDS cap
+        // (cuFuncSetAttribute(MAX_DYNAMIC_SHARED) → CUDA_ERROR_INVALID_VALUE).
+        // Skip them on this target so dispatch falls to the split4 / persistent
+        // (global-H, ~1KB static smem) kernels — correctness-equivalent, lower
+        // throughput; the smem-H fast paths are a Blackwell-only optimization.
+        if self.gdn_prefill_wy32_k.0 != 0 && total > 32 && !cfg!(atlas_scale) {
             // #110: dynamic smem must cover the FULL kernel layout (H + smem_k +
             // smem_q + smem_warp[4] + smem_kd[C*C] + smem_g[C] + smem_bt[C], C=32).
             // The old `+256` slack under-counted the smem_warp(16)+smem_g(128)+
@@ -141,7 +148,7 @@ impl Qwen3SsmLayer {
                 }
                 offset += chunk;
             }
-        } else if self.gdn_prefill_persistent_wy4_k.0 != 0 {
+        } else if self.gdn_prefill_persistent_wy4_k.0 != 0 && !cfg!(atlas_scale) {
             let smem = (kd * vd * 4 + 8 * kd * 4 + 56) as u32;
             ops::gdn_prefill_persistent_smem(
                 ctx.gpu,
