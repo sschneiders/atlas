@@ -46,6 +46,7 @@ impl MoeLayer {
             // FP32 gate path (ATLAS_FP32_GATE) — optional; KernelHandle(0) if the
             // target's kernel set predates these symbols, dispatch then stays BF16.
             dense_gemm_f32out: super::super::try_kernel(gpu, "gemm", "dense_gemm_bf16_f32out"),
+            dense_gemm_f32in: super::super::try_kernel(gpu, "gemm", "dense_gemm_f32in_f32out"),
             moe_topk_f32: super::super::try_kernel(gpu, "moe_topk", "moe_topk_softmax_f32"),
             moe_expert_gate_up_shared: gpu
                 .kernel("moe_shared_expert_fused", "moe_expert_gate_up_shared")?,

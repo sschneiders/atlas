@@ -50,6 +50,9 @@ pub struct BufferSizes {
     /// Keeps the router GEMM accumulator unrounded into top-K so near-tied
     /// experts don't flip on a BF16 store. Allocated whenever num_experts > 0.
     pub gate_logits_f32: usize,
+    /// FP32 MoE-input norm output [m, hidden] for ATLAS_FP32_ROUTING — the
+    /// full-precision router_in the gate GEMM consumes. Allocated when experts > 0.
+    pub moe_router_in_f32: usize,
     pub moe_output: usize,
     pub logits: usize,
     pub ssm_qkvz: usize,
@@ -240,6 +243,11 @@ impl BufferSizes {
             } else {
                 256
             },
+            moe_router_in_f32: if config.num_experts > 0 {
+                m * h * 4
+            } else {
+                256
+            },
             moe_output: m * h * bf16,
             logits: logits_tokens * config.vocab_size * bf16, // BF16 from LM head kernel
             // SSM buffers are also reused by attention prefill/multi-seq as scratch:
@@ -305,6 +313,7 @@ impl BufferSizes {
             + self.attn_output
             + self.gate_logits
             + self.gate_logits_f32
+            + self.moe_router_in_f32
             + self.moe_output
             + self.logits
             + self.ssm_qkvz

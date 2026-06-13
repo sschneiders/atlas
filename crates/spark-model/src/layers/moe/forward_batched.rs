@@ -29,11 +29,18 @@ impl MoeLayer {
         // trigger on gfx1151). Only the softmax-routed dense-gate path is
         // covered — the NVFP4 gate and the sigmoid+bias path keep BF16. Falls
         // back to BF16 if the f32 kernels are absent on this target.
-        let fp32_gate = self.gate_nvfp4.is_none()
-            && self.correction_bias_dev.is_none()
-            && self.dense_gemm_f32out.0 != 0
-            && self.moe_topk_f32.0 != 0
-            && std::env::var("ATLAS_FP32_GATE").as_deref() == Ok("1");
+        // ATLAS_FP32_ROUTING: the SSM-side norm already wrote an FP32 router_in
+        // (residual_add_rms_norm_gatef32 → moe_router_in_f32); the gate GEMM
+        // reads it at full precision via dense_gemm_f32in. Supersedes the
+        // gate-only ATLAS_FP32_GATE (which keeps the BF16 router_in but f32 gate
+        // accumulation). Either way the gate logits + top-K run in FP32.
+        let fp32_routing = self.fp32_routing_active();
+        let fp32_gate = fp32_routing
+            || (self.gate_nvfp4.is_none()
+                && self.correction_bias_dev.is_none()
+                && self.dense_gemm_f32out.0 != 0
+                && self.moe_topk_f32.0 != 0
+                && std::env::var("ATLAS_FP32_GATE").as_deref() == Ok("1"));
         let gate_elem = if fp32_gate { 4usize } else { bf16 };
 
         // Gemma-4 router pre-norm (no-op for other models).
@@ -50,6 +57,19 @@ impl MoeLayer {
                 self.w4a16_gemm,
                 router_in,
                 nvfp4,
+                gate_logits,
+                n,
+                num_experts,
+                h,
+                stream,
+            )?;
+        } else if fp32_routing {
+            // FP32 router_in (from residual_add_rms_norm_gatef32) × bf16 gate.
+            ops::dense_gemm(
+                ctx.gpu,
+                self.dense_gemm_f32in,
+                ctx.buffers.moe_router_in_f32(),
+                &self.weights.gate,
                 gate_logits,
                 n,
                 num_experts,

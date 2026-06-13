@@ -38,6 +38,8 @@ pub struct BufferArena {
     gate_logits: DevicePtr,
     /// MoE gate logits: [M, num_experts] in FP32 (ATLAS_FP32_GATE path).
     gate_logits_f32: DevicePtr,
+    /// MoE-input norm output: [M, hidden_size] in FP32 (ATLAS_FP32_ROUTING).
+    moe_router_in_f32: DevicePtr,
     /// MoE output: [M, hidden_size] in BF16.
     moe_output: DevicePtr,
     /// Logits: [M, vocab_size] in BF16.
@@ -92,6 +94,7 @@ impl BufferArena {
         let attn_output = gpu.alloc(sizes.attn_output)?;
         let gate_logits = gpu.alloc(sizes.gate_logits)?;
         let gate_logits_f32 = gpu.alloc(sizes.gate_logits_f32)?;
+        let moe_router_in_f32 = gpu.alloc(sizes.moe_router_in_f32)?;
         let moe_output = gpu.alloc(sizes.moe_output)?;
         let logits = gpu.alloc(sizes.logits)?;
         let ssm_qkvz = gpu.alloc(sizes.ssm_qkvz)?;
@@ -129,6 +132,7 @@ impl BufferArena {
             attn_output,
             gate_logits,
             gate_logits_f32,
+            moe_router_in_f32,
             moe_output,
             logits,
             ssm_qkvz,
@@ -167,6 +171,9 @@ impl BufferArena {
     }
     pub fn gate_logits_f32(&self) -> DevicePtr {
         self.gate_logits_f32
+    }
+    pub fn moe_router_in_f32(&self) -> DevicePtr {
+        self.moe_router_in_f32
     }
     pub fn moe_output(&self) -> DevicePtr {
         self.moe_output
