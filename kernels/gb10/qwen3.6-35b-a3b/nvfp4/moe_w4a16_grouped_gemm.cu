@@ -129,6 +129,25 @@ __device__ __constant__ float E2M1_LUT_MOE[16] = {
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
 };
 
+// NVFP4 per-block FP8-E4M3 scale decode. SCALE/gfx1151 `(float)__nv_fp8_e4m3`
+// is NON-STANDARD (same bug fixed in moe_sorted_prefill.cu / the decode GEMVs) —
+// software scl_fp8 there; NVIDIA path is the verbatim cast. Guards only the
+// standalone scale-dequant site below; the atlas_mma_e4m3 macro region is
+// already SCALE-guarded separately and left untouched.
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+__device__ __forceinline__ float atlas_dec_e4m3(unsigned char b) {
+    unsigned int s = (b >> 7) & 1u, e = (b >> 3) & 0xFu, m = b & 0x7u; float v;
+    if (e == 0u)               v = (float)m * 0.001953125f;
+    else if (e == 15u && m == 7u) v = 0.0f;
+    else                       v = __uint_as_float(((e + 120u) << 23) | (m << 20));
+    return s ? -v : v;
+}
+#else
+__device__ __forceinline__ float atlas_dec_e4m3(unsigned char b) {
+    __nv_fp8_e4m3 f; *(unsigned char*)&f = b; return (float)f;
+}
+#endif
+
 // ═══════════════════════════════════════════════════════════════════
 // Original N_TILE=64 pointer-table variant — kept for decode.
 // ═══════════════════════════════════════════════════════════════════
@@ -222,8 +241,7 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable(
                     unsigned char packed_byte = B_expert[(unsigned long long)gn * half_K + k_pair];
                     unsigned int nibble = (gk & 1) ? (packed_byte >> 4) : (packed_byte & 0xF);
                     unsigned char sb = S_expert[(unsigned long long)gn * num_groups + scale_group];
-                    __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = sb;
-                    smem_B[k][n] = __float2bfloat16(E2M1_LUT_MOE[nibble] * (float)fp8 * scale2);
+                    smem_B[k][n] = __float2bfloat16(E2M1_LUT_MOE[nibble] * atlas_dec_e4m3(sb) * scale2);
                 } else {
                     smem_B[k][n] = __float2bfloat16(0.0f);
                 }
