@@ -103,6 +103,10 @@ name = "fp8gemm_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "inferspark_attn_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "kernel_probe"
 required-features = ["cuda", "gpu-examples"]
 
