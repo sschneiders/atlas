@@ -79,7 +79,11 @@ impl MoeLayer {
         } else {
             ops::dense_gemm(
                 ctx.gpu,
-                if fp32_gate { self.dense_gemm_f32out } else { self.dense_gemm },
+                if fp32_gate {
+                    self.dense_gemm_f32out
+                } else {
+                    self.dense_gemm
+                },
                 router_in,
                 &self.weights.gate,
                 gate_logits,
@@ -135,7 +139,11 @@ impl MoeLayer {
             } else {
                 ops::moe_topk_softmax(
                     ctx.gpu,
-                    if fp32_gate { self.moe_topk_f32 } else { self.moe_topk },
+                    if fp32_gate {
+                        self.moe_topk_f32
+                    } else {
+                        self.moe_topk
+                    },
                     gate_t,
                     indices_dev,
                     weights_dev,

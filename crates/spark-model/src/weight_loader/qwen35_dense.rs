@@ -90,10 +90,8 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
         // BF16 requant transients). Gated env so it's a no-op in production.
         let mem_profile = std::env::var("ATLAS_MEM_PROFILE").is_ok();
         let log_free = |tag: &str| {
-            if mem_profile {
-                if let Ok(free) = gpu.free_memory() {
-                    tracing::info!("MEM_PROFILE[{tag}]: {:.2} GB GPU-free", free as f64 / 1e9);
-                }
+            if mem_profile && let Ok(free) = gpu.free_memory() {
+                tracing::info!("MEM_PROFILE[{tag}]: {:.2} GB GPU-free", free as f64 / 1e9);
             }
         };
         log_free("dense-load-start");

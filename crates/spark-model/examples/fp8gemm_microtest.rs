@@ -117,7 +117,9 @@ fn main() -> Result<()> {
         .map(|_| f32_to_bf16_bits(rng.uniform(-1.0, 1.0)))
         .collect();
     // B: E4M3 weight bytes, decoded magnitudes ~[-0.5, 0.5] (typical weights).
-    let b_fp8: Vec<u8> = (0..n * k).map(|_| f32_to_e4m3(rng.uniform(-0.5, 0.5))).collect();
+    let b_fp8: Vec<u8> = (0..n * k)
+        .map(|_| f32_to_e4m3(rng.uniform(-0.5, 0.5)))
+        .collect();
 
     let backend = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let gpu: &dyn GpuBackend = &backend;

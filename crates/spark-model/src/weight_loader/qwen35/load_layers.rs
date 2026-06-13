@@ -577,18 +577,18 @@ pub(super) fn load_layers(
                     // (Fp8Dequanted requant) instead of the native-FP8 build.
                     Nvfp4Variant::Fp8Dequanted if !force_nvfp4_all => {
                         linear_attn_arms::build_linear_attention_fp8(
-                        i,
-                        store,
-                        &lp,
-                        gpu,
-                        variant,
-                        config,
-                        h,
-                        stream,
-                        input_norm,
-                        post_attn_norm,
-                        ffn,
-                    )?
+                            i,
+                            store,
+                            &lp,
+                            gpu,
+                            variant,
+                            config,
+                            h,
+                            stream,
+                            input_norm,
+                            post_attn_norm,
+                            ffn,
+                        )?
                     }
                     _ => linear_attn_arms::build_linear_attention_nvfp4(
                         store,

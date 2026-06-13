@@ -496,9 +496,11 @@ fn hip_mirror_source(
     if let Ok(entries) = std::fs::read_dir(src_dir) {
         for entry in entries.flatten() {
             let p = entry.path();
-            let is_kernel_src = p.extension().and_then(|e| e.to_str()).map(|e| {
-                e == source_ext || e == "cuh" || e == "h"
-            }).unwrap_or(false);
+            let is_kernel_src = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e == source_ext || e == "cuh" || e == "h")
+                .unwrap_or(false);
             if !p.is_file() || !is_kernel_src {
                 continue;
             }
@@ -561,7 +563,10 @@ fn widen_warp_masks(src: &str) -> String {
             }
             // If a hex literal follows, emit it and append ULL (unless already
             // suffixed with L/UL/LL/ULL). Decimal/identifier masks left untouched.
-            if i + 1 < bytes.len() && bytes[i] == b'0' && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X') {
+            if i + 1 < bytes.len()
+                && bytes[i] == b'0'
+                && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X')
+            {
                 let start = i;
                 i += 2;
                 while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
