@@ -16,11 +16,11 @@
 
 #include <cuda_bf16.h>
 
-#if defined(__SCALE__)
-// SCALE/gfx1151: software E4M3 encode used by float_to_fp8 below, since the
-// `cvt.rn.satfinite.e4m3x2.f32` inline PTX has no codegen on the SCALE device
-// pass. Bit-exact SATFINITE+E4M3 semantics, not an approximation. Defined only
-// for the SCALE build so nvcc never emits an unused-function warning.
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+// SCALE/gfx1151 and HIP/gfx1151: software E4M3 encode used by float_to_fp8
+// below, since the `cvt.rn.satfinite.e4m3x2.f32` inline PTX has no codegen on
+// either device pass. Bit-exact SATFINITE+E4M3 semantics, not an approximation.
+// Defined only for these builds so nvcc never emits an unused-function warning.
 __device__ __forceinline__ float scl_fp8(unsigned char b) {
     unsigned int s = (b >> 7) & 1u, e = (b >> 3) & 0xFu, m = b & 0x7u; float v;
     if (e == 0u)               v = (float)m * 0.001953125f;
@@ -86,6 +86,12 @@ __device__ __forceinline__ __nv_fp8_storage_t float_to_fp8(float val) {
     // SATFINITE+E4M3, not an approximation. (SCALE defines __SCALE__, not
     // __HIP_PLATFORM_AMD__, in the device pass.)
     return scl_enc_fp8(val);
+#elif defined(__HIP_PLATFORM_AMD__)
+    // HIP/gfx1151: hipcc/clang rejects the PTX `=h` 16-bit output constraint.
+    // scl_enc_fp8 produces the identical SATFINITE+E4M3 byte the PTX low byte
+    // would yield (the asm packs e4m3x2 from a single float and we keep the
+    // low FP8 value), so this is bit-exact, not an approximation.
+    return (__nv_fp8_storage_t)scl_enc_fp8(val);
 #else
     unsigned short pair;
     asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %1;"

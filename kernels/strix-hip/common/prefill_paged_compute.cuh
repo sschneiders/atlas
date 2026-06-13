@@ -326,7 +326,7 @@ extern "C" __global__ void KERNEL_NAME(
                 v16h a;
                 #pragma unroll
                 for (int i = 0; i < 16; i++)
-                    a[i] = (__fp16)smem_P[pv_warp_m + lane_lo][k_off + i];
+                    a[i] = (__fp16)__half2float(smem_P[pv_warp_m + lane_lo][k_off + i]);
 
                 #pragma unroll
                 for (int nt = 0; nt < PV_N_TILES; nt++) {
@@ -596,7 +596,7 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
                 v16h a;
                 #pragma unroll
                 for (int i = 0; i < 16; i++)
-                    a[i] = (__fp16)smem_P[pv_warp_m + lane_lo][k_off + i];
+                    a[i] = (__fp16)__half2float(smem_P[pv_warp_m + lane_lo][k_off + i]);
                 #pragma unroll
                 for (int nt = 0; nt < PV_N_TILES; nt++) {
                     unsigned int d_col = (pv_n_start + nt) * 16 + lane_lo;
