@@ -52,6 +52,10 @@ impl MoeLayer {
                 stream,
             )?;
         }
+        // Routing-divergence diagnostic (no-op unless ATLAS_DUMP_EXPERT_IDS=1):
+        // last-token gate logits, so the batched path can be compared to gb10
+        // the same way the grouped paths are (HIP MoE routing-flip bisection).
+        super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
 
         // Per-token: topK routing + expert dispatch + weighted sum
         let h_usize = h as usize;
@@ -100,6 +104,11 @@ impl MoeLayer {
                     ctx.config.norm_topk_prob,
                     stream,
                 )?;
+            }
+            // Last-token routing dump (no-op unless ATLAS_DUMP_EXPERT_IDS=1):
+            // the token whose top-K determines the next prediction.
+            if t == num_tokens - 1 {
+                super::dump::dump_expert_ids(ctx.gpu, stream, indices_dev, weights_dev, 1, top_k)?;
             }
 
             let shared_out = ctx.buffers.attn_output();
