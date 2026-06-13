@@ -293,7 +293,18 @@ impl ComputeTarget for HipTarget {
             "-include".into(),
             "hip/hip_runtime.h".into(),
         ];
-        args.extend(extra_flags.iter().cloned());
+        // Translate nvcc-specific flags to their hipcc/clang equivalents so
+        // KERNEL.toml `extra_nvcc_flags` (authored for nvcc) work on HIP.
+        // `--fmad=false` (disable FMA contraction for determinism) → clang's
+        // `-ffp-contract=off`; preserving this matters for numeric parity.
+        for f in extra_flags {
+            match f.as_str() {
+                "--fmad=false" => args.push("-ffp-contract=off".into()),
+                "--fmad=true" => args.push("-ffp-contract=fast".into()),
+                s if s.starts_with("--fmad=") => {}
+                other => args.push(other.into()),
+            }
+        }
         args.push(source.to_str().unwrap().into());
         args.push("-o".into());
         args.push(output.to_str().unwrap().into());
