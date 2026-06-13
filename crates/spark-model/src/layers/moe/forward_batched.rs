@@ -23,10 +23,27 @@ impl MoeLayer {
         let bf16 = 2usize;
         let n = num_tokens as u32;
 
+        // FP32 gate path (ATLAS_FP32_GATE): keep the router GEMM accumulator in
+        // FP32 through top-K so two experts whose logits differ by less than a
+        // BF16 ULP no longer flip routing (the cross-compiler routing-cascade
+        // trigger on gfx1151). Only the softmax-routed dense-gate path is
+        // covered — the NVFP4 gate and the sigmoid+bias path keep BF16. Falls
+        // back to BF16 if the f32 kernels are absent on this target.
+        let fp32_gate = self.gate_nvfp4.is_none()
+            && self.correction_bias_dev.is_none()
+            && self.dense_gemm_f32out.0 != 0
+            && self.moe_topk_f32.0 != 0
+            && std::env::var("ATLAS_FP32_GATE").as_deref() == Ok("1");
+        let gate_elem = if fp32_gate { 4usize } else { bf16 };
+
         // Gemma-4 router pre-norm (no-op for other models).
         let router_in = self.router_input(input, n, h, ctx, stream)?;
         // Gate GEMM: [N, H] × [H, num_experts] → [N, num_experts]
-        let gate_logits = ctx.buffers.gate_logits(); // [N, 512] BF16
+        let gate_logits = if fp32_gate {
+            ctx.buffers.gate_logits_f32() // [N, num_experts] FP32
+        } else {
+            ctx.buffers.gate_logits() // [N, num_experts] BF16
+        };
         if let Some(ref nvfp4) = self.gate_nvfp4 {
             ops::w4a16_gemm(
                 ctx.gpu,
@@ -42,7 +59,7 @@ impl MoeLayer {
         } else {
             ops::dense_gemm(
                 ctx.gpu,
-                self.dense_gemm,
+                if fp32_gate { self.dense_gemm_f32out } else { self.dense_gemm },
                 router_in,
                 &self.weights.gate,
                 gate_logits,
@@ -55,7 +72,10 @@ impl MoeLayer {
         // Routing-divergence diagnostic (no-op unless ATLAS_DUMP_EXPERT_IDS=1):
         // last-token gate logits, so the batched path can be compared to gb10
         // the same way the grouped paths are (HIP MoE routing-flip bisection).
-        super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
+        // The dump reads BF16; skip it on the FP32-gate path.
+        if !fp32_gate {
+            super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
+        }
 
         // Per-token: topK routing + expert dispatch + weighted sum
         let h_usize = h as usize;
@@ -71,7 +91,7 @@ impl MoeLayer {
 
         for t in 0..num_tokens {
             let input_t = input.offset(t * h_usize * bf16);
-            let gate_t = gate_logits.offset(t * num_experts as usize * bf16);
+            let gate_t = gate_logits.offset(t * num_experts as usize * gate_elem);
             let output_t = ctx.buffers.moe_output().offset(t * h_usize * bf16);
 
             let scratch = ctx.buffers.scratch();
@@ -95,7 +115,7 @@ impl MoeLayer {
             } else {
                 ops::moe_topk_softmax(
                     ctx.gpu,
-                    self.moe_topk,
+                    if fp32_gate { self.moe_topk_f32 } else { self.moe_topk },
                     gate_t,
                     indices_dev,
                     weights_dev,

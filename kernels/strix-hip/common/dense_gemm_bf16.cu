@@ -74,6 +74,52 @@ extern "C" __global__ void dense_gemm_bf16(
     }
 }
 
+// FP32-output twin of dense_gemm_bf16 (see gb10 source for rationale): writes
+// the FP32 accumulator directly so the MoE router gate logits keep full
+// precision into top-K under ATLAS_FP32_GATE. Same scalar math as the BF16
+// kernel above; only the store dtype differs. Inputs stay BF16.
+//
+// Grid: (ceil(N/TILE_N), ceil(M/TILE_M))   Block: (TILE_N, TILE_M)
+extern "C" __global__ void dense_gemm_bf16_f32out(
+    const __nv_bfloat16* __restrict__ A,  // [M, K] row-major
+    const __nv_bfloat16* __restrict__ B,  // [N, K] row-major (read transposed)
+    float* __restrict__ C,                 // [M, N] row-major, FP32
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    unsigned int row = blockIdx.y * TILE_M + threadIdx.y;
+    unsigned int col = blockIdx.x * TILE_N + threadIdx.x;
+
+    __shared__ __nv_bfloat16 smem_A[TILE_M][TILE_K];
+    __shared__ __nv_bfloat16 smem_B[TILE_K][TILE_N];
+
+    float acc = 0.0f;
+
+    for (unsigned int k_base = 0; k_base < K; k_base += TILE_K) {
+        if (row < M && (k_base + threadIdx.x) < K) {
+            smem_A[threadIdx.y][threadIdx.x] = A[row * K + k_base + threadIdx.x];
+        } else {
+            smem_A[threadIdx.y][threadIdx.x] = __float2bfloat16(0.0f);
+        }
+        if ((k_base + threadIdx.y) < K && col < N) {
+            smem_B[threadIdx.y][threadIdx.x] = B[(unsigned long long)col * K + (k_base + threadIdx.y)];
+        } else {
+            smem_B[threadIdx.y][threadIdx.x] = __float2bfloat16(0.0f);
+        }
+        __syncthreads();
+        for (unsigned int kk = 0; kk < TILE_K; kk++) {
+            acc += __bfloat162float(smem_A[threadIdx.y][kk])
+                 * __bfloat162float(smem_B[kk][threadIdx.x]);
+        }
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = acc;
+    }
+}
+
 // ── HIP (gfx1151 / RDNA3.5) port of dense_gemm_bf16_pipelined ──────────────
 //
 // The gb10 source ships a tensor-core variant (mma.sync.m16n8k16 + a 2-stage
