@@ -124,62 +124,6 @@ std = []
 name = "cudarc"
 path = "src/lib.rs"
 
-[[example]]
-name = "01-allocate"
-path = "examples/01-allocate.rs"
-
-[[example]]
-name = "02-copy"
-path = "examples/02-copy.rs"
-
-[[example]]
-name = "03-launch-kernel"
-path = "examples/03-launch-kernel.rs"
-
-[[example]]
-name = "04-streams"
-path = "examples/04-streams.rs"
-
-[[example]]
-name = "05-device-repr"
-path = "examples/05-device-repr.rs"
-
-[[example]]
-name = "06-threading"
-path = "examples/06-threading.rs"
-
-[[example]]
-name = "08-cupti"
-path = "examples/08-cupti.rs"
-
-[[example]]
-name = "09-constant-memory"
-path = "examples/09-constant-memory.rs"
-
-[[example]]
-name = "10-function-attributes"
-path = "examples/10-function-attributes.rs"
-
-[[example]]
-name = "12-context-config"
-path = "examples/12-context-config.rs"
-
-[[example]]
-name = "13-copy-multi-gpu"
-path = "examples/13-copy-multi-gpu.rs"
-
-[[example]]
-name = "cufile-copy"
-path = "examples/cufile-copy.rs"
-
-[[example]]
-name = "matmul-kernel"
-path = "examples/matmul-kernel.rs"
-
-[[example]]
-name = "nvrtc-compile"
-path = "examples/nvrtc-compile.rs"
-
 [dependencies.float4]
 version = "0.1.0"
 optional = true
