@@ -74,6 +74,7 @@ int cuEventCreate(void** e, unsigned flags) { return hipEventCreateWithFlags((hi
 int cuEventDestroy_v2(void* e)              { return hipEventDestroy((hipEvent_t)e); }
 int cuEventRecord(void* e, void* s)         { return hipEventRecord((hipEvent_t)e, (hipStream_t)s); }
 int cuEventSynchronize(void* e)             { return hipEventSynchronize((hipEvent_t)e); }
+int cuEventElapsedTime(float* ms, void* a, void* b) { return hipEventElapsedTime(ms, (hipEvent_t)a, (hipEvent_t)b); }
 
 // ── CUDA graphs ───────────────────────────────────────────────────────
 // cudarc's cuGraphInstantiate (legacy arity): (exec*, graph, errNode*, logBuf, bufSize)

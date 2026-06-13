@@ -74,6 +74,103 @@ extern "C" __global__ void dense_gemm_bf16(
     }
 }
 
+// ── HIP (gfx1151 / RDNA3.5) port of dense_gemm_bf16_pipelined ──────────────
+//
+// The gb10 source ships a tensor-core variant (mma.sync.m16n8k16 + a 2-stage
+// cp.async prefetch pipeline). Native HIP/clang cannot lower either NVIDIA
+// inline PTX construct, so this target supplies a same-contract kernel: same
+// name, same (A,B,C,M,N,K) signature, and the SAME launch geometry the op
+// wrapper in gemm_dense.rs uses — Grid (ceil(N/128), ceil(M/128), 1),
+// Block (256,1,1) — so the dispatch is unchanged. The math is bit-equivalent
+// to the gb10 kernel (FP32 accumulation of the same BF16 products → the same
+// cosine=1.0 the gb10 path documents); only the GEMM micro-architecture
+// differs (synchronous smem staging + register-blocked scalar FMA in place of
+// async-copy + tensor cores). RDNA3.5 WMMA acceleration is a perf follow-up
+// (shares the fragment-layout work tracked for the HIP FP8 attention kernels);
+// correctness here is independent of that optimization.
+//
+// 256 threads cover a 128×128 output tile as a 16×16 grid of threads, each
+// owning a contiguous 8×8 micro-tile. smem: 2 × 128×16 BF16 = 8192 B/CTA.
+#define DP_M_TILE 128
+#define DP_N_TILE 128
+#define DP_K_STEP 16
+#define DP_THREADS 256
+extern "C" __global__ void dense_gemm_bf16_pipelined(
+    const __nv_bfloat16* __restrict__ A,   // [M, K] BF16 activations
+    const __nv_bfloat16* __restrict__ B,   // [N, K] BF16 weights (read transposed)
+    __nv_bfloat16* __restrict__ C,          // [M, N] BF16 output
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int cta_m = blockIdx.y * DP_M_TILE;
+    const unsigned int cta_n = blockIdx.x * DP_N_TILE;
+    // 16×16 thread grid; thread (tx,ty) owns rows [ty*8, ty*8+8), cols
+    // [tx*8, tx*8+8) of the CTA's 128×128 output tile.
+    const unsigned int tx = threadIdx.x & 15;          // [0,16) → N
+    const unsigned int ty = threadIdx.x >> 4;          // [0,16) → M
+
+    __shared__ __nv_bfloat16 sA[DP_M_TILE][DP_K_STEP];  // A[m, k]
+    __shared__ __nv_bfloat16 sB[DP_N_TILE][DP_K_STEP];  // B[n, k] (K-contiguous)
+
+    float acc[8][8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        #pragma unroll
+        for (int j = 0; j < 8; j++) acc[i][j] = 0.0f;
+
+    const __nv_bfloat16 zero = __float2bfloat16(0.0f);
+
+    for (unsigned int k_base = 0; k_base < K; k_base += DP_K_STEP) {
+        // Cooperative load: 128×16 = 2048 elems / 256 threads = 8 each.
+        #pragma unroll
+        for (unsigned int e = threadIdx.x; e < DP_M_TILE * DP_K_STEP; e += DP_THREADS) {
+            unsigned int row = e / DP_K_STEP;
+            unsigned int col = e % DP_K_STEP;
+            unsigned int gr = cta_m + row;
+            unsigned int gc = k_base + col;
+            sA[row][col] = (gr < M && gc < K)
+                ? A[(unsigned long long)gr * K + gc] : zero;
+        }
+        #pragma unroll
+        for (unsigned int e = threadIdx.x; e < DP_N_TILE * DP_K_STEP; e += DP_THREADS) {
+            unsigned int nrow = e / DP_K_STEP;
+            unsigned int kcol = e % DP_K_STEP;
+            unsigned int gn = cta_n + nrow;
+            unsigned int gk = k_base + kcol;
+            sB[nrow][kcol] = (gn < N && gk < K)
+                ? B[(unsigned long long)gn * K + gk] : zero;
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (unsigned int kk = 0; kk < DP_K_STEP; kk++) {
+            float a_reg[8];
+            float b_reg[8];
+            #pragma unroll
+            for (int i = 0; i < 8; i++) a_reg[i] = __bfloat162float(sA[ty * 8 + i][kk]);
+            #pragma unroll
+            for (int j = 0; j < 8; j++) b_reg[j] = __bfloat162float(sB[tx * 8 + j][kk]);
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                #pragma unroll
+                for (int j = 0; j < 8; j++) acc[i][j] += a_reg[i] * b_reg[j];
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        unsigned int r = cta_m + ty * 8 + i;
+        if (r >= M) continue;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            unsigned int c = cta_n + tx * 8 + j;
+            if (c < N) C[(unsigned long long)r * N + c] = __float2bfloat16(acc[i][j]);
+        }
+    }
+}
+
 // Fused SiLU(gate) * up activation — vectorized 2-wide BF16 loads/stores.
 // Input: [N, inter_size*2] where first half is gate, second half is up.
 // Output: [N, inter_size]
