@@ -220,6 +220,29 @@ pub(crate) async fn chat_completions_inner(
         Err(resp) => return resp,
     };
 
+    // Window enforcement (vLLM parity): bound generation to the remaining
+    // context window. vLLM caps `max_tokens = min(requested, max_model_len −
+    // num_prompt_tokens)` and stops at `max_model_len`. Atlas previously
+    // bounded decode only by the per-request `max_tokens` budget, so a prompt
+    // near `max_seq_len` (e.g. a deep agentic Zed turn at 63.7k/65.5k) could
+    // generate tens of thousands of tokens past the window — into positions
+    // the deployment declared out of scope, where the model degrades into a
+    // repeating attractor (observed: 18,945-token loop, 2026-06-13). The
+    // `remaining == 0 → finish(length)` machinery enforces this once the
+    // budget is clamped here.
+    let clamped_max_tokens =
+        super::compact::clamp_max_tokens_to_window(max_tokens, state.max_seq_len, prompt_len);
+    if clamped_max_tokens < max_tokens {
+        tracing::info!(
+            "max_tokens clamped to context window: {} → {} (max_seq_len={}, prompt_len={})",
+            max_tokens,
+            clamped_max_tokens,
+            state.max_seq_len,
+            prompt_len
+        );
+    }
+    let max_tokens = clamped_max_tokens;
+
     // ── Phase 7: dispatch streaming or blocking ─────────────────
     if req.stream {
         return super::chat_stream_dispatch::dispatch_streaming(

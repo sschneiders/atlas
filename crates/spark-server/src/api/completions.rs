@@ -147,11 +147,25 @@ pub async fn completions(
     });
     let stop_tokens = tokenize_stop_sequences(&state.tokenizer, &req.stop);
 
+    // Window enforcement (vLLM parity): bound generation to the remaining
+    // context window — see the matching clamp in `chat::chat_completions_inner`.
+    let max_tokens =
+        super::compact::clamp_max_tokens_to_window(req.max_tokens, state.max_seq_len, prompt_len);
+    if max_tokens < req.max_tokens {
+        tracing::info!(
+            "max_tokens clamped to context window: {} → {} (max_seq_len={}, prompt_len={})",
+            req.max_tokens,
+            max_tokens,
+            state.max_seq_len,
+            prompt_len
+        );
+    }
+
     if req.stream {
         return match completions_stream(
             state,
             prompt_tokens,
-            req.max_tokens,
+            max_tokens,
             temperature,
             top_k,
             top_p,
@@ -178,7 +192,7 @@ pub async fn completions(
         prompt_tokens: std::sync::Arc::new(prompt_tokens),
         session_hash,
         image_pixels: Vec::new(),
-        max_tokens: req.max_tokens,
+        max_tokens,
         min_tokens: 0,
         temperature,
         top_k,

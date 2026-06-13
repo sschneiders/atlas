@@ -6,6 +6,18 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 
+/// Window enforcement (vLLM parity): clamp the per-request generation budget
+/// to the remaining context window. vLLM caps `max_tokens = min(requested,
+/// max_model_len − num_prompt_tokens)`; without this a prompt near the window
+/// (a deep agentic turn) generates far past `max_seq_len` into positions the
+/// deployment declared out of scope, where the model degrades into a repeating
+/// loop. Pure arithmetic so it is unit-tested directly. `prompt_len <
+/// max_seq_len` is guaranteed by the caller's prompt-rejection check, so the
+/// window is ≥ 1 and a positive `max_tokens` is never clamped to 0.
+pub fn clamp_max_tokens_to_window(max_tokens: usize, max_seq_len: usize, prompt_len: usize) -> usize {
+    max_tokens.min(max_seq_len.saturating_sub(prompt_len))
+}
+
 /// OpenAI-compatible JSON error response.
 /// Coding agents (OpenCode, Cline, nanobot) expect this exact structure.
 /// Progressive context compaction (5 stages, per arXiv:2603.05344 OpenDev).
@@ -200,4 +212,44 @@ pub(super) fn openai_error_response_with_param(
         }
     });
     (status, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod window_clamp_tests {
+    use super::clamp_max_tokens_to_window;
+
+    #[test]
+    fn no_op_when_within_window() {
+        // Small prompt, modest request: untouched.
+        assert_eq!(clamp_max_tokens_to_window(2000, 65536, 1000), 2000);
+    }
+
+    #[test]
+    fn clamps_deep_prompt() {
+        // The Zed loop case: 63,699-token prompt + 65,536 request in a 65,536
+        // window → bounded to the 1,837-token remainder.
+        assert_eq!(clamp_max_tokens_to_window(65536, 65536, 63699), 1837);
+    }
+
+    #[test]
+    fn exact_boundary_leaves_one_token() {
+        // prompt_len = max_seq_len − 1 (the most a passing prompt can be).
+        assert_eq!(clamp_max_tokens_to_window(65536, 65536, 65535), 1);
+    }
+
+    #[test]
+    fn positive_request_never_clamps_to_zero() {
+        // Window is always ≥ 1 for an admitted prompt, so a positive request
+        // (→ remaining = max_tokens − 1) can never underflow.
+        for prompt_len in 0..65536 {
+            assert!(clamp_max_tokens_to_window(65536, 65536, prompt_len) >= 1);
+        }
+    }
+
+    #[test]
+    fn saturates_if_prompt_exceeds_window() {
+        // Defensive: caller rejects such prompts, but the arithmetic must not
+        // panic (saturating_sub → 0).
+        assert_eq!(clamp_max_tokens_to_window(2000, 65536, 70000), 0);
+    }
 }
