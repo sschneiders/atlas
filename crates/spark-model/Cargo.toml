@@ -99,6 +99,10 @@ name = "dense_gemm_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "fp8gemm_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "kernel_probe"
 required-features = ["cuda", "gpu-examples"]
 
