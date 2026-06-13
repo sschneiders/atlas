@@ -47,6 +47,9 @@ int cuMemsetD32Async(CUdeviceptr dst, unsigned int ui, size_t n, void* s)
 // ── modules / kernels ─────────────────────────────────────────────────
 int cuModuleLoadData(void** m, const void* image)          { return hipModuleLoadData((hipModule_t*)m, image); }
 int cuModuleGetFunction(void** f, void* m, const char* nm) { return hipModuleGetFunction((hipFunction_t*)f, (hipModule_t)m, nm); }
+// Fetch a __constant__/global symbol's device addr+size (registry::device_symbol).
+int cuModuleGetGlobal_v2(CUdeviceptr* dptr, size_t* bytes, void* m, const char* nm)
+                              { return hipModuleGetGlobal((hipDeviceptr_t*)dptr, bytes, (hipModule_t)m, nm); }
 int cuModuleUnload(void* m)                                { return hipModuleUnload((hipModule_t)m); }
 // On NVIDIA this opts a module function into >48KB dynamic shared mem. On AMD
 // the LDS is sized from hipModuleLaunchKernel's shared-mem arg (up to the

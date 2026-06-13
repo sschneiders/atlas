@@ -10,11 +10,18 @@ fn main() {
     // `quantized_from_fp8`). NVIDIA targets leave the cfg unset and keep the
     // current resident-source behavior byte-for-byte.
     println!("cargo:rustc-check-cfg=cfg(atlas_scale)");
-    if std::env::var("ATLAS_TARGET_HW")
-        .as_deref()
-        .map(|hw| hw.starts_with("strix"))
-        .unwrap_or(false)
-    {
+    // `atlas_hip` is the strict subset of atlas_scale for the NATIVE-HIP target
+    // (`strix-hip`, hipcc — not the SCALE PTX-recompile `strix`). HIP lacks the
+    // FP8 *prefill* GEMM kernels (fp8_gemm*/w8a16* are inline-PTX, not yet
+    // WMMA-ported), so the FP8→FP8 predequant-for-prefill path has no kernel
+    // there; on atlas_hip we skip predequant and use the NVFP4 (w4a16 WMMA)
+    // prefill instead. SCALE recompiles the PTX and keeps the FP8 prefill path.
+    println!("cargo:rustc-check-cfg=cfg(atlas_hip)");
+    let hw = std::env::var("ATLAS_TARGET_HW").unwrap_or_default();
+    if hw.starts_with("strix") {
         println!("cargo:rustc-cfg=atlas_scale");
+    }
+    if hw == "strix-hip" {
+        println!("cargo:rustc-cfg=atlas_hip");
     }
 }

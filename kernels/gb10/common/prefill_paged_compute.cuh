@@ -18,6 +18,21 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+// Async global→shared 16-byte copy helpers (cp.async on NVIDIA + SCALE).
+// Portable counterparts are defined in the strix-hip copy of this header,
+// where they degrade to synchronous uint4 copies (AMD has no cp.async).
+__device__ __forceinline__ void atlas_cp16(void* smem_dst, const void* gmem_src) {
+    unsigned _s = __cvta_generic_to_shared(smem_dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(_s), "l"(gmem_src));
+}
+__device__ __forceinline__ void atlas_cp16_pred(void* smem_dst, const void* gmem_src, bool pred) {
+    unsigned _s = __cvta_generic_to_shared(smem_dst);
+    unsigned _b = pred ? 16u : 0u;
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;" :: "r"(_s), "l"(gmem_src), "r"(_b));
+}
+__device__ __forceinline__ void atlas_cp_commit() { asm volatile("cp.async.commit_group;"); }
+__device__ __forceinline__ void atlas_cp_wait()   { asm volatile("cp.async.wait_group 0;"); }
+
 // Phase 2c precision upgrade (2026-05-24): P*V MMA now uses FP16 inputs
 // instead of BF16. FP16 has 10-bit mantissa vs BF16's 7-bit → 8× finer
 // precision on softmax probabilities, which is the largest remaining
@@ -199,21 +214,20 @@ extern "C" __global__ void KERNEL_NAME(
         const unsigned int cpr = HDIM / 8;
         for (unsigned int idx = tid; idx < TILE_CHUNKS; idx += blockDim.x) {
             unsigned int row = idx / cpr, col = (idx % cpr) * 8;
-            unsigned int sa = __cvta_generic_to_shared(&smem_Q[row][col]);
             if (q_start + row < q_len) {
 #ifdef PREFILL_BATCHED
                 const void* gm = (const void*)&Q[q_batch_off + (q_start+row)*q_seq_stride + q_head*head_dim + col];
 #else
                 const void* gm = (const void*)&Q[(q_start+row)*q_seq_stride + q_head*head_dim + col];
 #endif
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(sa), "l"(gm));
+                atlas_cp16(&smem_Q[row][col], gm);
             } else { *((uint4*)&smem_Q[row][col]) = make_uint4(0,0,0,0); }
         }
         if (num_kv_blocks > 0) {
             LOAD_KV_TILE(K_cache, block_table, smem_K[0], 0, kv_len, kv_head, tid, blockDim.x);
         }
-        asm volatile("cp.async.commit_group;");
-        asm volatile("cp.async.wait_group 0;");
+        atlas_cp_commit();
+        atlas_cp_wait();
     }
     __syncthreads();
 
@@ -225,7 +239,7 @@ extern "C" __global__ void KERNEL_NAME(
 
         // === Start V load (overlaps with QK^T for BF16 cp.async) ===
         LOAD_KV_TILE(V_cache, block_table, smem_V, kv_start, kv_len, kv_head, tid, blockDim.x);
-        asm volatile("cp.async.commit_group;");
+        atlas_cp_commit();
 
         // === QK^T (warps 0-1, register-based) ===
         float acc_s[4][4];
@@ -343,7 +357,7 @@ extern "C" __global__ void KERNEL_NAME(
         }
 
         // Wait for V tile load (was loading during QK^T+softmax for BF16)
-        asm volatile("cp.async.wait_group 0;");
+        atlas_cp_wait();
         __syncthreads();
 
         // Warps 2-3: rescale accumulators to match current m
@@ -367,7 +381,7 @@ extern "C" __global__ void KERNEL_NAME(
         // === Preload K[i+1] (paged, overlaps with PV for BF16 cp.async) ===
         if(kv_block+1<num_kv_blocks){
             LOAD_KV_TILE(K_cache, block_table, smem_K[ATLAS_KB(1-buf)], (kv_block+1)*BC, kv_len, kv_head, tid, blockDim.x);
-            asm volatile("cp.async.commit_group;");
+            atlas_cp_commit();
         }
 
         // === PV MMA (all 4 warps) ===
@@ -416,7 +430,7 @@ extern "C" __global__ void KERNEL_NAME(
 
         // Wait for K[i+1] prefetch to complete before next iteration
         if(kv_block+1<num_kv_blocks){
-            asm volatile("cp.async.wait_group 0;");
+            atlas_cp_wait();
         }
         __syncthreads();
     }
@@ -576,21 +590,20 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
         const unsigned int cpr = HDIM / 8;
         for (unsigned int idx = tid; idx < TILE_CHUNKS_Q64; idx += 256) {
             unsigned int row = idx / cpr, col = (idx % cpr) * 8;
-            unsigned int sa = __cvta_generic_to_shared(&smem_Q64[row][col]);
             if (q_start + row < q_len) {
 #ifdef PREFILL_BATCHED
                 const void* gm = (const void*)&Q[q_batch_off + (q_start+row)*q_seq_stride + q_head*head_dim + col];
 #else
                 const void* gm = (const void*)&Q[(q_start+row)*q_seq_stride + q_head*head_dim + col];
 #endif
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(sa), "l"(gm));
+                atlas_cp16(&smem_Q64[row][col], gm);
             } else { *((uint4*)&smem_Q64[row][col]) = make_uint4(0,0,0,0); }
         }
         if (num_kv_blocks > 0) {
             LOAD_KV_TILE(K_cache, block_table, smem_K64[0], 0, kv_len, kv_head, tid, blockDim.x);
         }
-        asm volatile("cp.async.commit_group;");
-        asm volatile("cp.async.wait_group 0;");
+        atlas_cp_commit();
+        atlas_cp_wait();
     }
     __syncthreads();
 
@@ -712,15 +725,15 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
                 smem_ml64[row1][0]=m_r1; smem_ml64[row1][1]=l_r1;
             }
             // Warps 0-3: commit empty cp.async group (balance with warps 4-7)
-            asm volatile("cp.async.commit_group;");
+            atlas_cp_commit();
         } else {
             // Warps 4-7: load V tile (128 threads, overlaps with QK^T above)
             LOAD_KV_TILE(V_cache, block_table, smem_V64, kv_start, kv_len, kv_head, tid - 128, 128);
-            asm volatile("cp.async.commit_group;");
+            atlas_cp_commit();
         }
 
         // Wait for V loads to complete (warps 0-3: no-op, warps 4-7: wait for copies)
-        asm volatile("cp.async.wait_group 0;");
+        atlas_cp_wait();
         __syncthreads();
 
         // Warps 4-7: rescale accumulators to match current m
@@ -744,7 +757,7 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
         // === Preload K[i+1] (256 threads = 2× faster) ===
         if(kv_block+1<num_kv_blocks){
             LOAD_KV_TILE(K_cache, block_table, smem_K64[ATLAS_KB(1-buf)], (kv_block+1)*BC, kv_len, kv_head, tid, blockDim.x);
-            asm volatile("cp.async.commit_group;");
+            atlas_cp_commit();
         }
 
         // === PV MMA (all 8 warps) ===
@@ -788,7 +801,7 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
         }
 
         if(kv_block+1<num_kv_blocks){
-            asm volatile("cp.async.wait_group 0;");
+            atlas_cp_wait();
         }
         __syncthreads();
     }
