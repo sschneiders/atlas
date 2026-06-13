@@ -15,7 +15,6 @@ memory_type = "LPDDR5X"
 # GPU-visible pool is the dedicated-VRAM carveout (<<64 GB) — model
 # sizing for the WSL bring-up must account for that, not this number.
 memory_gb = 64
-use_fp32_residual = false
 # RDNA3.5 has a hard 64 KB/workgroup LDS cap. The BR64=64 large-chunk
 # prefill kernel's __shared__ (smem_Q64[64]) overflows it even after
 # single-buffering K. Force the BR=32 prefill path on this target: the
