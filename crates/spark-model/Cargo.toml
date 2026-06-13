@@ -107,6 +107,14 @@ name = "inferspark_attn_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "moe_shared_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "moe_silu_down_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "kernel_probe"
 required-features = ["cuda", "gpu-examples"]
 
