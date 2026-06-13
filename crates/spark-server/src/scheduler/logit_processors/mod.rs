@@ -128,12 +128,18 @@ pub fn run_pipeline_with_path(
     ctx: &LogitsContext,
     path: &'static str,
 ) -> Option<u32> {
-    let stages: [&dyn LogitsProcessor; 7] = [
+    let stages: [&dyn LogitsProcessor; 8] = [
         &mid_word::MidWordThinkEndMask,
         &post_close::PostCloseThinkMask,
         &tool_during_think::ToolCallDuringThinkingMask,
         &forced_think_end::ForcedThinkEndInjector,
         &pin_tool_call::PinToToolCallStart,
+        // Opinionated tool-completion guard (default ON,
+        // ATLAS_TOOL_COMPLETION_GUARD=0 to disable): mask EOS while the guard
+        // is active so the model continues to its intended tool call. Runs
+        // before forced_token / grammar so the masked distribution is what
+        // those constrain.
+        &super::emit_step::ToolCompletionEosMask,
         &forced_token::ForcedTokenFastPath,
         &grammar_bitmask::GrammarBitmaskApply,
     ];

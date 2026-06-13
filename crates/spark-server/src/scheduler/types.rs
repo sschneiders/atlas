@@ -128,6 +128,12 @@ pub(super) struct ActiveSeq {
     /// (vLLM-parity repetition detection), this overrides the
     /// last-token-derived reason in `lifecycle::finish_sequence`.
     pub finish_reason_override: Option<&'static str>,
+    /// Tool-completion guard (opinionated, default ON; see
+    /// `helpers::tool_completion_guard_enabled`). `None` until the guard
+    /// first suppresses a bare EOS in a tool-active no-tool-call turn;
+    /// then holds `output_tokens.len()` at that point, so the guard keeps
+    /// suppressing only within a bounded window past it.
+    pub completion_guard_start: Option<usize>,
     /// Per-server spontaneous-thinking budget (from MODEL.toml
     /// `[behavior].max_thinking_budget`).
     pub spontaneous_think_budget: Option<u32>,

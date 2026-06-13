@@ -123,6 +123,29 @@ pub fn tool_response_stop_enabled() -> bool {
     env_flag_default_on("ATLAS_TOOL_RESPONSE_STOP")
 }
 
+/// Tool-completion guard (2026-06-13, default ON; kill-switch
+/// `ATLAS_TOOL_COMPLETION_GUARD=0`/`false`).
+///
+/// OPINIONATED, EXPERIMENTATION-DRIVEN departure from strict vLLM parity.
+/// In `tool_choice="auto"` vLLM lets the model emit EOS at any time; a
+/// turn that states an intended action then samples `<|im_end|>` without
+/// emitting the tool call is "valid" and ends the turn. opencode masks
+/// this by auto-continuing on a no-tool-call turn; Zed does not, so it
+/// stops the agentic session prematurely (observed live 2026-06-13:
+/// Qwen3.6-35B-A3B-FP8 emitted "Let me read native.rs…" then EOS, no tool
+/// call, even at temp 0.3). This guard makes Atlas robust to clients that
+/// do NOT auto-continue, the way opencode's orchestration is: in a
+/// tool-active turn that has produced content but not yet a tool call, a
+/// bare EOS is suppressed so the model continues to the tool call it was
+/// about to emit — strictly BOUNDED to a small token window so a turn that
+/// genuinely has nothing more to do still stops (no hallucinated-transcript
+/// trap; see the bounded design in `emit_step::tool_completion_guard_*`).
+/// This is a deliberate product choice, not a correctness requirement;
+/// disable it for strict-parity deployments.
+pub fn tool_completion_guard_enabled() -> bool {
+    env_flag_default_on("ATLAS_TOOL_COMPLETION_GUARD")
+}
+
 /// Whether the grammar forced-token fast-path is enabled (default
 /// `true`; disabled by `ATLAS_DISABLE_FORCED_TOKEN=1`/`true`).
 pub fn forced_token_fastpath_enabled() -> bool {

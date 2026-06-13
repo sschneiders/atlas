@@ -212,18 +212,21 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     // (it could neither act nor stop). EOS is suppressed only when the
     // request explicitly requires a tool call that has not happened yet
     // (`tool_choice="required"`/specific — vLLM also forces the call
-    // there) or while `min_tokens` is unmet (also a vLLM feature).
-    let legacy_suppresses_eos = a.require_tool_call;
-    let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
-    let suppress_eos = legacy_suppresses_eos || min_tokens_suppresses;
-
-    if a.eos_tokens.contains(&tok) && !suppress_eos {
+    // there), while `min_tokens` is unmet (also a vLLM feature), or by the
+    // opinionated, bounded tool-completion guard (see `tool_completion_guard`).
+    if a.eos_tokens.contains(&tok) {
+        let legacy_suppresses_eos = a.require_tool_call;
+        let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
+        if legacy_suppresses_eos || min_tokens_suppresses || tool_completion_guard(a) {
+            // Suppressed: discard the EOS (it was pushed at line ~164 before
+            // this check) so it is neither streamed nor counted, and let the
+            // model keep generating. Budget was already consumed for this
+            // step, which is intentional — suppression is not free, so it
+            // cannot outrun `max_tokens`.
+            a.output_tokens.pop();
+            return;
+        }
         a.finished = true;
-        return;
-    }
-    if a.eos_tokens.contains(&tok) && suppress_eos {
-        // EOS suppressed: grammar not terminated, legacy tool call not yet seen,
-        // or min_tokens not reached. Don't stop — let the model continue generating.
         return;
     }
     // OPENCODE FIX: see process_decode_logits — same gate. Suppress streaming
@@ -387,6 +390,112 @@ pub enum StartPrefillResult {
 //
 // Token IDs are Qwen3.6 byte-level BPE (verified via /tokenize 2026-05-25):
 //   27 = `<`, 28 = `=`, 29 = `>`, 510 = `</`, 15704 = `parameter`.
+
+/// Maximum tokens the tool-completion guard will keep an EOS suppressed,
+/// measured from the first suppression. A tool call (`<tool_call>{…}
+/// </tool_call>`) is short (~30–60 tokens), so this is ample for the model
+/// to emit the call it was about to make, while strictly bounding the extra
+/// generation on a turn that genuinely has nothing more to do (after the
+/// window, EOS is allowed — no hallucinated-transcript trap).
+const TOOL_COMPLETION_GUARD_WINDOW: usize = 128;
+
+/// Tool-completion guard — OPINIONATED, EXPERIMENTATION-DRIVEN, BOUNDED.
+///
+/// Returns `true` to SUPPRESS a bare EOS so the model continues. This is a
+/// deliberate departure from strict vLLM `tool_choice="auto"` semantics
+/// (where EOS always ends the turn), added 2026-06-13 after live Zed
+/// sessions showed Qwen3.6-35B-A3B-FP8 occasionally stating an intended
+/// action ("Let me read native.rs…") then emitting EOS with no tool call,
+/// even at temp 0.3 — which non-continuing clients like Zed read as "agent
+/// done" and stop prematurely (opencode masks the same behavior by
+/// auto-continuing). See [`helpers::tool_completion_guard_enabled`] for the
+/// full rationale and the `ATLAS_TOOL_COMPLETION_GUARD=0` kill-switch.
+///
+/// Fires only in a tool-active turn (`tool_request`) that has produced
+/// content but **no tool call yet** (`!tool_call_completed`), and only
+/// within [`TOOL_COMPLETION_GUARD_WINDOW`] tokens of the first suppression —
+/// after which EOS is allowed so a genuinely-finished turn still stops. A
+/// completed tool call turns it off immediately. This bounded design is what
+/// keeps it from recreating the unbounded-suppression trap that the
+/// 2026-06-12 parity work removed.
+/// Field gates for the tool-completion guard: a tool-active turn that has
+/// not yet emitted a tool call, and is not mid-thinking / mid-tool-body.
+/// Shared by the post-sample EOS catch and the pre-sample EOS mask so they
+/// agree on when the guard applies (SSOT). Every gate here is set on BOTH
+/// decode paths (`tool_request` sticky from prefill; `tool_call_completed`
+/// and `inside_tool_body` via `update_tool_param_state`; `inside_thinking`
+/// tracked in both) — deliberately NOT `content_started`, which only the
+/// non-MTP path sets and would make the guard dead under MTP (the flagship).
+pub fn tool_completion_guard_eligible(a: &ActiveSeq) -> bool {
+    crate::scheduler::helpers::tool_completion_guard_enabled()
+        && a.tool_request
+        && !a.tool_call_completed
+        && !a.inside_tool_body
+        && !a.inside_thinking
+}
+
+/// True while the guard is active and still inside its bounded window past
+/// the first suppression.
+fn tool_completion_guard_within_window(a: &ActiveSeq) -> bool {
+    a.completion_guard_start
+        .is_some_and(|start| a.output_tokens.len().saturating_sub(start) < TOOL_COMPLETION_GUARD_WINDOW)
+}
+
+/// Post-sample EOS catch (called from the EOS handler in both decode paths).
+/// Returns `true` to SUPPRESS the just-sampled bare EOS. On the first bare
+/// EOS of an eligible turn it activates the bounded window; thereafter it
+/// keeps suppressing only within that window. The companion pre-sample mask
+/// ([`ToolCompletionEosMask`]) forces progress so the window advances and
+/// the model reaches the tool call it intended — without it a re-sampled EOS
+/// could spin in place.
+pub fn tool_completion_guard(a: &mut ActiveSeq) -> bool {
+    if !tool_completion_guard_eligible(a) {
+        return false;
+    }
+    match a.completion_guard_start {
+        None => {
+            a.completion_guard_start = Some(a.output_tokens.len());
+            tracing::debug!(
+                output_len = a.output_tokens.len(),
+                "tool-completion guard: suppressing bare EOS (no tool call yet); \
+                 nudging the model to continue (bounded to {TOOL_COMPLETION_GUARD_WINDOW} tokens)"
+            );
+            true
+        }
+        Some(_) => tool_completion_guard_within_window(a),
+    }
+}
+
+/// Pre-sample mask: once the guard has activated (a bare EOS was caught) and
+/// we are still inside its bounded window, set the model's EOS logits to
+/// `-inf` so the sampler is forced to a non-EOS token. This guarantees the
+/// sequence advances (the window can't stall) and steers the model to the
+/// `<tool_call>` opener it was about to emit. Deactivates automatically once
+/// a tool call completes (`tool_call_completed`) or the window is exhausted.
+pub struct ToolCompletionEosMask;
+
+impl super::logit_processors::LogitsProcessor for ToolCompletionEosMask {
+    fn apply(
+        &self,
+        logits: &mut [f32],
+        a: &mut ActiveSeq,
+        _ctx: &super::logit_processors::LogitsContext,
+    ) -> super::logit_processors::ProcessorOutcome {
+        if tool_completion_guard_eligible(a) && tool_completion_guard_within_window(a) {
+            for &eos in &a.eos_tokens {
+                let idx = eos as usize;
+                if idx < logits.len() {
+                    logits[idx] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        super::logit_processors::ProcessorOutcome::Continue
+    }
+
+    fn name(&self) -> &'static str {
+        "tool_completion_eos_mask"
+    }
+}
 
 /// vLLM-parity repetition stop — the `check_stop` repetition branch
 /// (`v1/core/sched/utils.py`, vLLM >= v0.17.0). Called after each

@@ -279,6 +279,7 @@ pub fn resume_swapped_seq(
         thinking_budget: s.thinking_budget,
         repetition_detection: s.repetition_detection,
         finish_reason_override: None,
+        completion_guard_start: None,
         spontaneous_think_budget: s.spontaneous_think_budget,
         thinking_tokens: s.thinking_tokens,
         force_end_thinking: s.force_end_thinking,

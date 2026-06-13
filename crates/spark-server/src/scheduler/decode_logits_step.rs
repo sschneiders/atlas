@@ -350,15 +350,18 @@ pub fn process_decode_logits(
         // EOS handling. vLLM parity (2026-06-12): a natural EOS always ends
         // the turn except when the request explicitly requires a tool call
         // that has not happened yet (`tool_choice="required"`/specific —
-        // vLLM also forces the call there) or while `min_tokens` is unmet
-        // (also a vLLM feature). The auto-mode grammar suppression, the
-        // EOS-escape kill-switch, the in-thinking suppression, and the
+        // vLLM also forces the call there), while `min_tokens` is unmet
+        // (also a vLLM feature), or by the opinionated, bounded
+        // tool-completion guard (`emit_step::tool_completion_guard`,
+        // SSOT with the MTP/verify path). The auto-mode grammar suppression,
+        // the EOS-escape kill-switch, the in-thinking suppression, and the
         // POST_THINK_MIN_CONTENT guard were all removed — each had been
         // observed forcing the model past its natural stop into template
         // artefacts or hallucinated transcripts.
-        let legacy_suppresses_eos = a.require_tool_call;
-        let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
-        let suppress_eos = legacy_suppresses_eos || min_tokens_suppresses;
+        let suppress_eos = a.eos_tokens.contains(&tok)
+            && (a.require_tool_call
+                || a.output_tokens.len() < a.min_tokens
+                || crate::scheduler::emit_step::tool_completion_guard(a));
 
         if a.eos_tokens.contains(&tok) && !suppress_eos {
             // Stop/EOS token: do NOT stream to client (OpenAI spec: returned text
