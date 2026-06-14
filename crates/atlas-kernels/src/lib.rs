@@ -124,6 +124,48 @@ impl Default for SamplingPresets {
     }
 }
 
+/// vLLM-parity `RepetitionDetectionParams` (vllm/sampling_params.py).
+/// Field names, defaults, and validation mirror vLLM exactly:
+/// `max_pattern_size = 0` disables; `min_pattern_size = 0` is treated as 1;
+/// `min_count` must be >= 2 when enabled.
+///
+/// Lives in `atlas-kernels` (the lower crate) so it can be referenced from
+/// `ModelBehavior` without a cyclic dependency. `spark-server` re-exports it
+/// from `crate::openai` so existing import paths keep resolving.
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RepetitionDetectionParams {
+    #[serde(default)]
+    pub max_pattern_size: u32,
+    #[serde(default)]
+    pub min_pattern_size: u32,
+    #[serde(default)]
+    pub min_count: u32,
+}
+
+impl RepetitionDetectionParams {
+    /// vLLM `__post_init__` validation, verbatim semantics. Returns an
+    /// error message suitable for an OpenAI-style 400 body.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.min_pattern_size > self.max_pattern_size {
+            return Err("max_pattern_size, min_pattern_size must be >=0, with \
+                 min_pattern_size <= max_pattern_size. Set both to 0 to \
+                 disable repetitive pattern detection.");
+        }
+        if self.max_pattern_size > 0 && self.min_count < 2 {
+            return Err("min_count must be >= 2 to detect repetitive patterns in \
+                 engine output. If you do not wish to detect repetitive \
+                 patterns, set max_pattern_size to 0.");
+        }
+        Ok(())
+    }
+
+    /// True iff detection is enabled (vLLM: `max_pattern_size = 0` disables).
+    pub fn enabled(&self) -> bool {
+        self.max_pattern_size > 0
+    }
+}
+
 /// Model-specific behavior flags from MODEL.toml `[behavior]`.
 #[derive(Debug, Clone)]
 pub struct ModelBehavior {
@@ -198,6 +240,11 @@ pub struct ModelBehavior {
     /// specific model is known to ALWAYS get tool args right on the
     /// first attempt (extra inference round-trip cost is wasted there).
     pub tool_retry: bool,
+    /// Operator-default repetition detection (vLLM parity). None = off.
+    /// Overridden per-request by `ChatCompletionRequest.repetition_detection`
+    /// and globally by CLI `--repetition-detection`. Set in MODEL.toml
+    /// `[behavior.repetition_detection]`.
+    pub repetition_detection: Option<RepetitionDetectionParams>,
 }
 
 impl Default for ModelBehavior {
@@ -216,6 +263,7 @@ impl Default for ModelBehavior {
             tscg: false,
             disable_tool_grammar: false,
             tool_retry: true,
+            repetition_detection: None,
         }
     }
 }
@@ -370,5 +418,59 @@ mod tests {
             found.is_some(),
             "ptx_for_model('qwen3-next-80b') should find the default target"
         );
+    }
+
+    // ── RepetitionDetectionParams (vLLM parity) ──
+
+    #[test]
+    fn repetition_detection_deserialize_snake_case() {
+        // Mirrors both the JSON CLI flag (`--repetition-detection '{"..."}'`)
+        // and the TOML `[behavior.repetition_detection]` field names.
+        let json = r#"{"max_pattern_size":8,"min_pattern_size":1,"min_count":5}"#;
+        let rd: RepetitionDetectionParams = serde_json::from_str(json).unwrap();
+        assert_eq!(rd.max_pattern_size, 8);
+        assert_eq!(rd.min_pattern_size, 1);
+        assert_eq!(rd.min_count, 5);
+        assert!(rd.enabled());
+        assert!(rd.validate().is_ok());
+    }
+
+    #[test]
+    fn repetition_detection_defaults_disable() {
+        // Empty/absent fields → all zero → disabled.
+        let rd: RepetitionDetectionParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(rd.max_pattern_size, 0);
+        assert!(!rd.enabled());
+        assert!(rd.validate().is_ok()); // disabled is valid
+    }
+
+    #[test]
+    fn repetition_detection_validate_min_count() {
+        // max_pattern_size > 0 with min_count < 2 is invalid (vLLM parity).
+        let rd = RepetitionDetectionParams {
+            max_pattern_size: 8,
+            min_pattern_size: 1,
+            min_count: 1,
+        };
+        assert!(rd.validate().is_err());
+    }
+
+    #[test]
+    fn repetition_detection_serialize_roundtrip() {
+        let rd = RepetitionDetectionParams {
+            max_pattern_size: 8,
+            min_pattern_size: 1,
+            min_count: 5,
+        };
+        let json = serde_json::to_string(&rd).unwrap();
+        let rd2: RepetitionDetectionParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(rd.max_pattern_size, rd2.max_pattern_size);
+        assert_eq!(rd.min_count, rd2.min_count);
+    }
+
+    #[test]
+    fn model_behavior_default_repetition_detection_none() {
+        let b = ModelBehavior::default();
+        assert!(b.repetition_detection.is_none());
     }
 }

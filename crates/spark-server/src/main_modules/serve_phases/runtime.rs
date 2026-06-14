@@ -174,6 +174,20 @@ pub(crate) fn log_behavior_audit(args: &cli::ServeArgs, ptx_set: &atlas_kernels:
     if b.tscg {
         tracing::info!("Model behavior: TSCG tool-schema compilation ENABLED (compact signatures)");
     }
+    match &b.repetition_detection {
+        Some(rd) if rd.enabled() => tracing::info!(
+            "Model behavior: repetition_detection ON (max_pattern_size={}, min_pattern_size={}, min_count={}){}",
+            rd.max_pattern_size,
+            rd.min_pattern_size,
+            rd.min_count,
+            if args.repetition_detection.is_some() {
+                " [CLI override]"
+            } else {
+                ""
+            },
+        ),
+        _ => tracing::info!("Model behavior: repetition_detection OFF"),
+    }
     if args.disable_thinking {
         tracing::info!("--disable-thinking set: thinking is forced OFF for every request");
     }

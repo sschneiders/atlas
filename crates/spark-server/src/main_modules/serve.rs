@@ -521,12 +521,12 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     // thinking tokens are allowed before `</think>` is force-emitted.
     // CLI override beats MODEL.toml; 0 / unset = no budget (vLLM parity:
     // thinking counts toward max_tokens, which is the only bound).
-    let scheduler_spontaneous_think_budget: Option<u32> = args
-        .max_thinking_budget
-        .or(match ptx_set.behavior.max_thinking_budget {
-            0 => None,
-            b => Some(b),
-        });
+    let scheduler_spontaneous_think_budget: Option<u32> =
+        args.max_thinking_budget
+            .or(match ptx_set.behavior.max_thinking_budget {
+                0 => None,
+                b => Some(b),
+            });
     std::thread::spawn(move || {
         scheduler::run(
             scheduler_model,
@@ -595,6 +595,12 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             }
             if let Some(cli_disable) = args.disable_tool_grammar {
                 b.disable_tool_grammar = cli_disable;
+            }
+            if let Some(cli_rd) = args.repetition_detection.as_deref() {
+                match serde_json::from_str::<crate::openai::RepetitionDetectionParams>(cli_rd) {
+                    Ok(rd) => b.repetition_detection = Some(rd),
+                    Err(e) => anyhow::bail!("invalid --repetition-detection JSON: {e}"),
+                }
             }
             b
         },

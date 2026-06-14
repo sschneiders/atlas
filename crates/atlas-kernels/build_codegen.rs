@@ -172,6 +172,7 @@ pub(super) fn generate_target_ptx_rs(
              \x20               tscg: {},\n\
              \x20               disable_tool_grammar: {},\n\
              \x20               tool_retry: {},\n\
+             \x20               repetition_detection: {},\n\
              \x20           }},\n\
              \x20           model_type_matches: vec![{}],\n\
              \x20           dflash: {},\n\
@@ -194,6 +195,13 @@ pub(super) fn generate_target_ptx_rs(
             target.behavior_tscg,
             target.behavior_disable_tool_grammar,
             target.behavior_tool_retry,
+            target.behavior_repetition_detection.as_ref().map_or_else(
+                || "None".to_string(),
+                |rd| format!(
+                    "Some(RepetitionDetectionParams {{ max_pattern_size: {}, min_pattern_size: {}, min_count: {} }})",
+                    rd.max_pattern_size, rd.min_pattern_size, rd.min_count
+                ),
+            ),
             target.model_type_matches.iter().map(|m| {
                 let hs = match m.hidden_size {
                     Some(v) => format!("Some({v})"),

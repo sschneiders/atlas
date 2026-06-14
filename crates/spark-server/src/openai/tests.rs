@@ -306,3 +306,69 @@ fn server_default_not_merged_when_request_explicit() {
     assert!(req.chat_template_kwargs.is_none());
     assert!(req.resolve_thinking(false).0);
 }
+
+// ── RepetitionDetectionParams (vLLM parity) ──
+
+#[test]
+fn repetition_detection_request_field_deserializes() {
+    // A client sending repetition_detection in the request body.
+    let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}],
+        "repetition_detection": {
+            "max_pattern_size": 12,
+            "min_pattern_size": 2,
+            "min_count": 3
+        }
+    }))
+    .expect("valid chat request");
+    let rd = req.repetition_detection.expect("rd present");
+    assert_eq!(rd.max_pattern_size, 12);
+    assert_eq!(rd.min_pattern_size, 2);
+    assert_eq!(rd.min_count, 3);
+    assert!(rd.enabled());
+}
+
+#[test]
+fn repetition_detection_absent_in_request_is_none() {
+    let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}],
+    }))
+    .expect("valid chat request");
+    assert!(req.repetition_detection.is_none());
+}
+
+#[test]
+fn repetition_detection_cli_json_parses() {
+    // Mirrors the --repetition-detection CLI flag parsing path in serve.rs:
+    // serde_json::from_str::<RepetitionDetectionParams>(cli_rd).
+    let json = r#"{"max_pattern_size":8,"min_pattern_size":1,"min_count":5}"#;
+    let rd: RepetitionDetectionParams = serde_json::from_str(json).expect("valid CLI json");
+    assert_eq!(rd.max_pattern_size, 8);
+    assert_eq!(rd.min_count, 5);
+    assert!(rd.enabled());
+    assert!(rd.validate().is_ok());
+}
+
+#[test]
+fn repetition_detection_precedence_option_or() {
+    // Verifies the core precedence logic used by
+    // resolve_repetition_detection: request > operator default.
+    let req_rd = Some(RepetitionDetectionParams {
+        max_pattern_size: 10,
+        min_pattern_size: 1,
+        min_count: 2,
+    });
+    let behavior_rd = Some(RepetitionDetectionParams {
+        max_pattern_size: 8,
+        min_pattern_size: 1,
+        min_count: 5,
+    });
+    // Request wins.
+    assert_eq!(req_rd.or(behavior_rd).unwrap().max_pattern_size, 10);
+    // No request → operator default.
+    assert_eq!(None.or(behavior_rd).unwrap().max_pattern_size, 8);
+    // Neither set → off.
+    assert!(None::<RepetitionDetectionParams>.or(None).is_none());
+}

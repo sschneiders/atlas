@@ -140,6 +140,8 @@ name = "atlas-kernels"
 version = "0.1.1"
 dependencies = [
  "atlas-core",
+ "serde",
+ "serde_json",
  "toml",
 ]
 

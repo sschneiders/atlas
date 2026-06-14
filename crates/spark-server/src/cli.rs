@@ -124,6 +124,13 @@ pub struct ServeArgs {
     #[arg(long)]
     pub disable_tool_grammar: Option<bool>,
 
+    /// Override MODEL.toml's `[behavior.repetition_detection]`. A JSON
+    /// object: {"max_pattern_size":8,"min_pattern_size":1,"min_count":5}.
+    /// `max_pattern_size > 0` enables; `0` disables. Precedence (highest
+    /// wins): per-request body → this flag → MODEL.toml → off.
+    #[arg(long, value_name = "JSON")]
+    pub repetition_detection: Option<String>,
+
     /// Default chat template kwargs applied when the client sends no
     /// thinking parameters (no `reasoning.effort`, `chat_template_kwargs`,
     /// or `enable_thinking` in the request body). A JSON object with

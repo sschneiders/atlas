@@ -119,6 +119,17 @@ pub(super) fn parse_sampling_presets(
     )
 }
 
+/// Local pure-data mirror of `RepetitionDetectionParams`. Build scripts
+/// run before the crate's own lib is compiled, so they cannot reference
+/// `atlas_kernels::RepetitionDetectionParams` directly — we parse into
+/// this and codegen emits the real type literal.
+#[derive(Clone)]
+pub(super) struct ParsedRepetitionDetection {
+    pub max_pattern_size: u32,
+    pub min_pattern_size: u32,
+    pub min_count: u32,
+}
+
 /// Parsed `[behavior]` table from a model's MODEL.toml. Field defaults
 /// match `ModelBehavior::default()` so an absent table / absent field is
 /// behavior-neutral.
@@ -137,6 +148,7 @@ pub(super) struct ParsedBehavior {
     pub tscg: bool,
     pub disable_tool_grammar: bool,
     pub tool_retry: bool,
+    pub repetition_detection: Option<ParsedRepetitionDetection>,
 }
 
 impl Default for ParsedBehavior {
@@ -155,6 +167,7 @@ impl Default for ParsedBehavior {
             tscg: false,
             disable_tool_grammar: false,
             tool_retry: true,
+            repetition_detection: None,
         }
     }
 }
@@ -231,6 +244,30 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.get("tool_retry"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    // `[behavior.repetition_detection]` — nested TOML sub-table. Absent
+    // or empty (max_pattern_size=0) ⇒ None (off). Mirrors how vLLM treats
+    // max_pattern_size=0 as disabled.
+    let repetition_detection = b
+        .and_then(|v| v.get("repetition_detection"))
+        .and_then(|v| v.as_table())
+        .map(|t| ParsedRepetitionDetection {
+            max_pattern_size: t
+                .get("max_pattern_size")
+                .and_then(|v| v.as_integer())
+                .map(|v| v as u32)
+                .unwrap_or(0),
+            min_pattern_size: t
+                .get("min_pattern_size")
+                .and_then(|v| v.as_integer())
+                .map(|v| v as u32)
+                .unwrap_or(0),
+            min_count: t
+                .get("min_count")
+                .and_then(|v| v.as_integer())
+                .map(|v| v as u32)
+                .unwrap_or(2),
+        })
+        .filter(|rd| rd.max_pattern_size > 0);
     ParsedBehavior {
         thinking_in_tools,
         max_thinking_budget,
@@ -245,6 +282,7 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         tscg,
         disable_tool_grammar,
         tool_retry,
+        repetition_detection,
     }
 }
 

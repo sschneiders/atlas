@@ -78,6 +78,7 @@ struct Target {
     behavior_tscg: bool,
     behavior_disable_tool_grammar: bool,
     behavior_tool_retry: bool,
+    behavior_repetition_detection: Option<ParsedRepetitionDetection>,
     /// Which `(model_type, hidden_size)` pairs this kernel target supports.
     /// Parsed from `[[model_types]]` in MODEL.toml.
     model_type_matches: Vec<ModelTypeMatch>,
@@ -526,6 +527,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_tscg: pb.tscg,
                 behavior_disable_tool_grammar: pb.disable_tool_grammar,
                 behavior_tool_retry: pb.tool_retry,
+                behavior_repetition_detection: pb.repetition_detection,
                 model_type_matches,
                 dflash,
             });
@@ -557,7 +559,8 @@ fn list_subdirs(dir: &std::path::Path) -> Vec<String> {
 #[path = "build_parse.rs"]
 mod build_parse;
 use build_parse::{
-    parse_behavior, parse_dflash, parse_kernel_toml, parse_model_types, parse_sampling_presets,
+    ParsedRepetitionDetection, parse_behavior, parse_dflash, parse_kernel_toml, parse_model_types,
+    parse_sampling_presets,
 };
 
 /// Collect kernel-source files with shadowing: common dir provides the

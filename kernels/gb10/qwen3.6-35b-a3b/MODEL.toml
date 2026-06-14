@@ -222,6 +222,16 @@ thinking_in_tools = true
 # dominates any acceptance-rate gain at K=3 for this 35B-A3B model.
 default_num_drafts = 1
 
+# Operator-default repetition detection (vLLM parity, vLLM >= v0.17.0).
+# Detects repetitive N-gram patterns in output tokens and ends generation
+# early with finish_reason="repetition". Precedence (highest wins):
+# per-request body > CLI --repetition-detection > this table > off.
+# max_pattern_size > 0 enables.
+[behavior.repetition_detection]
+max_pattern_size = 8
+min_pattern_size = 1
+min_count = 5
+
 [[model_types]]
 model_type = "qwen3_6_moe"
 hidden_size = 2048

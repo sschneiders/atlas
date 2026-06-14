@@ -199,43 +199,12 @@ pub struct ChatCompletionRequest {
 /// Field names, defaults, and validation mirror vLLM exactly:
 /// `max_pattern_size = 0` disables; `min_pattern_size = 0` is treated as 1;
 /// `min_count` must be >= 2 when enabled.
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct RepetitionDetectionParams {
-    #[serde(default)]
-    pub max_pattern_size: u32,
-    #[serde(default)]
-    pub min_pattern_size: u32,
-    #[serde(default)]
-    pub min_count: u32,
-}
-
-impl RepetitionDetectionParams {
-    /// vLLM `__post_init__` validation, verbatim semantics. Returns an
-    /// error message suitable for an OpenAI-style 400 body.
-    pub fn validate(&self) -> Result<(), &'static str> {
-        if self.min_pattern_size > self.max_pattern_size {
-            return Err(
-                "max_pattern_size, min_pattern_size must be >=0, with \
-                 min_pattern_size <= max_pattern_size. Set both to 0 to \
-                 disable repetitive pattern detection.",
-            );
-        }
-        if self.max_pattern_size > 0 && self.min_count < 2 {
-            return Err(
-                "min_count must be >= 2 to detect repetitive patterns in \
-                 engine output. If you do not wish to detect repetitive \
-                 patterns, set max_pattern_size to 0.",
-            );
-        }
-        Ok(())
-    }
-
-    /// True iff detection is enabled (vLLM: `max_pattern_size = 0` disables).
-    pub fn enabled(&self) -> bool {
-        self.max_pattern_size > 0
-    }
-}
+///
+/// Re-exported from `atlas_kernels` (where the struct lives so it can be
+/// referenced from `ModelBehavior` without a cyclic dependency). Existing
+/// import paths (`crate::openai::RepetitionDetectionParams`,
+/// `crate::api::RepetitionDetectionParams`) keep resolving.
+pub use atlas_kernels::RepetitionDetectionParams;
 
 /// Stream options (OpenAI-compatible).
 #[derive(Debug, Clone, Copy, Deserialize, Default)]

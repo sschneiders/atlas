@@ -7,6 +7,10 @@ description = "Atlas CUDA kernel PTX — compiled from kernels/{hw}/{model}/{qua
 
 [dependencies]
 atlas-core = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [build-dependencies]
 toml = "0.8"

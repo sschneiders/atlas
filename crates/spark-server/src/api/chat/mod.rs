@@ -21,6 +21,7 @@
 //!                      timeout / logprobs resolution
 
 mod msg_entry;
+mod repetition;
 mod sampling_setup;
 mod template;
 mod thinking;
@@ -83,6 +84,12 @@ pub(crate) async fn chat_completions_inner(
 ) -> Response {
     crate::metrics::REQUESTS_TOTAL.inc();
     crate::metrics::REQUESTS_ACTIVE.inc();
+
+    // Operator-default repetition detection: request > CLI > MODEL.toml > off.
+    // Resolved before validation so a bad operator config also 400s.
+    if req.repetition_detection.is_none() {
+        req.repetition_detection = repetition::resolve_repetition_detection(&state, &req);
+    }
 
     // ── Input validation + cross-turn F-feature guards ──
     if let Err(resp) = super::chat_phases::validate_input(&req) {
@@ -210,12 +217,7 @@ pub(crate) async fn chat_completions_inner(
         grammar_spec,
         timeout_at,
         top_logprobs,
-    } = match sampling_setup::build_sampling(
-        &state,
-        &req,
-        enable_thinking,
-        tools_active,
-    ) {
+    } = match sampling_setup::build_sampling(&state, &req, enable_thinking, tools_active) {
         Ok(s) => s,
         Err(resp) => return resp,
     };
