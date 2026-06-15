@@ -73,13 +73,21 @@ All branches chain off the previous one (branch N+1 is based on branch N). `main
 with upstream; all KVFlash artifacts live on the branch chain.
 
 ### branch1 — `feat/kvflash-1-hostram-backend`
-- Generalize `HighSpeedSwap.backend: IoUringBackend` → `backend: B` where `B: StorageBackend`.
-- Add `HostRamBackend` in `spark-storage/src/backend/host_ram.rs`: an in-process `HashMap<GroupKey,
-  Vec<u8>>` of pinned host bytes; `read()` issues `cuMemcpyHtoDAsync` on the supplied stream;
-  `write_from_host()` clones bytes into the map.
-- Add pool-sized per-request allocation mode to `PagedKvCache` (opt-in; default unchanged).
-- Bit-exact round-trip unit tests per `KvCacheDtype` (host-RAM write → read back == original).
-- Pure Rust; no CUDA kernel changes; testable without nvcc via the POSIX-style deterministic path.
+- Generalize `HighSpeedSwap.backend: IoUringBackend` → `backend: Box<dyn StorageBackend>`.
+  (Box, not a generic param: HSS is installed via a `thread_local!` holding a concrete type at
+  `high_speed_swap.rs:226`, so `<B>` would break the thread-local. Dyn-dispatch on `read`/
+  `write` is negligible — called a few times per step behind ms-scale I/O.)
+- Refactor `new_on_stream` so a caller can inject an arbitrary backend; keep an IoUringBackend
+  default constructor so existing callers compile unchanged.
+- Add `HostRamBackend` in `spark-storage/src/backend/host_ram.rs`: an in-process store of
+  pinned host bytes keyed by `GroupKey` (mirrors `PosixBackend`'s bounce-buffer pattern at
+  `backend/posix.rs:16`); `read()` issues `copy_h_to_d_async` on the supplied stream;
+  `write_from_host()` stores the bytes (no `Layout` / files needed).
+- Bit-exact round-trip tests: a pure-host store test (no GPU) plus a full H2D round-trip
+  (`#[ignore = "requires GPU"]`, mirroring `posix.rs:111`).
+- `PagedKvCache` is NOT touched in PR1 — under "extend HSS" the pool is HSS's `ScratchPool`
+  (already pool-sized at `cfg.resident_blocks`). The KVFlash pager that bridges residency to
+  per-request KV is introduced in PR3. PR1 is pure `spark-storage`, no CUDA kernel changes.
 
 ### branch2 — `feat/kvflash-2-slot-mask`
 - Surgical validity: define a `KVFLASH_INVALID_BLOCK` sentinel (reuse the `dummy_kv_block` pattern
