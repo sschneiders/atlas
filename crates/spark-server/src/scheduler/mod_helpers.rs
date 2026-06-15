@@ -86,11 +86,14 @@ pub(super) fn install_kvflash(model: &dyn Model, cfg: Option<spark_runtime::Kvfl
     );
     match model.kv_cache_dims() {
         Some((block_size, num_layers)) => {
+            // Compute the display value BEFORE the move into `install` (cfg is
+            // consumed by install; referencing cfg.pool_tokens afterward is a
+            // use-after-move).
+            let pool_blocks = cfg.pool_tokens / block_size.max(1) as usize;
             spark_runtime::kvflash_pager::install(cfg, block_size, num_layers);
             tracing::info!(
                 "KVFlash pager installed on scheduler thread: block_size={block_size}, \
-                 num_layers={num_layers}, pool_blocks={}",
-                cfg.pool_tokens / block_size.max(1) as usize
+                 num_layers={num_layers}, pool_blocks={pool_blocks}"
             );
         }
         None => {
