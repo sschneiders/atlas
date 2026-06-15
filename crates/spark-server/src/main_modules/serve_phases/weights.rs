@@ -147,3 +147,65 @@ pub(crate) fn load_dflash_drafter(
     );
     Ok(Some((drafter_store, drafter_config)))
 }
+
+pub(crate) fn load_kvflash_scorer(
+    args: &cli::ServeArgs,
+    kvflash_cfg: &Option<spark_runtime::KvflashConfig>,
+    gpu: &dyn spark_runtime::gpu::GpuBackend,
+) -> Result<Option<spark_runtime::kvflash_scorer::DrafterScorer>> {
+    use spark_runtime::weights::WeightLoader;
+    let Some(cfg) = kvflash_cfg else {
+        return Ok(None);
+    };
+    if cfg.policy != spark_runtime::KvflashPolicy::Drafter {
+        tracing::info!(
+            "KVFlash: policy={:?} — no drafter scorer loaded (LRU in effect)",
+            cfg.policy
+        );
+        return Ok(None);
+    }
+    // Resolve the small drafter (Qwen3-0.6B-class): explicit --draft-model
+    // wins; else the default pflash drafter id. (Unlike DFlash, KVFlash has no
+    // MODEL.toml [kvflash].drafter field yet — PR6 adds it.)
+    let drafter_id = args
+        .draft_model
+        .clone()
+        .unwrap_or_else(|| "Qwen/Qwen3-0.6B".to_string());
+    tracing::info!("KVFlash: resolving drafter scorer '{drafter_id}'");
+    let drafter_dir =
+        crate::model_resolver::resolve_model_dir(&drafter_id, args.cache_dir.as_deref())
+            .context("Failed to resolve KVFlash drafter checkpoint")?;
+    let config_json = std::fs::read_to_string(drafter_dir.join("config.json"))
+        .with_context(|| format!("read drafter config.json at {}", drafter_dir.display()))?;
+    let (hidden_size, num_layers) = parse_drafter_dims(&config_json)
+        .context("parse KVFlash drafter hidden_size/num_hidden_layers")?;
+    let mut loader = spark_runtime::weights::SafetensorsLoader::new();
+    loader.peak_memory_multiplier = None;
+    let store = loader
+        .load(&drafter_dir, gpu, 0)
+        .context("Failed to load KVFlash drafter weights")?;
+    tracing::info!(
+        "KVFlash drafter scorer store: {} tensors, {} bytes (hidden={hidden_size}, layers={num_layers})",
+        store.len(),
+        store.total_bytes()
+    );
+    Ok(Some(spark_runtime::kvflash_scorer::DrafterScorer::new(
+        store,
+        hidden_size,
+        num_layers,
+    )))
+}
+
+/// Parse `hidden_size` and `num_hidden_layers` from a HF-style config.json.
+/// Kept tiny and tolerant: missing fields are a hard error (PCND — no defaults
+/// for structural dims).
+fn parse_drafter_dims(config_json: &str) -> Result<(usize, usize)> {
+    #[derive(serde::Deserialize)]
+    struct DrafterConfigDims {
+        hidden_size: usize,
+        num_hidden_layers: usize,
+    }
+    let dims: DrafterConfigDims = serde_json::from_str(config_json)
+        .context("drafter config.json is not valid JSON with hidden_size + num_hidden_layers")?;
+    Ok((dims.hidden_size, dims.num_hidden_layers))
+}

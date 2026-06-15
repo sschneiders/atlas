@@ -521,6 +521,14 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     // ── --kvflash config validation ──
     let kvflash_cfg = serve_phases::validate_kvflash(&args, &early_kvflash_cfg)?;
 
+    // KVFlash decode-loop integration consumes this scorer (see
+    // docs/design/kvflash-port.md PR4).
+    let kvflash_scorer = serve_phases::load_kvflash_scorer(&args, &kvflash_cfg, gpu.as_ref())?;
+    match &kvflash_scorer {
+        Some(_) => tracing::info!("KVFlash: drafter scorer materialized"),
+        None => tracing::info!("KVFlash: no drafter scorer (LRU policy or kvflash off)"),
+    }
+
     let adaptive_sampling = args.adaptive_sampling;
     let session_manager = session_manager::SessionSsmManager::new(600); // 10 min TTL
     // Spontaneous-thinking budget: when the model emits `<think>` without

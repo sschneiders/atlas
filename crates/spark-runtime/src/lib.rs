@@ -16,6 +16,12 @@ pub mod kv_dequant;
 pub mod kv_spill;
 pub mod kvflash_config;
 pub mod kvflash_residency;
+pub mod kvflash_scorer;
+
+// Re-export the KVFlash config types at the crate root so spark-server can
+// reference them as `spark_runtime::KvflashConfig` / `KvflashPolicy` (mirrors
+// how other top-level runtime types are surfaced).
+pub use kvflash_config::{KvflashConfig, KvflashPolicy};
 #[cfg(feature = "metal")]
 pub mod metal_backend;
 pub mod prefix_cache;
