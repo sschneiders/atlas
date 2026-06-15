@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 
-use crate::backend::IoUringBackend;
+use crate::backend::{IoUringBackend, StorageBackend};
 use crate::config::HighSpeedSwapConfig;
 use crate::cuda_min::{CudaCtx, DeviceBuffer};
 use crate::eviction::EvictionPolicy;
@@ -26,7 +26,7 @@ pub struct HighSpeedSwap {
     model: ModelDims,
     predictor: Predictor,
     pool: ScratchPool,
-    backend: IoUringBackend,
+    backend: Box<dyn StorageBackend>,
     attn: TiledAttention,
     eviction: EvictionPolicy,
     // Reusable scratch buffers.
@@ -81,7 +81,32 @@ impl HighSpeedSwap {
             4096,
         );
         let layout = Layout::create(&cfg.dir, group_layout).context("create layout")?;
-        let backend = IoUringBackend::new(layout, cfg.qd as usize)?;
+        let backend: Box<dyn StorageBackend> =
+            Box::new(IoUringBackend::new(layout, cfg.qd as usize)?);
+        Self::new_on_stream_with_backend(stream, cfg, model, backend)
+    }
+
+    /// Stream-only constructor that accepts an injected storage backend.
+    /// Used by callers (e.g. the host-RAM KVFlash path) that own their own
+    /// store and therefore must not have the orchestrator create the NVMe
+    /// layout / swap dir. Only `cfg.validate()` runs here; the injected
+    /// backend owns its own storage lifecycle.
+    pub fn new_on_stream_with_backend(
+        stream: u64,
+        cfg: HighSpeedSwapConfig,
+        model: ModelDims,
+        backend: Box<dyn StorageBackend>,
+    ) -> Result<Self> {
+        cfg.validate()?;
+        let group_layout = GroupLayout::new(
+            model.num_layers,
+            model.max_blocks_per_layer,
+            model.num_kv_heads,
+            model.block_size as u32,
+            model.head_dim as u32,
+            2, // BF16
+            4096,
+        );
         let pool = ScratchPool::new(ScratchDims {
             num_slots: cfg.resident_blocks,
             num_kv_heads: model.num_kv_heads,

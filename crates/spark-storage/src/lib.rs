@@ -72,7 +72,7 @@ pub mod scratch_pool;
 pub mod tiled_attention;
 
 #[cfg(feature = "cuda")]
-pub use backend::{IoUringBackend, PosixBackend, ReadRequest, StorageBackend};
+pub use backend::{HostRamBackend, IoUringBackend, PosixBackend, ReadRequest, StorageBackend};
 pub use config::HighSpeedSwapConfig;
 pub use eviction::EvictionPolicy;
 #[cfg(feature = "cuda")]

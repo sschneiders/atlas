@@ -12,9 +12,11 @@ use anyhow::Result;
 
 use crate::group::GroupKey;
 
+pub mod host_ram;
 pub mod io_uring;
 pub mod posix;
 
+pub use self::host_ram::HostRamBackend;
 pub use self::io_uring::IoUringBackend;
 pub use posix::PosixBackend;
 
