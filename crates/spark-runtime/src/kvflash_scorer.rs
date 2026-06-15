@@ -101,6 +101,50 @@ impl KvFlashScorer for DrafterScorer {
     }
 }
 
+/// Cross-tokenizer drafter scorer for non-qwen targets (laguna, gemma4).
+///
+/// Relevance is a property of the TEXT, not the tokenizer: this scorer
+/// detokenizes the target's history with the TARGET tokenizer, re-tokenizes
+/// for the drafter's tokenizer, scores, and maps scores back to chunk
+/// boundaries by character spans (lucebox's `KvFlashCrossTokScorer`).
+///
+/// RUNTIME-VALIDATION GATE: the detokenize/re-tokenize step needs both
+/// tokenizers wired (spark-server's TokenizerRuntime + the drafter's) and is
+/// NOT yet implemented. `score_chunks` falls back to LRU ordering so
+/// correctness is preserved. Qwen3.6 targets do NOT need this scorer — they
+/// feed target ids to the drafter directly (same tokenizer family).
+pub struct CrossTokScorer {
+    #[allow(dead_code)]
+    store: WeightStore,
+    #[allow(dead_code)]
+    hidden_size: usize,
+}
+
+impl CrossTokScorer {
+    pub fn new(store: WeightStore, hidden_size: usize) -> Self {
+        Self { store, hidden_size }
+    }
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+}
+
+impl KvFlashScorer for CrossTokScorer {
+    fn score_chunks(&mut self, num_chunks: usize) -> Vec<f32> {
+        // TODO(kvflash PR6 runtime-validation): detokenize target ids ->
+        // re-tokenize for drafter -> score -> map back by char spans. Until
+        // then, LRU fallback preserves correctness.
+        tracing::debug!(
+            "kvflash CrossTokScorer not yet wired (hidden={}): LRU fallback",
+            self.hidden_size
+        );
+        (0..num_chunks).map(|i| i as f32).collect()
+    }
+    fn name(&self) -> &'static str {
+        "cross-tok"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +178,18 @@ mod tests {
         assert_eq!(scorer.name(), "drafter");
         assert_eq!(scorer.hidden_size(), 1024);
         assert_eq!(scorer.num_layers(), 28);
+        let scores = scorer.score_chunks(4);
+        assert_eq!(scores, vec![0.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn crosstok_falls_back_to_lru_ordering() {
+        // WeightStore::empty() is the documented testing constructor.
+        // Until the detokenize/re-tokenize bridge is wired, CrossTokScorer
+        // must return ascending (LRU) scores so correctness is preserved.
+        let mut scorer = CrossTokScorer::new(WeightStore::empty(), 1024);
+        assert_eq!(scorer.name(), "cross-tok");
+        assert_eq!(scorer.hidden_size(), 1024);
         let scores = scorer.score_chunks(4);
         assert_eq!(scores, vec![0.0, 1.0, 2.0, 3.0]);
     }

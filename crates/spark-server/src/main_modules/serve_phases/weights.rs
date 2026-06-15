@@ -151,6 +151,7 @@ pub(crate) fn load_dflash_drafter(
 pub(crate) fn load_kvflash_scorer(
     args: &cli::ServeArgs,
     kvflash_cfg: &Option<spark_runtime::KvflashConfig>,
+    ptx_set: &atlas_kernels::TargetPtxSet,
     gpu: &dyn spark_runtime::gpu::GpuBackend,
 ) -> Result<Option<spark_runtime::kvflash_scorer::DrafterScorer>> {
     use spark_runtime::weights::WeightLoader;
@@ -165,11 +166,12 @@ pub(crate) fn load_kvflash_scorer(
         return Ok(None);
     }
     // Resolve the small drafter (Qwen3-0.6B-class): explicit --draft-model
-    // wins; else the default pflash drafter id. (Unlike DFlash, KVFlash has no
-    // MODEL.toml [kvflash].drafter field yet — PR6 adds it.)
+    // wins; else the per-model [kvflash].drafter from MODEL.toml; else the
+    // built-in default drafter id (precedence: CLI > MODEL.toml > default).
     let drafter_id = args
         .draft_model
         .clone()
+        .or_else(|| ptx_set.kvflash.as_ref().map(|k| k.drafter.to_string()))
         .unwrap_or_else(|| "Qwen/Qwen3-0.6B".to_string());
     tracing::info!("KVFlash: resolving drafter scorer '{drafter_id}'");
     let drafter_dir =

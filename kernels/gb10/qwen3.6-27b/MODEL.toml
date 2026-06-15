@@ -151,3 +151,11 @@ mask_token_id = 248070
 # `dflash_loader::parse_dflash_config` reads these from the drafter's
 # config.json at runtime; this MODEL.toml field is the fallback default.
 target_layer_ids = [1, 16, 31, 46, 61]
+
+# KVFlash decode-time KV paging per-model defaults (see docs/design/kvflash-port.md).
+# drafter = the small model used as the relevance scorer when --kvflash-policy
+# drafter. Qwen3.6 targets feed target ids to the drafter directly (no cross-tok).
+[kvflash]
+drafter = "Qwen/Qwen3-0.6B"
+pool_tokens_default = 0       # 0 = let the runtime size from VRAM ("auto")
+protected_tail_blocks = 4     # full-attention Qwen3.6: small protected tail

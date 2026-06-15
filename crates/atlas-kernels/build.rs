@@ -95,6 +95,10 @@ struct Target {
     /// block-diffusion speculative decoding. `None` when the model has no
     /// associated DFlash drafter checkpoint.
     dflash: Option<DflashRaw>,
+    /// `[kvflash]` section if present in MODEL.toml — per-model KVFlash
+    /// decode-paging defaults (drafter id, pool size, protected tail).
+    /// `None` when the model has no `[kvflash]` section.
+    kvflash: Option<KvflashRaw>,
 }
 
 #[derive(Default, Clone)]
@@ -104,6 +108,13 @@ struct DflashRaw {
     window_size: usize,
     mask_token_id: u32,
     target_layer_ids: Vec<usize>,
+}
+
+#[derive(Default, Clone)]
+struct KvflashRaw {
+    drafter: String,
+    pool_tokens_default: usize,
+    protected_tail_blocks: u32,
 }
 
 fn main() {
@@ -758,6 +769,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
             let pb = parse_behavior(&model_dir);
             let model_type_matches = parse_model_types(&model_dir);
             let dflash = parse_dflash(&model_dir);
+            let kvflash = parse_kvflash(&model_dir);
 
             targets.push(Target {
                 hw: hw.clone(),
@@ -801,6 +813,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_tool_retry: pb.tool_retry,
                 model_type_matches,
                 dflash,
+                kvflash,
             });
         }
     }
@@ -830,7 +843,8 @@ fn list_subdirs(dir: &std::path::Path) -> Vec<String> {
 #[path = "build_parse.rs"]
 mod build_parse;
 use build_parse::{
-    parse_behavior, parse_dflash, parse_kernel_toml, parse_model_types, parse_sampling_presets,
+    parse_behavior, parse_dflash, parse_kernel_toml, parse_kvflash, parse_model_types,
+    parse_sampling_presets,
 };
 
 /// Collect kernel-source files with shadowing: common dir provides the

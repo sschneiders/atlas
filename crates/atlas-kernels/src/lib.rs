@@ -334,6 +334,26 @@ pub struct DflashConfig {
     pub target_layer_ids: &'static [usize],
 }
 
+/// KVFlash per-model defaults parsed from `[kvflash]` in MODEL.toml at build
+/// time. `None` when the model has no `[kvflash]` section. These are
+/// per-model *suggestions* (drafter id, default pool size, protected tail);
+/// CLI flags (`--kvflash`, `--kvflash-policy`, `--draft-model`) and env vars
+/// still override them at runtime (precedence: CLI > env > MODEL.toml).
+#[derive(Debug, Clone)]
+pub struct KvflashModelConfig {
+    /// HuggingFace id (or local path) of the small drafter used as the
+    /// relevance scorer when `--kvflash-policy drafter`. Defaults to
+    /// "Qwen/Qwen3-0.6B" at parse time if absent in TOML.
+    pub drafter: &'static str,
+    /// Suggested resident pool size in TOKENS for this model. 0 = let the
+    /// runtime builder size from VRAM ("auto").
+    pub pool_tokens_default: usize,
+    /// Logical blocks protected from eviction at the decode tail (causal
+    /// continuity). Per-model because sliding-attention archs need a wider
+    /// protected tail than full-attention ones.
+    pub protected_tail_blocks: u32,
+}
+
 /// Kernel modules hyperoptimized for a specific (H, M_q) target.
 ///
 /// Each blob is the compiled kernel for one module, emitted uniformly as
@@ -350,6 +370,10 @@ pub struct TargetPtxSet {
     /// no `[dflash]` section. Consumed by spark-server when `--dflash` is
     /// set without an explicit `--draft-model` flag.
     pub dflash: Option<DflashConfig>,
+    /// KVFlash per-model defaults. `None` when MODEL.toml has no `[kvflash]`
+    /// section. Consumed by spark-server's `load_kvflash_scorer` + the
+    /// `--kvflash` builder as per-model fallbacks.
+    pub kvflash: Option<KvflashModelConfig>,
 }
 
 /// All compiled kernel targets and their PTX module sets.

@@ -313,3 +313,12 @@ gamma = 16
 window_size = 4096
 mask_token_id = 248070
 target_layer_ids = [1, 10, 19, 28, 37]
+
+# KVFlash decode-time KV paging per-model defaults (see docs/design/kvflash-port.md).
+# drafter = the small model used as the relevance scorer when --kvflash-policy
+# drafter. The 35B-A3B MoE inherits the qwen3.6 decode path (same tokenizer
+# family), so it feeds target ids to the drafter directly — no cross-tok bridge.
+[kvflash]
+drafter = "Qwen/Qwen3-0.6B"
+pool_tokens_default = 0       # 0 = let the runtime size from VRAM ("auto")
+protected_tail_blocks = 4     # full-attention Qwen3.6: small protected tail

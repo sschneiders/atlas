@@ -180,6 +180,7 @@ pub(super) fn generate_target_ptx_rs(
              \x20           }},\n\
              \x20           model_type_matches: vec![{}],\n\
              \x20           dflash: {},\n\
+             \x20           kvflash: {},\n\
              \x20       }},\n",
             target.model, target.quant,
             fmt_cat(&target.sampling_thinking_text),
@@ -222,6 +223,13 @@ pub(super) fn generate_target_ptx_rs(
                     "Some(DflashConfig {{ draft_model: \"{}\", gamma: {}, window_size: {}, mask_token_id: {}, target_layer_ids: &[{}] }})",
                     d.draft_model, d.gamma, d.window_size, d.mask_token_id,
                     d.target_layer_ids.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", "),
+                ),
+            },
+            match &target.kvflash {
+                None => "None".to_string(),
+                Some(k) => format!(
+                    "Some(KvflashModelConfig {{ drafter: \"{}\", pool_tokens_default: {}, protected_tail_blocks: {} }})",
+                    k.drafter, k.pool_tokens_default, k.protected_tail_blocks,
                 ),
             },
         ));

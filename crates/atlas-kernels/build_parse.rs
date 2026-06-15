@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use super::{DflashRaw, ModelTypeMatch, SamplingCat};
+use super::{DflashRaw, KvflashRaw, ModelTypeMatch, SamplingCat};
 
 pub(super) fn parse_kernel_toml(
     kernel_dir: &std::path::Path,
@@ -401,5 +401,38 @@ pub(super) fn parse_dflash(model_dir: &std::path::Path) -> Option<DflashRaw> {
         window_size,
         mask_token_id,
         target_layer_ids,
+    })
+}
+
+/// Parse `[kvflash]` from MODEL.toml. Returns `None` when the section is
+/// absent. Mirrors `parse_dflash`. Per-model defaults consumed by
+/// spark-server as fallbacks (CLI/env override).
+pub(super) fn parse_kvflash(model_dir: &std::path::Path) -> Option<KvflashRaw> {
+    let model_toml_path = model_dir.join("MODEL.toml");
+    if !model_toml_path.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&model_toml_path).unwrap_or_default();
+    let toml: toml::Value = toml::from_str(&content).ok()?;
+    let kvflash = toml.get("kvflash")?;
+    let drafter = kvflash
+        .get("drafter")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "Qwen/Qwen3-0.6B".to_string());
+    let pool_tokens_default = kvflash
+        .get("pool_tokens_default")
+        .and_then(|v| v.as_integer())
+        .map(|v| v as usize)
+        .unwrap_or(0);
+    let protected_tail_blocks = kvflash
+        .get("protected_tail_blocks")
+        .and_then(|v| v.as_integer())
+        .map(|v| v as u32)
+        .unwrap_or(4);
+    Some(KvflashRaw {
+        drafter,
+        pool_tokens_default,
+        protected_tail_blocks,
     })
 }
