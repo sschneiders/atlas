@@ -65,6 +65,16 @@ pub fn step_decode_only(
         }
     };
 
+    // KVFlash: per-step residency paging. The model's default impl is a no-op
+    // when KVFlash is not installed, so this is one cheap trait-call per seq
+    // per step for non-KVFlash users. Lazily registers each slot on its first
+    // step (no separate admission-point call site).
+    for a in active.iter_mut() {
+        if let Err(e) = model.kvflash_step(&mut a.seq, 0) {
+            tracing::error!("kvflash_step: {e:#}");
+        }
+    }
+
     process_decode_logits(
         model,
         active,

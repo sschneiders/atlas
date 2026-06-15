@@ -62,16 +62,21 @@ pub(super) fn install_high_speed_swap(
 
 /// Install --kvflash decode-time KV paging config on the scheduler thread.
 ///
-/// PR3 scope: this validates + logs the accepted config and marks the thread as
-/// KVFlash-enabled. It does NOT yet construct the host-RAM backend / pager —
-/// that needs the model dims + an active CUDA context and belongs in the
-/// per-step decode-loop integration (the runtime-validation-gated remainder;
-/// see docs/design/kvflash-port.md PR3).
-// KVFlash decode-loop integration: see docs/design/kvflash-port.md PR3
-pub(super) fn install_kvflash(cfg: Option<spark_runtime::KvflashConfig>) {
+/// PR7: validates + logs the accepted config AND installs the thread-local
+/// pager (`spark_runtime::kvflash_pager`) so the per-decode-step
+/// `kvflash_step` dispatch actually caps resident KV and pages cold blocks to
+/// host RAM (LRU). The model's KV cache geometry (`block_size` /
+/// `num_layers`) is read via [`Model::kv_cache_dims`] and cached in the pager
+/// so the eviction loop does not re-lock the cache each step.
+// KVFlash decode-loop integration: see docs/design/kvflash-port.md PR7
+pub(super) fn install_kvflash(model: &dyn Model, cfg: Option<spark_runtime::KvflashConfig>) {
     let Some(cfg) = cfg else {
         return;
     };
+    if let Err(e) = cfg.validate() {
+        tracing::error!("--kvflash config rejected: {e:#}");
+        return;
+    }
     tracing::info!(
         "--kvflash installing: pool_tokens={}, tau={}, policy={:?}, protected_tail_blocks={}",
         cfg.pool_tokens,
@@ -79,10 +84,22 @@ pub(super) fn install_kvflash(cfg: Option<spark_runtime::KvflashConfig>) {
         cfg.policy,
         cfg.protected_tail_blocks,
     );
-    tracing::warn!(
-        "KVFlash config accepted; per-step decode-loop paging is the \
-         runtime-validation-gated remainder (see docs/design/kvflash-port.md PR3)"
-    );
+    match model.kv_cache_dims() {
+        Some((block_size, num_layers)) => {
+            spark_runtime::kvflash_pager::install(cfg, block_size, num_layers);
+            tracing::info!(
+                "KVFlash pager installed on scheduler thread: block_size={block_size}, \
+                 num_layers={num_layers}, pool_blocks={}",
+                cfg.pool_tokens / block_size.max(1) as usize
+            );
+        }
+        None => {
+            tracing::warn!(
+                "--kvflash requested but model does not expose kv_cache_dims; \
+                 pager NOT installed"
+            );
+        }
+    }
 }
 
 /// Drain pending request queue and policy-select prefills to start.

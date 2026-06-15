@@ -48,6 +48,27 @@ impl KvflashResidency {
         self.resident_count
     }
 
+    /// Grow the tracker to track `new_len` logical blocks. New entries
+    /// (indices `old_total .. new_len`) are marked resident (freshly written
+    /// by the decode loop) and unprotected. Already-tracked entries —
+    /// including any previously paged-out interior blocks — are untouched.
+    /// No-op when `new_len <= total()` (sequences do not shrink mid-generation
+    /// on the happy path; rollback is handled separately by the caller).
+    ///
+    /// Used by the KVFlash pager to track a growing `block_table` across
+    /// decode steps (the table appends a new logical block every `block_size`
+    /// generated tokens).
+    pub fn grow(&mut self, new_len: usize) {
+        let old_len = self.resident.len();
+        if new_len <= old_len {
+            return;
+        }
+        let extra = new_len - old_len;
+        self.resident.resize(new_len, true);
+        self.protected.resize(new_len, false);
+        self.resident_count += extra;
+    }
+
     /// Mark block `idx` as never-pageable (a sink or trailing-window block).
     ///
     /// Idempotent. Out-of-bounds indices are a silent no-op.

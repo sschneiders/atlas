@@ -24,6 +24,7 @@ mod decode_b;
 mod decode_b2;
 mod decode_checkpoint;
 mod ep_misc;
+mod kvflash;
 mod meta;
 mod prefill_a;
 mod prefill_b;
@@ -302,6 +303,18 @@ impl Model for TransformerModel {
     }
     fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<()> {
         self.compact_sequence_dispatch(seq, new_slot)
+    }
+    fn kvflash_begin(&self, seq: &mut SequenceState) -> Result<()> {
+        self.kvflash_begin_dispatch(seq)
+    }
+    fn kvflash_step(&self, seq: &mut SequenceState, _stream: u64) -> Result<()> {
+        self.kvflash_step_dispatch(seq, _stream)
+    }
+    fn kvflash_end(&self, seq: &mut SequenceState) -> Result<()> {
+        self.kvflash_end_dispatch(seq)
+    }
+    fn kv_cache_dims(&self) -> Option<(u32, usize)> {
+        self.kv_cache_dims_dispatch()
     }
     fn detach_slot_for_reuse(&self, seq: &mut SequenceState) {
         self.detach_slot_for_reuse_dispatch(seq)

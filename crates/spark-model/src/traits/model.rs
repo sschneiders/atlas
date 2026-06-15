@@ -369,6 +369,39 @@ pub trait Model: Send + Sync {
     /// sequence's slot, so a subsequent early-return/drop cannot double-release.
     fn detach_slot_for_reuse(&self, seq: &mut SequenceState);
 
+    /// KVFlash: register a request with the decode-loop pager. No-op when
+    /// KVFlash is not installed (the default). The concrete impl registers
+    /// the slot with the thread-local pager, protecting the sink + trailing
+    /// decode window. Called lazily by [`Model::kvflash_step`] on a slot's
+    /// first decode step (no separate admission-point call site needed).
+    fn kvflash_begin(&self, _seq: &mut SequenceState) -> Result<()> {
+        Ok(())
+    }
+
+    /// KVFlash: per-decode-step paging. Called by the scheduler after each
+    /// `decode_batch`. No-op default. The concrete impl evicts LRU blocks to
+    /// the host store when the request's resident count exceeds the pool cap,
+    /// rewriting the slot's `block_table` so paged-out blocks point at the
+    /// zeroed dummy (the forward path reads the dummy via the existing
+    /// `unwrap_or(dummy_kv_block)` convention — no forward-path edits).
+    fn kvflash_step(&self, _seq: &mut SequenceState, _stream: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// KVFlash: release the request's pager state (frees the host store).
+    /// No-op default. Called by the scheduler when a sequence finishes.
+    fn kvflash_end(&self, _seq: &mut SequenceState) -> Result<()> {
+        Ok(())
+    }
+
+    /// KV cache geometry for the KVFlash pager install: `(block_size,
+    /// num_layers)`. `None` for the default / non-attention models. The
+    /// scheduler reads this at `--kvflash` install time so the pager can cache
+    /// the geometry and avoid re-locking the cache each step.
+    fn kv_cache_dims(&self) -> Option<(u32, usize)> {
+        None
+    }
+
     /// CUDA-graphed K=2 verify: 2 tokens, capture-then-replay. Returns
     /// `[verified_0, verified_1]` argmax IDs. SSM intermediates saved for
     /// partial rollback via `rollback_ssm_states`.

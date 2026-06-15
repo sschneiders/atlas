@@ -70,6 +70,11 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq) {
     // Must happen BEFORE free_sequence() so block indices are still valid.
     // Enables multi-turn sessions to reuse KV cache for prior assistant responses.
     model.cache_sequence(&a.seq);
+    // KVFlash: release the request's pager state (drops the host store). The
+    // model's default impl is a no-op when KVFlash is not installed.
+    if let Err(e) = model.kvflash_end(&mut a.seq) {
+        tracing::error!("kvflash_end: {e:#}");
+    }
     if let Err(e) = model.free_sequence(&mut a.seq) {
         tracing::error!("free_sequence: {e:#}");
     }

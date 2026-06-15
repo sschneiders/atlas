@@ -202,7 +202,7 @@ pub fn run(
     };
 
     install_high_speed_swap(&*model, high_speed_swap_cfg);
-    install_kvflash(kvflash_cfg);
+    install_kvflash(&*model, kvflash_cfg);
 
     loop {
         // ── Drain pending → start prefill (chunked or full) ──
