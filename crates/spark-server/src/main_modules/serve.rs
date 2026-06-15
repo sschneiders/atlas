@@ -309,6 +309,23 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
                     None
                 },
             });
+
+    // KVFlash drafter scorer: build + validate + load BEFORE `gpu` moves into
+    // build_model below — the scorer's weight load needs the gpu handle, the
+    // same pattern as load_dflash_drafter above. `kvflash_cfg` is the validated
+    // config threaded into scheduler::run later. The scorer itself is loaded
+    // only to validate the drafter resolves + log; it is dropped immediately
+    // (the decode-loop does not yet consume it — PR4 runtime-validation gate).
+    let early_kvflash_cfg = serve_phases::build_kvflash_config(&args)?;
+    let kvflash_cfg = serve_phases::validate_kvflash(&args, &early_kvflash_cfg)?;
+    let kvflash_scorer =
+        serve_phases::load_kvflash_scorer(&args, &kvflash_cfg, &ptx_set, gpu.as_ref())?;
+    match &kvflash_scorer {
+        Some(_) => tracing::info!("KVFlash: drafter scorer materialized"),
+        None => tracing::info!("KVFlash: no drafter scorer (LRU policy or kvflash off)"),
+    }
+    drop(kvflash_scorer);
+
     let model = serve_phases::build_model(
         &args,
         &config,
@@ -339,10 +356,6 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
 
     // Phase 6.3 — HSS config built early so the EP worker can install it.
     let early_high_speed_swap_cfg = serve_phases::build_high_speed_swap_config(&args)?;
-
-    // KVFlash decode-time KV paging config, built early (same point as HSS so
-    // "auto" can read free VRAM via mem_info() now that CUDA is initialized).
-    let early_kvflash_cfg = serve_phases::build_kvflash_config(&args)?;
 
     // EP worker: rank > 0 enters command loop, returns when head exits.
     let mut model_opt = Some(model);
@@ -519,16 +532,8 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     )?;
 
     // ── --kvflash config validation ──
-    let kvflash_cfg = serve_phases::validate_kvflash(&args, &early_kvflash_cfg)?;
-
-    // KVFlash decode-loop integration consumes this scorer (see
-    // docs/design/kvflash-port.md PR4).
-    let kvflash_scorer =
-        serve_phases::load_kvflash_scorer(&args, &kvflash_cfg, &ptx_set, gpu.as_ref())?;
-    match &kvflash_scorer {
-        Some(_) => tracing::info!("KVFlash: drafter scorer materialized"),
-        None => tracing::info!("KVFlash: no drafter scorer (LRU policy or kvflash off)"),
-    }
+    // (kvflash_cfg was built + validated before build_model above, where the
+    // gpu handle was still available for the scorer load. See that block.)
 
     let adaptive_sampling = args.adaptive_sampling;
     let session_manager = session_manager::SessionSsmManager::new(600); // 10 min TTL
