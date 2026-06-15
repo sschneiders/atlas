@@ -142,6 +142,133 @@ pub(crate) fn validate_head_high_speed_swap(
     Ok(Some(cfg.clone()))
 }
 
+/// Pure auto-sizing arithmetic, factored out so it is unit-testable without a
+/// CUDA context. Returns the resident pool size in TOKENS (NOT yet rounded to a
+/// multiple of `block_size` — the caller rounds).
+///
+/// When `bytes_per_kv_token == 0` the per-token KV cost is unknown (the builder
+/// does not yet receive model dims), so VRAM-proportional sizing is impossible
+/// and we fall back to the configured caps (`min(max_pool, max_ctx)`, floored at
+/// a protected minimum). A future PR that passes the real `bytes_per_kv_token`
+/// gets true `free_vram / bytes_per_kv_token` sizing for free.
+pub(crate) fn resolve_auto_pool(
+    free_vram_bytes: usize,
+    bytes_per_kv_token: usize,
+    max_pool: usize,
+    max_ctx: usize,
+) -> usize {
+    const PROTECTED_MIN: usize = 512;
+    if bytes_per_kv_token == 0 {
+        return max_pool.min(max_ctx).max(PROTECTED_MIN);
+    }
+    let computed = free_vram_bytes / bytes_per_kv_token;
+    computed.min(max_pool).min(max_ctx).max(PROTECTED_MIN)
+}
+
+fn env_u32(name: &str) -> Option<u32> {
+    std::env::var(name)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+}
+
+/// Build the resolved KVFlash config from CLI flags + env fallback. Returns
+/// `Ok(None)` when KVFlash is not requested (neither `--kvflash` nor
+/// `ATLAS_KVFLASH` set). Mirrors `build_high_speed_swap_config`'s shape: takes
+/// only `&args`, resolves "auto"/env into a concrete `pool_tokens`, rounds up to
+/// a multiple of `block_size`, and validates.
+pub(crate) fn build_kvflash_config(
+    args: &cli::ServeArgs,
+) -> Result<Option<spark_runtime::KvflashConfig>> {
+    // Source the pool spec: explicit --kvflash flag, else ATLAS_KVFLASH env
+    // (manual dual-check idiom — no #[arg(env=...)] in this codebase).
+    let pool_spec = match args.kvflash.as_deref() {
+        Some(s) => Some(s.to_string()),
+        None => std::env::var("ATLAS_KVFLASH")
+            .ok()
+            .filter(|s| !s.is_empty()),
+    };
+    let Some(spec) = pool_spec else {
+        return Ok(None);
+    };
+
+    // tau / max_pool / policy: flag defaults, overridable by their env vars.
+    let tau = env_u32("ATLAS_KVFLASH_TAU").unwrap_or(args.kvflash_tau);
+    let max_pool = env_usize("ATLAS_KVFLASH_MAX_POOL").unwrap_or(args.kvflash_max_pool);
+    let policy = match std::env::var("ATLAS_KVFLASH_POLICY")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        Some(s) => s.parse::<spark_runtime::KvflashPolicy>()?,
+        None => args.kvflash_policy.into(),
+    };
+
+    let pool_tokens = resolve_pool_tokens(&spec, max_pool, args.max_seq_len, args.block_size)?;
+    let cfg = spark_runtime::KvflashConfig {
+        pool_tokens,
+        tau,
+        policy,
+        protected_tail_blocks: args.kvflash_protected_tail_blocks,
+    };
+    cfg.validate()?;
+    Ok(Some(cfg))
+}
+
+/// Resolve the pool token count from the spec string (`"auto"` or a numeric
+/// token count), then round up to a multiple of `block_size`.
+fn resolve_pool_tokens(
+    spec: &str,
+    max_pool: usize,
+    max_ctx: usize,
+    block_size: usize,
+) -> Result<usize> {
+    let raw = match spec.trim().to_ascii_lowercase().as_str() {
+        "auto" => {
+            let (free_vram, _total) = spark_storage::cuda_min::mem_info()
+                .context("--kvflash auto requires an initialized GPU context")?;
+            // bytes_per_kv_token is unknown at this build site (model dims are
+            // not passed to the builder yet); resolve_auto_pool falls back to
+            // the configured caps. A future PR passes the real per-token cost.
+            resolve_auto_pool(free_vram, 0, max_pool, max_ctx)
+        }
+        other => other
+            .parse::<usize>()
+            .with_context(|| format!("--kvflash expected a token count or 'auto', got '{other}'"))?
+            .min(max_ctx),
+    };
+    // Round up to a multiple of block_size (KV cache block granularity), keeping
+    // at least one block.
+    Ok(raw.div_ceil(block_size).max(1) * block_size)
+}
+
+/// Validate + log the resolved KVFlash config. Mirrors
+/// `validate_head_high_speed_swap`: logs an info summary line and returns the
+/// config unchanged. `Ok(None)` when KVFlash is disabled.
+pub(crate) fn validate_kvflash(
+    args: &cli::ServeArgs,
+    cfg: &Option<spark_runtime::KvflashConfig>,
+) -> Result<Option<spark_runtime::KvflashConfig>> {
+    let _ = args;
+    let Some(cfg) = cfg.as_ref() else {
+        return Ok(None);
+    };
+    tracing::info!(
+        "--kvflash enabled: pool_tokens={}, tau={}, policy={}, protected_tail_blocks={}",
+        cfg.pool_tokens,
+        cfg.tau,
+        cfg.policy,
+        cfg.protected_tail_blocks,
+    );
+    Ok(Some(cfg.clone()))
+}
+
 pub(crate) fn maybe_run_ep_worker(
     args: &cli::ServeArgs,
     model: &mut Option<Box<dyn spark_model::traits::Model>>,
@@ -257,4 +384,61 @@ pub(crate) fn maybe_run_ep_worker(
     });
     handle.join().expect("EP worker thread panicked");
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_pool_vram_proportional_when_cost_known() {
+        // 2 GiB free, 256 bytes/token KV → 8192 tokens before clamps.
+        let pool = resolve_auto_pool(2 * (1 << 30), 256, 16384, 32768);
+        assert_eq!(pool, 8192);
+    }
+
+    #[test]
+    fn auto_pool_clamps_to_max_pool_and_max_ctx() {
+        // huge free VRAM, small caps → clamped to the tighter cap.
+        assert_eq!(resolve_auto_pool(usize::MAX, 256, 4096, 32768), 4096);
+        assert_eq!(resolve_auto_pool(usize::MAX, 32768, 16384, 4096), 4096);
+    }
+
+    #[test]
+    fn auto_pool_floors_at_protected_min() {
+        // tiny free VRAM → protected minimum of 512.
+        let pool = resolve_auto_pool(1000, 256, 16384, 32768);
+        assert_eq!(pool, 512);
+    }
+
+    #[test]
+    fn auto_pool_unknown_cost_falls_back_to_caps() {
+        // bytes_per_kv_token == 0 → can't size from VRAM; use caps.
+        assert_eq!(resolve_auto_pool(1 << 30, 0, 8192, 32768), 8192);
+        // floored at protected min when caps are tiny.
+        assert_eq!(resolve_auto_pool(1 << 30, 0, 0, 0), 512);
+    }
+
+    #[test]
+    fn env_helpers_parse_valid_and_reject_invalid() {
+        // std::env::set_var / remove_var are unsafe as of edition 2024
+        // (not signal-/thread-safe), so the mutations live in an unsafe block.
+        unsafe {
+            std::env::set_var("ATLAS_TEST_KVFLASH_U32", "128");
+            assert_eq!(env_u32("ATLAS_TEST_KVFLASH_U32"), Some(128));
+
+            std::env::set_var("ATLAS_TEST_KVFLASH_U32", "not-a-num");
+            assert_eq!(env_u32("ATLAS_TEST_KVFLASH_U32"), None);
+
+            std::env::set_var("ATLAS_TEST_KVFLASH_U32", "");
+            assert_eq!(env_u32("ATLAS_TEST_KVFLASH_U32"), None);
+
+            std::env::remove_var("ATLAS_TEST_KVFLASH_U32");
+            assert_eq!(env_u32("ATLAS_TEST_KVFLASH_U32"), None);
+
+            std::env::set_var("ATLAS_TEST_KVFLASH_USIZE", "4096");
+            assert_eq!(env_usize("ATLAS_TEST_KVFLASH_USIZE"), Some(4096));
+            std::env::remove_var("ATLAS_TEST_KVFLASH_USIZE");
+        }
+    }
 }

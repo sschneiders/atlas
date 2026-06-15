@@ -340,6 +340,10 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     // Phase 6.3 — HSS config built early so the EP worker can install it.
     let early_high_speed_swap_cfg = serve_phases::build_high_speed_swap_config(&args)?;
 
+    // KVFlash decode-time KV paging config, built early (same point as HSS so
+    // "auto" can read free VRAM via mem_info() now that CUDA is initialized).
+    let early_kvflash_cfg = serve_phases::build_kvflash_config(&args)?;
+
     // EP worker: rank > 0 enters command loop, returns when head exits.
     let mut model_opt = Some(model);
     if serve_phases::maybe_run_ep_worker(&args, &mut model_opt, &early_high_speed_swap_cfg)? {
@@ -514,6 +518,9 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         swap_space_gb,
     )?;
 
+    // ── --kvflash config validation ──
+    let kvflash_cfg = serve_phases::validate_kvflash(&args, &early_kvflash_cfg)?;
+
     let adaptive_sampling = args.adaptive_sampling;
     let session_manager = session_manager::SessionSsmManager::new(600); // 10 min TTL
     // Spontaneous-thinking budget: when the model emits `<think>` without
@@ -540,6 +547,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             use_ngram_spec,
             swap_space_gb,
             high_speed_swap_cfg,
+            kvflash_cfg,
             block_size,
             think_end_token,
             think_start_token,

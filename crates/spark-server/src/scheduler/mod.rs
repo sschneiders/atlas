@@ -118,6 +118,7 @@ pub fn run(
     use_ngram_speculative: bool,
     swap_space_gb: usize,
     high_speed_swap_cfg: Option<spark_storage::HighSpeedSwapConfig>,
+    kvflash_cfg: Option<spark_runtime::KvflashConfig>,
     block_size: usize,
     think_end_token: Option<u32>,
     think_start_token: Option<u32>,
@@ -201,6 +202,7 @@ pub fn run(
     };
 
     install_high_speed_swap(&*model, high_speed_swap_cfg);
+    install_kvflash(kvflash_cfg);
 
     loop {
         // ── Drain pending → start prefill (chunked or full) ──

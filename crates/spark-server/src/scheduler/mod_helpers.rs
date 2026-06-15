@@ -60,6 +60,31 @@ pub(super) fn install_high_speed_swap(
     }
 }
 
+/// Install --kvflash decode-time KV paging config on the scheduler thread.
+///
+/// PR3 scope: this validates + logs the accepted config and marks the thread as
+/// KVFlash-enabled. It does NOT yet construct the host-RAM backend / pager —
+/// that needs the model dims + an active CUDA context and belongs in the
+/// per-step decode-loop integration (the runtime-validation-gated remainder;
+/// see docs/design/kvflash-port.md PR3).
+// KVFlash decode-loop integration: see docs/design/kvflash-port.md PR3
+pub(super) fn install_kvflash(cfg: Option<spark_runtime::KvflashConfig>) {
+    let Some(cfg) = cfg else {
+        return;
+    };
+    tracing::info!(
+        "--kvflash installing: pool_tokens={}, tau={}, policy={:?}, protected_tail_blocks={}",
+        cfg.pool_tokens,
+        cfg.tau,
+        cfg.policy,
+        cfg.protected_tail_blocks,
+    );
+    tracing::warn!(
+        "KVFlash config accepted; per-step decode-loop paging is the \
+         runtime-validation-gated remainder (see docs/design/kvflash-port.md PR3)"
+    );
+}
+
 /// Drain pending request queue and policy-select prefills to start.
 pub(super) fn drain_pending_requests(
     pending: &Arc<(Mutex<PendingQueue>, Condvar)>,

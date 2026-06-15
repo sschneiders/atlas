@@ -5,6 +5,25 @@
 use clap::Parser;
 use std::path::PathBuf;
 
+/// clap-facing residency policy for `--kvflash-policy`. `spark-runtime` is
+/// intentionally clap-free, so this mirrors [`spark_runtime::KvflashPolicy`]
+/// (plain enum + `Display`/`FromStr`) and converts into it.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum KvflashPolicyArg {
+    #[default]
+    Lru,
+    Drafter,
+}
+
+impl From<KvflashPolicyArg> for spark_runtime::KvflashPolicy {
+    fn from(arg: KvflashPolicyArg) -> Self {
+        match arg {
+            KvflashPolicyArg::Lru => spark_runtime::KvflashPolicy::Lru,
+            KvflashPolicyArg::Drafter => spark_runtime::KvflashPolicy::Drafter,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "spark", about = "Atlas Spark — pure Rust LLM inference server")]
 pub struct Cli {
@@ -413,6 +432,37 @@ pub struct ServeArgs {
     /// for diff-against-no-swap correctness checks).
     #[arg(long, default_value_t = 64)]
     pub high_speed_swap_cache_blocks_per_seq: u32,
+
+    // ── --kvflash (decode-time KV paging) ──
+    // Coexists with --high-speed-swap: HSS is intra-sequence block streaming
+    // via io_uring, KVFlash is decode-time residency paging to host RAM with a
+    // reselect interval. Disabled by default (None). See
+    // docs/design/kvflash-port.md PR3.
+    /// Enable KVFlash decode-time KV paging. Resident pool size in tokens, or
+    /// 'auto' to size from free VRAM. Off when unset (None). Env fallback:
+    /// `ATLAS_KVFLASH` (same value syntax). See docs/design/kvflash-port.md.
+    #[arg(long, value_name = "TOKENS|auto")]
+    pub kvflash: Option<String>,
+
+    /// Reselect interval floor (decoded tokens between residency reselections).
+    /// Env fallback: `ATLAS_KVFLASH_TAU`.
+    #[arg(long, default_value_t = 64)]
+    pub kvflash_tau: u32,
+
+    /// Residency policy: lru (recency-only) or drafter (PR4). Env fallback:
+    /// `ATLAS_KVFLASH_POLICY`.
+    #[arg(long, value_enum, default_value_t = KvflashPolicyArg::Lru)]
+    pub kvflash_policy: KvflashPolicyArg,
+
+    /// Cap on the auto-sized resident pool (tokens). Env fallback:
+    /// `ATLAS_KVFLASH_MAX_POOL`.
+    #[arg(long, default_value_t = 16384)]
+    pub kvflash_max_pool: usize,
+
+    /// Logical KV blocks at the decode tail protected from eviction (causal
+    /// continuity of in-flight generation).
+    #[arg(long, default_value_t = 4)]
+    pub kvflash_protected_tail_blocks: u32,
 
     /// Default request timeout in seconds. 0 = no timeout.
     #[arg(long, default_value_t = 300)]
