@@ -17,6 +17,7 @@ pub mod kv_spill;
 pub mod kvflash_config;
 pub mod kvflash_residency;
 pub mod kvflash_scorer;
+pub mod kvflash_verify;
 
 // Re-export the KVFlash config types at the crate root so spark-server can
 // reference them as `spark_runtime::KvflashConfig` / `KvflashPolicy` (mirrors

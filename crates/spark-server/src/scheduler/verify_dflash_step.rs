@@ -2,6 +2,20 @@
 
 //! DFlash-based verify step (drafted token verification).
 
+// ── KVFlash (pool-aware verify) integration points ───────────────────────
+// Under --kvflash, decode_verify_dflash becomes slot-mapped: each draft
+// token's KV write targets its pool slot via per-token kv_write_rows, and
+// attention runs over a slot-space validity mask built by
+// spark_runtime::kvflash_verify::KvflashVerifyPlan. The validity rule
+// (resident committed positions + causal among drafts) means REJECTED drafts
+// need no rollback — their slots are excluded by the pos < base_pos rule
+// until the next replay rewrites them. Under kvflash the accept-prefix +
+// seq_len/tokens rollback below is therefore skipped; the pool's validity
+// mask handles rejection. NOT YET WIRED — runtime-validation gate (see
+// docs/design/kvflash-port.md PR5). Acceptance parity target: 15.4-15.6%
+// pooled vs 15.3% full cache (lucebox measurement).
+// ─────────────────────────────────────────────────────────────────────────
+
 use super::*;
 
 /// DFlash γ-token verify with accept-prefix.
