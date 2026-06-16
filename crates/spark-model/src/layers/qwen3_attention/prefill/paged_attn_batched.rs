@@ -243,7 +243,10 @@ impl Qwen3AttentionLayer {
             (dtype, _) => {
                 anyhow::bail!(
                     "prefill_attention_paged_attn_batched: kv_dtype {:?} not yet supported \
-                     in batched mode (layer {}). Falls back to per-stream.",
+                     in batched mode (layer {}). FibQuant works in single-stream mode \
+                     (validated); batched multi-sequence serving needs a FibQuant batched \
+                     prefill kernel or per-stream fallback. Use --max-batch-size 1 or \
+                     schedule FibQuant sequences per-stream.",
                     dtype,
                     self.attn_layer_idx
                 );
