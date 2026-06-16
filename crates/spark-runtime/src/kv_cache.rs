@@ -85,8 +85,9 @@ pub enum KvCacheDtype {
     /// llama-cpp-turboquant's `q8_0/turbo2`). Best compression-to-quality
     /// ratio for turbo2 V on tested models.
     Fp8KTurbo2V,
-    /// FibQuant vector quantization (arXiv:2605.11478): normalize → shared Haar
-    /// rotation → k-dim radial-angular codebook (Beta-quantile radii ×
+    /// FibQuant vector quantization (arXiv:2605.11478): normalize → Walsh–Hadamard
+    /// rotation (reusing Atlas's `wht_bf16`; validated Haar-equivalent on real KV
+    /// — Step 1) → k-dim radial-angular codebook (Beta-quantile radii ×
     /// Fibonacci directions + Lloyd-Max). Stores `{fp16 norm, codebook index}`
     /// per vector — ~8× compression at ~0.99 attention cosine (Step 1).
     /// Compression-bounded residency: the full context stays resident, so
@@ -151,6 +152,7 @@ impl KvCacheDtype {
                 | KvCacheDtype::Turbo3
                 | KvCacheDtype::Turbo4
                 | KvCacheDtype::Turbo8
+                | KvCacheDtype::FibQuant
         )
     }
 

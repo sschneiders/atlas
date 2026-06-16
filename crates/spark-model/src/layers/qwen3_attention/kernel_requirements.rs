@@ -92,9 +92,10 @@ pub(super) fn required_optional_kernels_for_dtype(
             ));
         }
         KvCacheDtype::FibQuant => {
-            // Chunked-prefill paged-attention kernel (Step 3 .cu). Unlike the
-            // turbo dtypes FibQuant uses its own Haar rotation, not WHT, so the
-            // WHT bookend gate below does not fire for it.
+            // Chunked-prefill paged-attention kernel (Step 3 .cu). FibQuant
+            // reuses the WHT rotation (`is_wht_rotated()` is true), so the WHT
+            // bookend gate below adds `wht_bf16` automatically — same write-path
+            // WHT(K/V) + read-path WHT(Q)/iWHT(out) flow as the turbo dtypes.
             req.push((
                 "prefill_paged_fibquant",
                 "inferspark_prefill_paged_fibquant",
@@ -196,16 +197,19 @@ mod tests {
                 "{d:?}: plain dtype should require no optional kernels"
             );
         }
-        // FibQuant needs its own chunked-prefill kernel but, unlike turbo
-        // dtypes, uses its own Haar rotation (not WHT) ⇒ no WHT bookends.
+        // FibQuant needs its own chunked-prefill kernel AND (like the turbo
+        // dtypes) the WHT bookends — it reuses `wht_bf16` for the rotation,
+        // validated Haar-equivalent on real KV in Step 1.
         let fq_req = required_optional_kernels_for_dtype(KvCacheDtype::FibQuant, 256);
         assert!(
             fq_req.iter().any(|(m, _)| *m == "prefill_paged_fibquant"),
             "FibQuant: requirement list missing prefill_paged_fibquant"
         );
         assert!(
-            !fq_req.iter().any(|(m, _)| *m == "wht_bf16"),
-            "FibQuant must not require WHT bookends (it uses its own rotation)"
+            fq_req
+                .iter()
+                .any(|(m, f)| *m == "wht_bf16" && *f == "wht_bf16_inplace"),
+            "FibQuant must require the WHT bookends (it reuses wht_bf16)"
         );
     }
 
@@ -219,6 +223,7 @@ mod tests {
             KvCacheDtype::Turbo3,
             KvCacheDtype::Turbo4,
             KvCacheDtype::Turbo8,
+            KvCacheDtype::FibQuant,
         ] {
             assert!(d.is_wht_rotated(), "{d:?} must gate the WHT bookends");
         }
