@@ -458,4 +458,82 @@ models where key info isn't prompt-early).
 - The Q-driven scorer's non-discriminatory scores (~30-40 uniform) are an
   open research question if reactive recall is ever revisited.
 
+---
+
+# SESSION 3 — FP8 validated; any-depth recall investigated (cheap signals all fail)
+
+## FP8 validated
+
+The A3B's DEFAULT KV (FP8, online per-tensor calibration) + prefix floor passes
+the simple validation: smoke PASS, flatness 0.92, `{shallow: HIT, deep: HIT}`.
+The prefix floor is dtype-agnostic (no K projection). So FP8 works at moderate
+context (4x pool ≈ 4K tok).
+
+**Caveat (model quality, not KVFlash):** at ≥8x pool the A3B loses coherence
+with all-FP8 KV (outputs degenerate to "BLUEFOX77 user assistant" gibberish),
+even with BF16 KV at 16x. The startup warning predicts this —
+`--kv-high-precision-layers max` (or 2-5) is the recommended quality knob. This
+is orthogonal to KVFlash paging.
+
+## Recall grid test added
+
+`tests/test_kvflash_recall_grid.py` sweeps needle depth × context size
+(default 7 depths × {4x,8x,16x} pool). Run against a --kvflash server. Reports
+a HIT/MISS grid + coverage %. Use it to characterise recall beyond the single
+shallow/deep pair.
+
+## Any-depth recall: four cheap mechanisms tried, ALL fail for mid-depth
+
+The recall grid shows the prefix floor only covers the very start (it's a
+fixed pool/4 blocks, so depth-0.05 at 8x is already past it) + the recent tail.
+Mid-depth (0.15-0.75, the paged-out middle) is **0% across all configs**.
+Investigated four cheap signals; all confirmed failures with diagnostics:
+
+1. **Q-driven (Predictor)** — per-block scores uniformly ~30-40; argmax never
+   the needle. Decode Q is a *generation* query, not a *retrieval* query.
+2. **Prefix floor** — works for the ends only; fixed size doesn't scale with
+   context (depth-0.05 at 8x = block 20 > prefix 16).
+3. **Content-hash novelty** (`ATLAS_KVFLASH_NOVELTY`, byte hash) — diagnostic
+   showed `unique_hashes=208/208`: RoPE injects position into the cached K, so
+   every block's hash is unique → rarity signal uniform → degenerates to the
+   prefix. (Implementation kept, gated, dormant; documents the attempt.)
+4. **K-norm novelty** (rotation-invariant ‖K‖²) — `unique_hashes=143/208`: the
+   K is *context-dependent* (hidden states differ by position/context, not
+   just RoPE rotation), so even the norm doesn't group same-content blocks.
+
+**Root conclusion:** content-based / reactive signals cannot reliably identify
+a paged-out needle, because the cached K entangles content with position and
+context. The ONLY reliable importance signal is the **actual attention** the
+model computes during prefill (when all content is visible) — i.e. the real
+FlashMemory mechanism, which Atlas's KVFlash port does not yet implement
+(it uses LRU).
+
+## Path to real any-depth recall (future work)
+
+Attention-based keep-set, computed once at first decode step (all blocks still
+resident, pre-eviction — the prompt's attention pattern is intact):
+
+1. **Capture the prefill Q** — hook the prefill attention path
+   (`paged_attn.rs` / `paged_attn_batched.rs`) to stash the last prompt
+   token's Q (the question's retrieval query) for one chosen layer. Mirrors
+   the decode Q-capture hook (Step 1) but on the prefill path.
+2. **One custom attention pass** — at first decode step, compute that Q's
+   attention over ALL blocks' K (read K from the KV cache, a single
+   query × context-keys softmax). O(context), one-time. The blocks with the
+   highest attention weight are the keep-set.
+3. **Protect the top-pool by attention weight** + recent tail + sink; evict
+   the rest. The needle (what the question attends to) stays resident at any
+   depth.
+
+This is a moderate feature (prefill hook + one attention pass), not a quick
+tweak. It's the principled fix; everything cheaper has been empirically
+eliminated above.
+
+## Current default
+
+Prefix recall floor (pool/4) + pure-LRU, PredictorScorer dormant. Passes the
+simple validation (shallow+deep HIT, flatness ~0.92) at moderate context on
+both BF16 and FP8 KV. Does NOT provide mid-depth recall — see the grid.
+
+
 
