@@ -343,7 +343,7 @@ impl KvflashPager {
         for b in 0..total as u32 {
             let h = kv_cache
                 .read_block(0, b, gpu)
-                .map(|(k, _)| k_block_hash(&k))
+                .map(|(k, _)| k_block_norm_sq(&k))
                 .unwrap_or(0);
             hashes.push(h);
         }
@@ -683,14 +683,23 @@ impl KvflashPager {
     }
 }
 
-/// Stable hash of one block's raw K bytes (any dtype) — a content signature
-/// for the novelty keep-set. Blocks with identical K collide; a distinctive
-/// needle in repetitive filler gets a unique hash.
-fn k_block_hash(k: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    k.hash(&mut h);
-    h.finish()
+/// Rotation-invariant content signature for the novelty keep-set: ‖K‖² (sum
+/// of squared BF16 K values). RoPE rotates K by a position-dependent angle,
+/// which a raw byte hash conflates with content (every block looks unique).
+/// The L2 norm is preserved by any rotation, so same-content blocks share a
+/// norm regardless of position — a distinctive needle in repetitive filler
+/// gets an outlier norm. Assumes BF16 K (2 bytes/element); FP8 would need
+/// dequant for an exact norm.
+fn k_block_norm_sq(k: &[u8]) -> u64 {
+    let mut sum: f64 = 0.0;
+    let mut i = 0;
+    while i + 2 <= k.len() {
+        let bits = u16::from_le_bytes([k[i], k[i + 1]]) as u32;
+        let v = f32::from_bits(bits << 16) as f64;
+        sum += v * v;
+        i += 2;
+    }
+    sum.round() as u64
 }
 
 /// Pure-logic reselect planner. Given per-chunk relevance `scores` (higher =
