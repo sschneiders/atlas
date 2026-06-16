@@ -334,6 +334,11 @@ impl Qwen3AttentionLayer {
                 KvCacheDtype::Nvfp4 => {
                     Some(gpu.kernel("paged_decode_nvfp4", "paged_decode_attn_splitk_nvfp4")?)
                 }
+                // Same module (`paged_decode_fibquant`) as the basic kernel —
+                // the split-K symbol is appended to paged_decode_attn_fibquant.cu.
+                KvCacheDtype::FibQuant => {
+                    Some(gpu.kernel("paged_decode_fibquant", "paged_decode_attn_splitk_fibquant")?)
+                }
                 KvCacheDtype::Turbo3
                 | KvCacheDtype::Turbo4
                 | KvCacheDtype::Turbo8
@@ -350,6 +355,14 @@ impl Qwen3AttentionLayer {
             },
             paged_decode_reduce_k: match kv_dtype {
                 KvCacheDtype::Nvfp4 => {
+                    Some(gpu.kernel("paged_decode_nvfp4", "paged_decode_attn_reduce_nvfp4")?)
+                }
+                // The reduce kernel is dtype-independent: it only touches the
+                // `workspace` f32 partials (head_dim + m + l) and writes BF16
+                // output — it never reads the KV cache. FibQuant therefore
+                // reuses the compiled NVFP4 reduce symbol verbatim (the split-K
+                // FibQuant kernel writes partials in the identical layout).
+                KvCacheDtype::FibQuant => {
                     Some(gpu.kernel("paged_decode_nvfp4", "paged_decode_attn_reduce_nvfp4")?)
                 }
                 KvCacheDtype::Turbo3

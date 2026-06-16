@@ -180,29 +180,88 @@ impl Qwen3AttentionLayer {
             }
             // FibQuant: WHT + vector codebook. No separate scale section (the
             // per-vector bf16 norm is inline); Q is WHT-rotated and output
-            // iWHT'd by the caller's bookends (is_wht_rotated). v1 = basic
-            // kernel (no split-K); hd=256 codebook.
-            KvCacheDtype::FibQuant => ops::paged_decode_attn_fibquant(
-                gpu,
-                self.paged_decode_k,
-                q,
-                kv_cache.k_pool_ptr(self.attn_layer_idx),
-                kv_cache.v_pool_ptr(self.attn_layer_idx),
-                output,
-                block_table,
-                seq_lens,
-                max_blocks_per_seq,
-                num_seqs,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                block_size,
-                inv_sqrt_d,
-                q_stride,
-                kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
-                self.fibq_codebook_dev,
-                stream,
-            ),
+            // iWHT'd by the caller's bookends (is_wht_rotated). Split-K path
+            // mirrors NVFP4: partition the KV sequence across CTAs when the
+            // basic kernel underutilizes the GPU (long seqs, few heads), write
+            // f32 partials to `workspace`, then merge with the shared
+            // dtype-independent reduce kernel. hd=256 codebook.
+            KvCacheDtype::FibQuant => {
+                // Split count derived from the configured max batch (constant),
+                // not the runtime co-batched count, so a sequence's reduction
+                // tree is identical alone vs co-batched (determinism fix — same
+                // as NVFP4).
+                let current_ctas = num_q_heads * super::super::split_ref_seqs(num_seqs);
+                let num_splits = if current_ctas >= NUM_SMS {
+                    1u32
+                } else {
+                    NUM_SMS / current_ctas
+                };
+
+                if num_splits > 1 {
+                    let splitk_k = self
+                        .paged_decode_splitk_k
+                        .expect("split-K kernel required for FibQuant");
+                    let reduce_k = self
+                        .paged_decode_reduce_k
+                        .expect("reduce kernel required for FibQuant");
+                    ops::paged_decode_attn_splitk_fibquant(
+                        gpu,
+                        splitk_k,
+                        q,
+                        kv_cache.k_pool_ptr(self.attn_layer_idx),
+                        kv_cache.v_pool_ptr(self.attn_layer_idx),
+                        workspace,
+                        block_table,
+                        seq_lens,
+                        max_blocks_per_seq,
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        block_size,
+                        inv_sqrt_d,
+                        num_splits,
+                        q_stride,
+                        kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
+                        self.fibq_codebook_dev,
+                        num_seqs,
+                        stream,
+                    )?;
+                    ops::paged_decode_attn_reduce_nvfp4(
+                        gpu,
+                        reduce_k,
+                        workspace,
+                        output,
+                        seq_lens,
+                        num_q_heads,
+                        head_dim,
+                        num_splits,
+                        num_seqs,
+                        stream,
+                    )
+                } else {
+                    ops::paged_decode_attn_fibquant(
+                        gpu,
+                        self.paged_decode_k,
+                        q,
+                        kv_cache.k_pool_ptr(self.attn_layer_idx),
+                        kv_cache.v_pool_ptr(self.attn_layer_idx),
+                        output,
+                        block_table,
+                        seq_lens,
+                        max_blocks_per_seq,
+                        num_seqs,
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        block_size,
+                        inv_sqrt_d,
+                        q_stride,
+                        kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
+                        self.fibq_codebook_dev,
+                        stream,
+                    )
+                }
+            }
             KvCacheDtype::Bf16KTurbo3V => {
                 // TurboQuant+ safer-asym Bf16K + Turbo3V combined paged decode.
                 // K read as BF16 NHD (vector loads), V read as turbo3 (3-bit

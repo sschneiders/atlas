@@ -284,3 +284,194 @@ extern "C" __global__ void paged_decode_attn_fibquant(
         }
     }
 }
+
+// ============================================================================
+// Split-K FibQuant variant for long sequences with few heads (issue #4).
+//
+// Mirrors paged_decode_attn_splitk_nvfp4 but reads FibQuant-coded K/V
+// (per-vector {bf16 norm, 1-byte codebook indices}, no separate scale section).
+// The only differences vs the NVFP4 split-K kernel are:
+//   - K/V load+dequant: `fibquant_dequant` (codebook gather × norm) instead of
+//     `nvfp4_dequant` (nibble × FP8 group scale).
+//   - Cache addressing: payload = 2 + head_dim/FIB_K bytes per (token, kv_head);
+//     vector at `block_offset * (num_kv_heads*payload) + kv_head*payload`
+//     (norm at +0, indices at +2). No `data_section_bytes`.
+//   - Trailing `fibq_codebook` device pointer staged to shared memory (the 4 KB
+//     f32 codebook), instead of a compile-time E2M1 LUT.
+//
+// Writes f32 partials to `workspace` in the SAME layout as the NVFP4 split-K
+// kernel (`[seq, q_head, split, (head_dim+2)]`: head_dim partials + m + l), so
+// the dtype-independent `paged_decode_attn_reduce_nvfp4` merges them unchanged.
+//
+// Grid: (num_q_heads, num_splits, num_seqs)   Block: (256, 1, 1)
+// ============================================================================
+
+extern "C" __global__ void paged_decode_attn_splitk_fibquant(
+    const __nv_bfloat16* __restrict__ Q,
+    const unsigned char* __restrict__ K_cache,
+    const unsigned char* __restrict__ V_cache,
+    float* __restrict__ workspace,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const unsigned int max_blocks_per_seq,
+    const unsigned int num_q_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int block_size,
+    const float inv_sqrt_d,
+    const unsigned int num_splits,
+    const unsigned int q_stride,
+    const unsigned long long block_stride_bytes,
+    const float* __restrict__ fibq_codebook
+) {
+    const unsigned int q_head = blockIdx.x;
+    const unsigned int split_id = blockIdx.y;
+    const unsigned int seq_idx = blockIdx.z;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int warp_id = tid / WARP_SIZE;
+    const unsigned int lane_id = tid % WARP_SIZE;
+
+    if (q_head >= num_q_heads) return;
+    const unsigned int seq_len = (unsigned int)seq_lens[seq_idx];
+    if (seq_len == 0) return;
+
+    // Stage the 4 KB FibQuant codebook to shared memory (data-dependent gather).
+    __shared__ float cb_smem[FIB_N * FIB_K];
+    for (unsigned int i = tid; i < FIB_N * FIB_K; i += blockDim.x)
+        cb_smem[i] = fibq_codebook[i];
+    __syncthreads();
+
+    unsigned int split_size = (seq_len + num_splits - 1) / num_splits;
+    unsigned int kv_start = split_id * split_size;
+    unsigned int kv_end = kv_start + split_size;
+    if (kv_end > seq_len) kv_end = seq_len;
+    if (kv_start >= seq_len) kv_start = kv_end;
+
+    const unsigned int gqa_ratio = num_q_heads / num_kv_heads;
+    const unsigned int kv_head = q_head / gqa_ratio;
+    const unsigned int vec_offset_bf16 = lane_id * VEC_BF16;
+
+    // FibQuant block addressing: payload per (token, kv_head) = 2 (bf16 norm) +
+    // head_dim/FIB_K index bytes; no separate scale section (no data_section_bytes).
+    const unsigned int nblocks = head_dim / FIB_K;
+    const unsigned int payload = 2u + nblocks;
+    const unsigned int token_payload_stride = num_kv_heads * payload;
+    const unsigned int kv_payload_off = kv_head * payload;
+
+    const int* my_block_table = block_tables + seq_idx * max_blocks_per_seq;
+
+    // Load Q (already WHT-rotated by the host bookend).
+    const unsigned int* q32 = (const unsigned int*)(Q + (unsigned long long)seq_idx * q_stride
+                                                       + (unsigned long long)q_head * head_dim + vec_offset_bf16);
+    float q_reg[VEC_BF16];
+    #pragma unroll
+    for (int i = 0; i < VEC_BF16 / 2; i++) {
+        unpack2_bf16(q32[i], q_reg[2*i], q_reg[2*i+1]);
+    }
+
+    unsigned int local_len = kv_end - kv_start;
+    unsigned int chunk_size = (local_len + NUM_WARPS - 1) / NUM_WARPS;
+    unsigned int my_start = kv_start + warp_id * chunk_size;
+    unsigned int my_end = my_start + chunk_size;
+    if (my_end > kv_end) my_end = kv_end;
+    if (my_start > kv_end) my_start = kv_end;
+
+    float m_val = -1e30f;
+    float l_val = 0.0f;
+    float o_reg[VEC_BF16];
+    #pragma unroll
+    for (int i = 0; i < VEC_BF16; i++) o_reg[i] = 0.0f;
+
+    for (unsigned int pos = my_start; pos < my_end; pos++) {
+        unsigned int logical_block = pos / block_size;
+        unsigned int block_offset = pos % block_size;
+        unsigned int physical_block = (unsigned int)my_block_table[logical_block];
+
+        const unsigned char* k_block = K_cache + (unsigned long long)physical_block * block_stride_bytes;
+        const unsigned char* v_block = V_cache + (unsigned long long)physical_block * block_stride_bytes;
+
+        const unsigned char* kp = k_block + block_offset * token_payload_stride + kv_payload_off;
+        float k_tmp[VEC_BF16];
+        fibquant_dequant(kp, lane_id, cb_smem, k_tmp);
+
+        float dot = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < VEC_BF16; i++)
+            dot += q_reg[i] * k_tmp[i];
+        #pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+            dot += __shfl_xor_sync(0xffffffff, dot, offset);
+
+        float score = dot * inv_sqrt_d;
+        float m_new = fmaxf(m_val, score);
+        float exp_old = __expf(m_val - m_new);
+        float exp_new = __expf(score - m_new);
+        l_val = l_val * exp_old + exp_new;
+
+        const unsigned char* vp = v_block + block_offset * token_payload_stride + kv_payload_off;
+        float v_tmp[VEC_BF16];
+        fibquant_dequant(vp, lane_id, cb_smem, v_tmp);
+
+        #pragma unroll
+        for (int i = 0; i < VEC_BF16; i++)
+            o_reg[i] = o_reg[i] * exp_old + exp_new * v_tmp[i];
+        m_val = m_new;
+    }
+
+    // Tree merge within CTA (identical to NVFP4 split-K).
+    __shared__ float smem_m[NUM_WARPS];
+    __shared__ float smem_l[NUM_WARPS];
+    __shared__ float smem_o[NUM_WARPS][HDIM];
+
+    if (lane_id == 0) {
+        smem_m[warp_id] = m_val;
+        smem_l[warp_id] = l_val;
+    }
+    #pragma unroll
+    for (int i = 0; i < VEC_BF16; i++) {
+        smem_o[warp_id][vec_offset_bf16 + i] = o_reg[i];
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (unsigned int stride = NUM_WARPS / 2; stride > 0; stride >>= 1) {
+        if (warp_id < (unsigned int)stride) {
+            unsigned int other = warp_id + stride;
+            float lw = smem_l[other];
+            if (lw > 0.0f) {
+                float mw = smem_m[other];
+                float my_m = smem_m[warp_id];
+                float my_l = smem_l[warp_id];
+                float m_new = fmaxf(my_m, mw);
+                float scale_me = __expf(my_m - m_new);
+                float scale_w = __expf(mw - m_new);
+                smem_l[warp_id] = my_l * scale_me + lw * scale_w;
+                smem_m[warp_id] = m_new;
+                #pragma unroll
+                for (int i = 0; i < VEC_BF16; i++) {
+                    smem_o[warp_id][vec_offset_bf16 + i] =
+                        smem_o[warp_id][vec_offset_bf16 + i] * scale_me +
+                        smem_o[other][vec_offset_bf16 + i] * scale_w;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Write partial to workspace (F32) — SAME layout as NVFP4 split-K so the
+    // shared dtype-independent reduce kernel merges it unchanged.
+    unsigned int ws_stride = (head_dim + 2);
+    float* ws_base = workspace + ((unsigned long long)seq_idx * num_q_heads + q_head) * num_splits * ws_stride
+                   + split_id * ws_stride;
+
+    if (warp_id == 0) {
+        #pragma unroll
+        for (int i = 0; i < VEC_BF16; i++) {
+            ws_base[vec_offset_bf16 + i] = smem_o[0][vec_offset_bf16 + i];
+        }
+        if (lane_id == 0) {
+            ws_base[head_dim] = smem_m[0];
+            ws_base[head_dim + 1] = smem_l[0];
+        }
+    }
+}
