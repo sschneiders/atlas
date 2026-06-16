@@ -107,12 +107,17 @@ def main():
     v = cap["v"]                # [seq, nkv, hd] (no RoPE on V)
     T = k.shape[0]
 
+    def bf16_bytes(t):
+        # Raw bf16 bit pattern as little-endian int16 (numpy has no bf16 dtype);
+        # the Rust spike reads it back with `bf16::from_le_bytes`.
+        return t.to(torch.bfloat16).view(torch.int16).cpu().numpy().tobytes()
+
     with open(args.out, "wb") as f:
         f.write(b"FKV1")
         f.write(struct.pack("<IIII", hd, nkv, nq, T))
-        f.write(torch.tensor(k).to(torch.bfloat16).cpu().numpy().tobytes())
-        f.write(torch.tensor(v).to(torch.bfloat16).cpu().numpy().tobytes())
-        f.write(torch.tensor(q).to(torch.bfloat16).cpu().numpy().tobytes())
+        f.write(bf16_bytes(k))
+        f.write(bf16_bytes(v))
+        f.write(bf16_bytes(q))
 
     print(f"wrote {args.out}: d={hd} nkv={nkv} nq={nq} T={T} "
           f"(model_type={model_type}, layer={args.layer})")
