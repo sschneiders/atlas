@@ -139,17 +139,67 @@ def check_smoke(url):
     return "PASS", f"{ct} tok / coherent"
 
 
+def call_stream(url, messages, max_tokens=96, timeout=600):
+    """Stream a chat completion and split timing into TTFT (prefill proxy) and
+    decode time (first token -> last token). Returns
+    (prompt_tokens, completion_tokens, ttft_s, decode_s).
+    decode tok/s = completion_tokens / decode_s is the DECODE-ONLY rate — it
+    excludes prefill, so it reflects KVFlash's effect (flat past the pool)
+    rather than the prefill cost that grows with context."""
+    body = {
+        "model": "kvflash-test",
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    req = urllib.request.Request(
+        f"{url}/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    t_request = time.time()
+    first_t = None
+    last_t = None
+    pt = ct = 0
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            choices = chunk.get("choices") or []
+            if choices:
+                delta = choices[0].get("delta") or {}
+                if delta.get("content"):
+                    if first_t is None:
+                        first_t = time.time()
+                    last_t = time.time()
+            usage = chunk.get("usage")
+            if usage:
+                pt = usage.get("prompt_tokens", pt)
+                ct = usage.get("completion_tokens", ct)
+    ttft = (first_t - t_request) if first_t else 0.0
+    decode_s = (last_t - first_t) if (first_t and last_t) else 0.0
+    return pt, ct, ttft, decode_s
+
+
 def check_throughput(url, pool):
-    """Over-pool throughput flatness: sweep context lengths across the pool
-    cap and measure decode tok/s. Reports a flatness table + ratio."""
-    print(f"\n[2/3] THROUGHPUT SWEEP (pool={pool} tok) ...", flush=True)
-    # Context targets: half-pool, pool, 2x, 4x, 8x. The pool point is where
-    # eviction should BEGIN engaging; past it, tok/s should stay flat under
-    # kvflash (vs sloping down without it).
+    """Over-pool throughput flatness measured DECODE-ONLY (excludes prefill).
+    Reports per-context TTFT (prefill proxy) + decode tok/s + a decode flatness
+    ratio. KVFlash's effect: decode tok/s stays flat once context exceeds the
+    pool; TTFT still grows with context (prefill is not paged by the MVP)."""
+    print(f"\n[2/3] THROUGHPUT SWEEP — DECODE-ONLY (pool={pool} tok) ...", flush=True)
     targets = []
     for mult in (0.5, 1.0, 2.0, 4.0, 8.0):
         targets.append(max(64, int(pool * mult)))
-    # De-dupe (small pools can collapse targets).
     seen, sweep = set(), []
     for t in targets:
         if t not in seen:
@@ -160,37 +210,32 @@ def check_throughput(url, pool):
     for target in sweep:
         msg = build_context(target)
         try:
-            t0 = time.time()
-            reply = call(url, [{"role": "user", "content": msg}], max_tokens=96, timeout=600)
-            dt = time.time() - t0
+            pt, ct, ttft, decode_s = call_stream(url, [{"role": "user", "content": msg}])
         except Exception as e:
-            rows.append((target, None, None, None, f"err: {e}"))
+            rows.append((target, None, None, None, None, f"err: {e}"))
             continue
-        _text, pt, ct = extract(reply)
-        tps = (ct / dt) if (dt > 0 and ct > 0) else 0.0
-        rows.append((target, pt, ct, tps, ""))
+        decode_tps = (ct / decode_s) if (decode_s > 0 and ct > 0) else 0.0
+        rows.append((target, pt, ct, ttft, decode_tps, ""))
         marker = "  <-- pool cap" if target == pool else ""
         print(
-            f"      target~{target:>6}tok  actual_prompt={pt:>6}  gen={ct:>3}  "
-            f"wall={dt:5.2f}s  tok/s={tps:5.1f}{marker}",
+            f"      target~{target:>6}tok  prompt={pt:>6}  gen={ct:>3}  "
+            f"TTFT={ttft:5.2f}s  decode={decode_tps:5.1f} tok/s{marker}",
             flush=True,
         )
 
-    # Flatness ratio: tok/s at the LARGEST measured context vs at the pool
-    # context. Near 1.0 => eviction is engaging and capping the per-step KV
-    # read (the KVFlash effect). Well below 1.0 => either kvflash is off, the
-    # pool is wrong, or eviction isn't firing.
-    valid = [(pt, tps) for (tgt, pt, ct, tps, err) in rows if tps and not err]
+    # Decode flatness: decode tok/s at the largest context vs at the pool.
+    # Near 1.0 => KVFlash is capping the per-step KV read (decode stays flat
+    # past the pool). TTFT growing is EXPECTED (prefill isn't paged by the MVP).
+    valid = [(pt, dtps) for (tgt, pt, ct, ttft, dtps, err) in rows if dtps and not err]
     ratio_str = "n/a"
     if len(valid) >= 2:
-        # find the pool-proximate and the largest-prompt rows
         by_prompt = sorted(valid, key=lambda r: r[0])
         at_pool = min(valid, key=lambda r: abs(r[0] - pool))[1]
         at_max = by_prompt[-1][1]
         ratio = at_max / at_pool if at_pool > 0 else 0.0
         ratio_str = f"{ratio:.2f}"
-    print(f"      flatness ratio (tok_s@largest / tok_s@pool) = {ratio_str}")
-    print(f"      (near 1.0 => eviction engaging; <1.0 => compare vs no-kvflash baseline)")
+    print(f"      decode flatness (decode_tps@largest / decode_tps@pool) = {ratio_str}")
+    print(f"      (near 1.0 => KVFlash capping decode KV read; TTFT growth is prefill, expected)")
     return "DONE", ratio_str
 
 

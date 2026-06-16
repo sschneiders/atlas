@@ -80,6 +80,7 @@ impl TransformerModel {
                         seq.seq_len + 1,
                         block_size,
                         self.dummy_kv_block,
+                        spark_runtime::kvflash_pager::pool_blocks().unwrap_or(usize::MAX),
                     ) {
                         Some((resident, reduced)) => (reduced as i32, Some(resident)),
                         None => ((seq.seq_len + 1) as i32, None),

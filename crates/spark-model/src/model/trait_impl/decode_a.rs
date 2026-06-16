@@ -122,6 +122,7 @@ impl TransformerModel {
                     seq.seq_len + 1,
                     bs,
                     self.dummy_kv_block,
+                    spark_runtime::kvflash_pager::pool_blocks().unwrap_or(usize::MAX),
                 ) {
                     Some((resident, reduced)) => {
                         // One-shot diagnostic: confirms compaction engaged at
