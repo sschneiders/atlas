@@ -91,6 +91,15 @@ pub(super) fn required_optional_kernels_for_dtype(
                 "inferspark_prefill_paged_turbo3k_turbo8v_64",
             ));
         }
+        KvCacheDtype::FibQuant => {
+            // Chunked-prefill paged-attention kernel (Step 3 .cu). Unlike the
+            // turbo dtypes FibQuant uses its own Haar rotation, not WHT, so the
+            // WHT bookend gate below does not fire for it.
+            req.push((
+                "prefill_paged_fibquant",
+                "inferspark_prefill_paged_fibquant",
+            ));
+        }
         KvCacheDtype::Bf16 | KvCacheDtype::Fp8 | KvCacheDtype::Nvfp4 => {}
     }
     // WHT rotation bookends: the write path stores turbo cache contents in
@@ -187,6 +196,17 @@ mod tests {
                 "{d:?}: plain dtype should require no optional kernels"
             );
         }
+        // FibQuant needs its own chunked-prefill kernel but, unlike turbo
+        // dtypes, uses its own Haar rotation (not WHT) ⇒ no WHT bookends.
+        let fq_req = required_optional_kernels_for_dtype(KvCacheDtype::FibQuant, 256);
+        assert!(
+            fq_req.iter().any(|(m, _)| *m == "prefill_paged_fibquant"),
+            "FibQuant: requirement list missing prefill_paged_fibquant"
+        );
+        assert!(
+            !fq_req.iter().any(|(m, _)| *m == "wht_bf16"),
+            "FibQuant must not require WHT bookends (it uses its own rotation)"
+        );
     }
 
     /// Turbo2 is WHT-rotated by the write path like Turbo3/4/8 — the decode
