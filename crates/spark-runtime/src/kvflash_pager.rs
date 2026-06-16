@@ -374,7 +374,6 @@ impl KvflashPager {
         if l >= block_table.len() {
             return Ok(false);
         }
-        let num_layers = self.num_layers;
         // Pull the host copy out of the slot (removed from the host store).
         let layers_kv = match self.slots.get_mut(&slot) {
             Some(st) => match st.host_store.remove(&logical) {
@@ -394,8 +393,7 @@ impl KvflashPager {
                 return Ok(false);
             }
         };
-        for layer in 0..num_layers {
-            let (k, v) = &layers_kv[layer];
+        for (layer, (k, v)) in layers_kv.iter().enumerate() {
             kv_cache.write_block(layer, physical, k, v, gpu)?;
         }
         block_table[l] = physical;
