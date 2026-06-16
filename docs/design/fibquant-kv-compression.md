@@ -345,6 +345,14 @@ the same symbol but with the variant's compiled code.
 - Validate each shipped rate on the recall grid + the #3 quality gate before
   merge (4× expected best; 8× already validated = current FibQuant).
 
+**#7 status: DONE + validated.** The `[[variants]]` build mechanism is in
+`build_parse.rs`/`build.rs` (no-variant path byte-identical, verified). The
+`FibQuant4x` (k=2, N=256, 4×) variant is wired alongside `FibQuant` (8×); the 3
+FibQuant `.cu` are compiled twice via `-DFIB_K=4`/`-DFIB_K=2`. Verified on gb10:
+`--kv-cache-dtype fibquant4x` serves the A3B ("What is 2+2?"→"4"), and the #3
+greedy quality gate vs bf16 = **8/8 exact-match, Jaccard 1.000** (same as 8×).
+So the tunable-rate feature ships at 4× + 8×; 16× remains deferred.
+
 ## Step 1 results (fidelity spike — DONE, mechanism validated)
 
 Pure-Rust reference in `crates/atlas-quant/src/fibquant/` (codebook = Beta-
