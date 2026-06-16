@@ -57,11 +57,11 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(args.model)
-    model = (
-        AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16)
-        .to("cuda")
-        .eval()
-    )
+    # `device_map="cuda"` streams weights straight to the GPU via accelerate
+    # (avoids the CPU double-buffer that OOMs on a 35B FP8 model on 128GB).
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model, torch_dtype=torch.bfloat16, device_map="cuda"
+    ).eval()
     cfg = model.config
     model_type = cfg.model_type.replace("-", "_")
     apply_rope = get_apply_rope(model_type)
