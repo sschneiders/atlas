@@ -456,7 +456,13 @@ impl KvflashPager {
         gpu: &dyn GpuBackend,
     ) {
         let (qs, nq, nkv, hd, ntok) = match self.prefill_q.as_ref() {
-            Some(q) => (q.as_slice(), self.prefill_q_nq, self.prefill_q_nkv, self.prefill_q_hd, self.prefill_q_ntok),
+            Some(q) => (
+                q.as_slice(),
+                self.prefill_q_nq,
+                self.prefill_q_nkv,
+                self.prefill_q_hd,
+                self.prefill_q_ntok,
+            ),
             None => {
                 tracing::debug!("kvflash attention keep-set: no prefill Q captured yet");
                 return;
@@ -507,49 +513,6 @@ impl KvflashPager {
         tracing::info!(
             "kvflash attention keep-set (q-window={ntok}): total={total} n_keep={n_keep} top_weight={:.4} kept={keep:?}",
             agg[top_idx],
-        );
-        if let Some(st) = self.slots.get_mut(&slot) {
-            for &i in &keep {
-                st.residency.protect(i as usize);
-            }
-            st.attention_keep_set_computed = true;
-        }
-    }
-        };
-        let total = match self.slots.get(&slot) {
-            Some(st) => st.residency.total(),
-            None => return,
-        };
-        if total == 0 || nkv == 0 || hd == 0 {
-            return;
-        }
-        let bs = self.block_size as usize;
-        // Read K from the LAST attention layer (matches the captured prefill Q,
-        // which is the last layer's — deep layers carry content attention,
-        // early layers are sink-dominated).
-        let k_layer = self.num_layers.saturating_sub(1);
-        // Parse each block's K (BF16) to f32 [bs, nkv, hd].
-        let mut block_ks: Vec<Vec<f32>> = Vec::with_capacity(total);
-        for b in 0..total as u32 {
-            let kf: Vec<f32> = kv_cache
-                .read_block(k_layer, b, gpu)
-                .map(|(k, _)| {
-                    (0..k.len() / 2)
-                        .map(|i| {
-                            let bits = u16::from_le_bytes([k[i * 2], k[i * 2 + 1]]) as u32;
-                            f32::from_bits(bits << 16)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            block_ks.push(kf);
-        }
-        let weights = attention_block_weights(q, &block_ks, nq, nkv, hd, bs);
-        let n_keep = (self.pool_blocks() / 4).max(1);
-        let keep = top_blocks_by_weight(&weights, n_keep);
-        tracing::debug!(
-            "kvflash attention keep-set: total={total} n_keep={n_keep} top_weight={:.4} kept={keep:?}",
-            weights.first().copied().unwrap_or(0.0),
         );
         if let Some(st) = self.slots.get_mut(&slot) {
             for &i in &keep {
@@ -1127,7 +1090,15 @@ pub fn capture_prefill_q(
     stream: u64,
 ) {
     let _ = with_local(|p| {
-        p.capture_prefill_q(q_base, num_tokens, num_q_heads, num_kv_heads, head_dim, gpu, stream);
+        p.capture_prefill_q(
+            q_base,
+            num_tokens,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            gpu,
+            stream,
+        );
         Ok(())
     });
 }
