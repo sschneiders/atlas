@@ -489,7 +489,7 @@ impl KvflashPager {
                 n_refreshed += 1;
             }
         }
-        tracing::info!(
+        tracing::debug!(
             "kvflash refresh: resident={} refreshed={}",
             resident_blocks_len,
             n_refreshed
@@ -538,7 +538,7 @@ impl KvflashPager {
                 n_recall += 1;
             }
         }
-        tracing::info!(
+        tracing::debug!(
             "kvflash reselect: total={} planned_evict={} planned_recall={} exec_evict={} exec_recall={}",
             total,
             evict.len(),
