@@ -669,6 +669,101 @@ requires the needle to already be resident.
 - The recall-grid test (`tests/test_kvflash_recall_grid.py`) is the right
   benchmark for any future recall mechanism.
 
+---
+
+# SESSION 6 — CORRECTION: the scorer is a small DRAFTER model that GENERATES (sessions 2-5 tested the wrong thing)
+
+## The wrong turn
+
+Sessions 2-5 followed the handoff's claim that "the HSS Predictor is the same
+relevance signal as a drafter, without a second model." **That claim was
+wrong.** Everything tested in sessions 2-5 used the *main* model's attention
+(prefill question-window, all-token aggregate) or a low-rank proxy (Predictor)
+or content statistics (novelty). All are **sink-dominated and/or circular**,
+and all failed for mid-depth recall. None of them is a drafter.
+
+## The right mechanism: a separate small drafter that GENERATES
+
+The original KVFlash design (and the intent): the scorer is a **small Qwen3
+drafter (Qwen3-0.6B-class)** that runs as a **separate model with FULL KV (no
+KVFlash paging)** over the context + question and **generates**. Its
+generation attention is the relevance signal.
+
+**Why this breaks the circularity that defeated sessions 2-5:**
+- The control (session 4): with full KV the A3B finds a mid-depth needle **92%**
+  of the time — but that retrieval happens via the **generation** attention
+  (the decode step that produces the answer attends to the needle).
+- On the **main** model that attention is **circular**: it only exists once the
+  needle is already resident (paged in), which is exactly what we're trying to
+  decide. So main-model attention (prefill *or* a kernel hook on it) cannot
+  identify the needle — proven empirically (sink-dominated / generation-only).
+- The **drafter** is a *different* model with *full* KV. It runs generation
+  with full attention and CAN attend to a mid-depth needle the main model has
+  paged out. Its generation attention is therefore **non-circular** — it is the
+  92% signal, available without already having the needle resident. The
+  drafter's per-chunk attention → the main model's keep-set.
+
+In one line: **the main model's generation attention is the signal, but it's
+circular on the main model; the drafter runs that same signal non-circularly
+because it has full KV.**
+
+## Drafter design (what to build)
+
+1. **Load a small drafter** (e.g. `Qwen/Qwen3-0.6B`) alongside the main model.
+   Atlas already has scaffolding: `DrafterScorer`
+   (`crates/spark-runtime/src/kvflash_scorer.rs`) holds a drafter `WeightStore`;
+   `load_kvflash_scorer` (`serve_phases/weights.rs`) loads one and parses its
+   dims; the **dflash spec-decode drafter** (`load_dflash_drafter`,
+   `crates/spark-server/.../serve_phases/`) runs a drafter forward — the
+   closest existing "run a small model forward" precedent. Reuse/investigate
+   these first.
+2. **Run the drafter over the full prompt** (context + question), one-shot at
+   prefill end, with **full attention**. The drafter is small (0.6B) and is
+   NOT subject to KVFlash paging (only the main model is), so it sees the
+   entire context.
+3. **Capture the drafter's attention per KV block.** Atlas's fused attention
+   kernels do not expose the attention matrix, so capture the drafter's
+   per-layer **Q and K** (materialised during its forward — same pattern as
+   the session-4 prefill Q-capture hook in `paged.rs`/`cache_skip.rs`) and
+   compute attention = softmax(Q·Kᵀ/√d) via a GEMM. Aggregate per-block →
+   relevance. (This is the "attention extraction" the handoff called "not yet
+   wired" — it is the core work item.)
+4. **Keep-set** = top-`pool/4` blocks by drafter attention + recent tail + sink,
+   protected from eviction.
+5. **Validate** with the recall grid (`tests/test_kvflash_recall_grid.py`):
+   mid-depth (0.15-0.75) HIT is the goal; decode flatness must hold ~0.92.
+
+## Open question to resolve FIRST (cheap)
+
+Is the drafter's **forward** (prefill) attention enough, or must it **generate**
+(decode) to get the reliable signal? The control proved *generation* attention
+is the 92% signal. The drafter is a different (smaller) model — its forward
+attention may be less sink-dominated than the main model's, in which case a
+single forward suffices (cheap). If the drafter's forward attention is also
+sink-dominated, run a short drafter generation (a few tokens) and capture the
+generation-step attention. **Test the drafter's forward attention on the recall
+grid before committing to a full generation loop.**
+
+## Do NOT repeat (sessions 2-5, all ruled out)
+
+- HSS Predictor (Q·K_lowrank) — non-discriminatory scores.
+- Main-model prefill attention (question-window OR all-token aggregate) —
+  sink-dominated + circular.
+- Content novelty (byte-hash: RoPE-confounded; K-norm: context-confounded).
+- Prefix floor — ends only, doesn't scale.
+- A kernel hook on the **main** model's attention — same sink-dominated signal.
+(None of these is a drafter. The drafter is a *separate model with full KV*.)
+
+## Branch state
+
+`feat/kvflash-9-drafter-scorer` (gb10 + origin). Compile-clean on gb10 real
+CUDA (`cargo clippy -Dwarnings`). Default = prefix recall floor + pure-LRU
+(passes the simple validation, BF16 + FP8). The failed experiments are gated
++ dormant (`ATLAS_KVFLASH_NOVELTY`, `ATLAS_KVFLASH_ATTENTION`,
+`ATLAS_KVFLASH_SCORER`). The `DrafterScorer` stub + `load_kvflash_scorer` +
+prefill Q-capture hook are in place to build on.
+
+
 
 
 
