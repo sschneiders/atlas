@@ -16,6 +16,7 @@ Usage (gb10 venv at /tmp/draftprobe_venv):
 """
 import argparse
 import struct
+import sys
 
 import torch
 
@@ -32,18 +33,17 @@ def build_context(target_tokens):
     return body[:mid] + " " + needle + " " + body[mid:]
 
 
-def get_apply_rope(model_type):
-    """Pick the model's apply_rotary_pos_emb from its modeling module."""
-    candidates = {
-        "qwen3": "transformers.models.qwen3.modeling_qwen3",
-        "qwen3_next": "transformers.models.qwen3_next_moe.modeling_qwen3_next_moe",
-        "qwen3_vl": "transformers.models.qwen3_vl.modeling_qwen3_vl",
-    }
-    mod_name = candidates.get(model_type)
-    if mod_name is None:
-        raise SystemExit(f"unsupported model_type {model_type!r}; add its import path")
-    mod = __import__(mod_name, fromlist=["apply_rotary_pos_emb"])
-    return mod.apply_rotary_pos_emb
+def get_apply_rope(model):
+    """Robustly fetch `apply_rotary_pos_emb` from the model's own modeling module
+    (works for any architecture: qwen3, qwen3_next_moe, qwen3_5_moe_text, ...)."""
+    mod = sys.modules[type(model).__module__]
+    fn = getattr(mod, "apply_rotary_pos_emb", None)
+    if fn is None:
+        raise SystemExit(
+            f"apply_rotary_pos_emb not found in {type(model).__module__}; "
+            "the model may store rotary differently"
+        )
+    return fn
 
 
 def main():
@@ -63,8 +63,7 @@ def main():
         args.model, torch_dtype=torch.bfloat16, device_map="cuda"
     ).eval()
     cfg = model.config
-    model_type = cfg.model_type.replace("-", "_")
-    apply_rope = get_apply_rope(model_type)
+    apply_rope = get_apply_rope(model)
     nq = cfg.num_attention_heads
     nkv = cfg.num_key_value_heads
     hd = cfg.head_dim if hasattr(cfg, "head_dim") else (cfg.hidden_size // nq)
@@ -120,7 +119,7 @@ def main():
         f.write(bf16_bytes(q))
 
     print(f"wrote {args.out}: d={hd} nkv={nkv} nq={nq} T={T} "
-          f"(model_type={model_type}, layer={args.layer})")
+          f"(model_type={cfg.model_type}, layer={args.layer})")
 
 
 if __name__ == "__main__":
