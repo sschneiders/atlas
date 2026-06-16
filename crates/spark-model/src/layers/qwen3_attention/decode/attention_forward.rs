@@ -472,12 +472,13 @@ impl Qwen3AttentionLayer {
             })
             .expect("local installed checked in high_speed_swap_engaged")?;
         } else {
-            // KVFlash Q-capture: stash this step's decode Q (chosen layer = 0)
-            // for the relevance scorer's later `score_chunks`. No-op when no
-            // scorer is attached (recency/LRU residency). Post-RoPE `q_out` is
-            // the true attention query; DevicePtr is Copy so this does not move
-            // it out of the `run_paged_decode` call below.
-            if self.attn_layer_idx == 0 {
+            // KVFlash Q-capture: stash this step's decode Q for the relevance
+            // scorer's later `score_chunks`. No-op when no scorer is attached
+            // (recency/LRU residency). Capture from a LATE attention layer
+            // (semantic Q) — layer-0 Q is too low-level to discriminate a
+            // recall target. TODO: make this the model's last attention layer
+            // generically (needs the attention-layer count on the layer/config).
+            if self.attn_layer_idx == 9 {
                 spark_runtime::kvflash_pager::capture_q(q_out, nq, hd, ctx.gpu, stream);
             }
             self.run_paged_decode(
