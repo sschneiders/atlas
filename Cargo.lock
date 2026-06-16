@@ -2074,6 +2074,7 @@ dependencies = [
  "anyhow",
  "atlas-core",
  "atlas-kernels",
+ "atlas-quant",
  "base64 0.22.1",
  "half",
  "image",

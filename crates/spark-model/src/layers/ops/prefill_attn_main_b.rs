@@ -242,6 +242,7 @@ pub fn prefill_attention_paged_fibquant(
     sliding_window: u32,
     inv_sqrt_d: f32,
     fibq_block_stride: u64,
+    codebook_dev: DevicePtr,
     stream: u64,
 ) -> Result<()> {
     let br = if cfg!(atlas_scale) { 32u32 } else { 64u32 };
@@ -264,6 +265,7 @@ pub fn prefill_attention_paged_fibquant(
         .arg_u32(1u32) // causal_mask_enabled
         .arg_f32(inv_sqrt_d)
         .arg_u64(fibq_block_stride)
+        .arg_ptr(codebook_dev)
         .launch(stream)
 }
 

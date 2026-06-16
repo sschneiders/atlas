@@ -502,6 +502,7 @@ impl Qwen3AttentionLayer {
                     key_stride,
                     value_stride,
                     kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
+                    self.fibq_codebook_dev,
                     stream,
                 )
             }

@@ -14,11 +14,19 @@
 //   bf16 norm at that offset; head_dim/FIB_K index bytes immediately after.
 //
 // Grid: (num_q_heads, num_seqs, 1)   Block: (256, 1, 1)
-// v1 embeds the hd=256 codebook (A3B target).
+//
+// The codebook is built on the host from `atlas-quant` for the layer's actual
+// head_dim and passed in as the trailing `fibq_codebook` device pointer (only
+// the FIB_K=4 / FIB_N=256 geometry is compile-time — any head_dim works).
 
 #include <cuda_bf16.h>
-#include "fibquant_codebook_256.cuh"
 
+#ifndef FIB_K
+#define FIB_K 4
+#endif
+#ifndef FIB_N
+#define FIB_N 256
+#endif
 #define WARP_SIZE 32
 #ifndef HDIM
 #define HDIM 256
@@ -67,7 +75,8 @@ extern "C" __global__ void paged_decode_attn_fibquant(
     const unsigned int block_size,
     const float inv_sqrt_d,
     const unsigned int q_stride,
-    const unsigned long long block_stride_bytes
+    const unsigned long long block_stride_bytes,
+    const float* __restrict__ fibq_codebook
 ) {
     const unsigned int q_head = blockIdx.x;
     const unsigned int seq_idx = blockIdx.y;
@@ -82,7 +91,7 @@ extern "C" __global__ void paged_decode_attn_fibquant(
     // Stage the 4 KB FibQuant codebook to shared memory (data-dependent gather).
     __shared__ float cb_smem[FIB_N * FIB_K];
     for (unsigned int i = tid; i < FIB_N * FIB_K; i += blockDim.x)
-        cb_smem[i] = FIB_CODEBOOK[i];
+        cb_smem[i] = fibq_codebook[i];
     __syncthreads();
 
     const unsigned int gqa_ratio = num_q_heads / num_kv_heads;

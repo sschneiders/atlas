@@ -77,6 +77,7 @@ pub fn reshape_and_cache_fibquant(
     key_stride: u32,
     value_stride: u32,
     block_stride_bytes: u64,
+    codebook_dev: DevicePtr,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
@@ -93,6 +94,7 @@ pub fn reshape_and_cache_fibquant(
         .arg_u32(key_stride)
         .arg_u32(value_stride)
         .arg_u64(block_stride_bytes)
+        .arg_ptr(codebook_dev)
         .launch(stream)
 }
 
@@ -198,6 +200,7 @@ pub fn paged_decode_attn_fibquant(
     inv_sqrt_d: f32,
     q_stride: u32,
     block_stride_bytes: u64,
+    codebook_dev: DevicePtr,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
@@ -217,6 +220,7 @@ pub fn paged_decode_attn_fibquant(
         .arg_f32(inv_sqrt_d)
         .arg_u32(q_stride)
         .arg_u64(block_stride_bytes)
+        .arg_ptr(codebook_dev)
         .launch(stream)
 }
 

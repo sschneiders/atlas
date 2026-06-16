@@ -463,6 +463,7 @@ impl Qwen3AttentionLayer {
                     self.sliding_window.unwrap_or(0),
                     inv_sqrt_d,
                     kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
+                    self.fibq_codebook_dev,
                     stream,
                 )?,
                 (_, true) => ops::prefill_attention_paged_fp8_64(

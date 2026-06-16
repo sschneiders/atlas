@@ -17,13 +17,19 @@
 // One CTA per vector: the first (head_dim/FIB_K) threads each own one k-block;
 // they cooperatively reduce the vector L2 norm, then each searches the codebook.
 //
-// NOTE: the embedded codebook (fibquant_codebook_256.cuh) is built for
-// head_dim = 256. v1 targets hd = 256 (the A3B); other head dims need a
-// matching codebook.
+// The codebook is NOT embedded: it is built on the host from `atlas-quant` for
+// the layer's actual head_dim (spherical-Beta f_{d,k}), uploaded once at model
+// init, and passed in as the trailing `fibq_codebook` device pointer. Only the
+// geometry (FIB_K=4, FIB_N=256) is compile-time — so any head_dim works.
 
 #include <cuda_bf16.h>
-#include "fibquant_codebook_256.cuh"
 
+#ifndef FIB_K
+#define FIB_K 4
+#endif
+#ifndef FIB_N
+#define FIB_N 256
+#endif
 #ifndef WARP_SIZE
 #define WARP_SIZE 32
 #endif
@@ -60,7 +66,8 @@ extern "C" __global__ void reshape_and_cache_flash_fibquant(
     const unsigned int block_size,
     const unsigned int key_stride,
     const unsigned int value_stride,
-    const unsigned long long block_stride_bytes
+    const unsigned long long block_stride_bytes,
+    const float* __restrict__ fibq_codebook
 ) {
     const unsigned int vec_idx = blockIdx.x;
     const unsigned int token_idx = vec_idx / num_kv_heads;
@@ -76,7 +83,7 @@ extern "C" __global__ void reshape_and_cache_flash_fibquant(
     // data-dependently during the search — __constant__ would serialise).
     __shared__ float cb_smem[FIB_N * FIB_K];
     for (unsigned int i = tid; i < FIB_N * FIB_K; i += blockDim.x)
-        cb_smem[i] = FIB_CODEBOOK[i];
+        cb_smem[i] = fibq_codebook[i];
     __syncthreads();
 
     // Each of the first `nblocks` threads loads its k-block of WHT(K)/WHT(V).

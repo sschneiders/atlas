@@ -9,10 +9,19 @@
 // the output iWHT'd by the host bookends (same as the turbo dtypes).
 //
 // Grid: (num_q_heads, ceil(q_len/BR), 1)  Block: (128 or 256, 1, 1)
-// v1 embeds the hd=256 codebook (A3B target).
+//
+// The codebook is built on the host from `atlas-quant` for the layer's actual
+// head_dim and threaded via KERNEL_EXTRA_PARAMS (`fibq_codebook`); only the
+// FIB_K=4 / FIB_N=256 geometry is compile-time (any head_dim works).
 
 #include <cuda_bf16.h>
-#include "fibquant_codebook_256.cuh"
+
+#ifndef FIB_K
+#define FIB_K 4
+#endif
+#ifndef FIB_N
+#define FIB_N 256
+#endif
 
 // Stage the 4 KB FibQuant codebook to shared memory once per CTA so the
 // data-dependent gather in LOAD_KV_TILE reads from smem, not __constant__.
@@ -22,7 +31,7 @@
 #define KERNEL_PREAMBLE \
     __shared__ float fibq_cb_smem[FIB_N * FIB_K]; \
     for (unsigned int _i = threadIdx.x; _i < FIB_N * FIB_K; _i += blockDim.x) \
-        fibq_cb_smem[_i] = FIB_CODEBOOK[_i]; \
+        fibq_cb_smem[_i] = fibq_codebook[_i]; \
     __syncthreads();
 
 // FibQuant tile loader: gather `codebook[index] × norm` → BF16 into smem.
@@ -61,6 +70,7 @@
 #define V_CACHE_TYPE const void* __restrict__
 #define KERNEL_EXTRA_PARAMS \
     , const float inv_sqrt_d \
-    , const unsigned long long fibq_block_stride
+    , const unsigned long long fibq_block_stride \
+    , const float* __restrict__ fibq_codebook
 
 #include "prefill_paged_compute.cuh"

@@ -113,6 +113,10 @@ pub struct Qwen3AttentionLayer {
     /// Post-norm for dense FFN output only (post_feedforward_layernorm_1).
     pub(crate) post_dense_ffn_norm: Option<DenseWeight>,
     pub(super) kv_dtype: KvCacheDtype,
+    /// FibQuant per-head_dim codebook, built once from `atlas-quant` at init and
+    /// uploaded as a 4 KB f32 device buffer. `DevicePtr::NULL` when
+    /// `kv_dtype != FibQuant` (never dereferenced outside the FibQuant arms).
+    pub(super) fibq_codebook_dev: spark_runtime::gpu::DevicePtr,
     /// Turbo4 sparse-V pruning threshold (0.0 = disabled).
     pub(super) sparse_v_threshold: f32,
     // ── Decode weights (QuantWeight enum: Nvfp4 | Fp8 | Dense) ──
