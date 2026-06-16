@@ -20,6 +20,9 @@ pub(crate) const FIBQUANT_K: usize = 4;
 /// calibration); the same `(k, N, seed)` is shared by host (atlas-quant) and
 /// the `.cu` kernel (Step 3).
 pub(crate) const FIBQUANT_N: usize = 256;
+// The byte math in `block_bytes_dims` stores 1 byte per index; enforce the
+// `N ≤ 256` invariant it depends on.
+const _: () = assert!(FIBQUANT_N <= 256, "FibQuant index width assumes N <= 256");
 
 /// KV cache quantization dtype.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
