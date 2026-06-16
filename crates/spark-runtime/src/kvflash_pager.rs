@@ -493,7 +493,7 @@ impl KvflashPager {
             None => return Ok((0, 0)),
         };
         // 2. Plan (pure logic; reads residency + protected_tail_blocks).
-        let (evict, recall) = {
+        let (mut evict, mut recall) = {
             let st = match self.slots.get(&slot) {
                 Some(s) => s,
                 None => return Ok((0, 0)),
@@ -505,6 +505,19 @@ impl KvflashPager {
                 &scores,
             )
         };
+        // Cap the per-reselect swap. plan_reselect aims for the full top-pool
+        // in one shot, but the relevance scores move with each decode Q, so an
+        // unbounded swap churns the resident set every τ (observed 50/50 swaps
+        // → 5x decode slowdown). Converge gradually: at most SWAP_CAP evictions
+        // (lowest-score residents) + recalls (highest-score paged-out) per
+        // reselect. A contextually-relevant paged-out chunk (the needle, when
+        // asked) is the top-scored recall and is still pulled in immediately.
+        // plan_reselect returns recall highest-score-first and evict in the
+        // same DESC pass, so reverse evict to drop the lowest-score residents.
+        const SWAP_CAP: usize = 8;
+        evict.reverse();
+        evict.truncate(SWAP_CAP);
+        recall.truncate(SWAP_CAP);
         // 3. Execute: evict first (frees GPU capacity), then recall.
         let mut n_evict = 0usize;
         for &logical in &evict {
