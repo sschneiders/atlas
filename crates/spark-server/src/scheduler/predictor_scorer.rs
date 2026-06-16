@@ -25,7 +25,7 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kvflash_scorer::KvFlashScorer;
 use spark_storage::ModelDims;
-use spark_storage::cuda_min::{DeviceBuffer, copy_d_to_h_async, stream_sync};
+use spark_storage::cuda_min::{DeviceBuffer, copy_d_to_h_async, copy_h_to_d_async, stream_sync};
 use spark_storage::predictor::{Predictor, PredictorDims};
 
 /// Low-rank projection dimension. Higher = sharper relevance, more HBM for
@@ -78,6 +78,21 @@ impl PredictorScorer {
         dims.validate()?;
         let stream = 0u64;
         let predictor = Predictor::new_on_stream(stream, dims, PREDICTOR_SEED)?;
+        // Zero A_g so unprojected blocks (never-evicted resident tail, slots
+        // beyond the current context) score exactly 0 — never recalled, evicted
+        // first. Without this, cuMemAlloc garbage yields arbitrary scores and
+        // churns the resident set every reselect. Sync so the zeroing (default
+        // stream) is visible before any hot-path access (model stream).
+        let a_g_bytes = dims.a_g_bytes();
+        let zero = vec![0u8; a_g_bytes];
+        copy_h_to_d_async(
+            predictor.a_g_dev_ptr(),
+            zero.as_ptr() as *const c_void,
+            a_g_bytes,
+            stream,
+        )?;
+        drop(zero);
+        stream_sync(stream)?;
         let q_capture = DeviceBuffer::new(dims.num_q_heads * dims.head_dim * 2)?;
         let q_proj = DeviceBuffer::new(dims.num_q_heads * dims.r * 2)?;
         let block_scores = DeviceBuffer::new(dims.max_blocks * 4)?;

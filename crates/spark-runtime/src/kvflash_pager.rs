@@ -374,6 +374,10 @@ impl KvflashPager {
             for (layer, (k, _v)) in layers_kv.iter().enumerate() {
                 s.project_evicted_block(layer, logical, k, gpu);
             }
+            // Mark projected so a later recall (page_in) doesn't trigger a
+            // redundant re-projection in the next reselect refresh — the
+            // block's low-rank K is already in A_g and its content is fixed.
+            s.mark_projected(logical);
         }
         Ok(layers_kv)
     }
