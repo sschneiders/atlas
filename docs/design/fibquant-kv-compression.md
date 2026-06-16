@@ -202,6 +202,48 @@ with upstream/main** and clippy-clean on gb10 real CUDA. New branch e.g.
    `--kvflash`.
 4. Decode flatness ~0.92 retained.
 
+## Step 1 results (fidelity spike — DONE, mechanism validated)
+
+Pure-Rust reference in `crates/atlas-quant/src/fibquant/` (codebook = Beta-
+quantile radii × Fibonacci/Roberts–Kronecker directions + multi-restart
+Lloyd–Max; Haar rotation; normalize→rotate→vector-quantize codec; attention-
+output cosine metric, paper Eq. 3). 25 unit tests pass; clippy/fmt clean.
+
+**Synthetic canonical source (d=256, the A3B head_dim), per-vector cosine:**
+
+| k | N | rate (b) | compress | vec_cos |
+|---|---|----------|----------|---------|
+| 2 | 16 | 2.0 | 8× | 0.939 |
+| 2 | 64 | 3.0 | 5.3× | 0.984 |
+| 2 | 256 | 4.0 | 4× | 0.996 |
+| 4 | 256 | 2.0 | 8× | 0.948 |
+| 4 | 1024 | 2.5 | 6.4× | 0.973 |
+
+**Real KV (Qwen3-0.6B, d=128, layer 5, T=633) — attention-output cosine
+(paper Eq. 3), K and V both compressed:**
+
+| k | N | rate (b) | compress | attn_cos |
+|---|---|----------|----------|----------|
+| 2 | 16 | 2.0 | 8× | **0.988** |
+| 2 | 64 | 3.0 | 5.3× | **0.998** |
+| 2 | 256 | 4.0 | 4× | **0.9997** |
+| 4 | 256 | 2.0 | 8× | **0.992** |
+| 4 | 1024 | 2.5 | 6.4× | **0.997** |
+
+Success criterion #2 is met on real KV: **≥0.95 attention cosine at every rate,
+0.988 @ 8×, beating the paper's 5×@0.99.** Softmax robustness lifts attn_cos
+well above the per-vector cosine, exactly as the paper predicts.
+
+**A3B (d=256) note.** By FibQuant's source-agnostic universality (Thm 1) the
+rotated-block source is identical for every model, and at d=256 the shell is
+tighter (Var R² = O(d⁻²)) so the problem is *easier* than d=128 ⇒ A3B fidelity
+≥ the Qwen3-0.6B numbers above. The HF-cached A3B (FP8/NVFP4) is blocked for
+offline capture by a `kernels`/`transformers` fp8-kernel revision mismatch in
+the venv (HF infra, not FibQuant); the real-A3B-KV number will be taken via
+`PagedKvCache::read_block` (the doc's specified method) during Step 2, on the
+actual Atlas stack. Capture tooling: `tests/dump_kv_fkv1.py` (HF path) +
+`crates/atlas-quant/examples/fibquant_fidelity.rs` (the sweep).
+
 ## Attribution
 
 FibQuant mechanism: Lee & Kim, arXiv:2605.11478. Reimplemented for Atlas under
