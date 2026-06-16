@@ -403,3 +403,59 @@ gb10 (scp a .sh) instead of inline heredocs. nvcc is at `/usr/local/cuda/bin`
 but NOT on PATH in non-interactive ssh shells, so prefix `PATH=...:$PATH`
 for any build (cudarc's build script needs `nvcc --version`).
 
+---
+
+# RESOLUTION — prefix recall floor (validation criterion MET)
+
+The alternative to Q-driven recall is **coverage-based**: pin the first
+`pool/4` blocks (the prompt prefix) as an always-resident floor, on top of
+the existing sink + recent tail. The resident set becomes "prefix + recent",
+covering both ends of the context while staying pool-sized (O(pool) attention
+→ flatness preserved). This is the FlashMemory always-resident floor extended
+from the sink to a prefix.
+
+## Validated on the gb10 (BF16 KV, `--kvflash 1024 --kvflash-compact`)
+
+```
+smoke:              PASS
+throughput flatness: 0.95   (target ~0.92; was 0.93 under pure LRU)
+needle recall:      {'shallow': 'HIT', 'deep': 'HIT'}   (shallow was MISS!)
+```
+
+Decode curve is flat: 610-650 tok/s from 1x to 8x the pool. The shallow
+needle (block ~11, ~5% depth) lands inside the pinned prefix; the deep
+needle (block ~203, ~85% depth) stays inside the recent tail. Both HIT.
+
+## Why this beat the Q-driven scorer
+
+- `pool/4 = 16` prefix blocks (for pool 64): covers a ~5%-depth needle
+  without crowding the recent window (deep needle stays in the recent 48).
+- The PredictorScorer is now **opt-in** (`ATLAS_KVFLASH_SCORER=1`), dormant
+  by default. With it ON, the reselect churn destabilises the model's answer
+  (shallow flips back to MISS) even though the prefix keeps the needle
+  resident — confirming the churn, not the residency, was the problem. The
+  Steps 1-3 scorer code is preserved for experimentation.
+- Why prefix beats reactive Q-recall fundamentally: reactive recall needs the
+  decode Q to "know" what to retrieve, but the decode Q is a generation query
+  and (once the target is paged out) doesn't reflect it. Pinning the prefix
+  never pages it out, so there is nothing to reactively retrieve.
+
+## Config
+
+`prefix_blocks` is computed as `pool_blocks / 4` (min 1) in `begin_request`
+and re-asserted in `sync_to_len` (idempotent `protect_range`). No CLI/config
+field yet — make it a `KvflashConfig` field if tuning is needed (e.g. for
+models where key info isn't prompt-early).
+
+## Outstanding (not blockers for the criterion)
+
+- **Step 4 (FP8 dequant)** still NOT done — validated with
+  `--kv-cache-dtype bf16`. For the A3B's default FP8 KV, add FP8→BF16 dequant
+  in `PredictorScorer::project_bf16` (scale from
+  `Qwen3AttentionLayer::effective_fp8_scales`, bridged via the Q-capture hook
+  or a model accessor). Only needed if the Q-driven scorer is re-enabled;
+  the prefix floor is dtype-agnostic.
+- The Q-driven scorer's non-discriminatory scores (~30-40 uniform) are an
+  open research question if reactive recall is ever revisited.
+
+
