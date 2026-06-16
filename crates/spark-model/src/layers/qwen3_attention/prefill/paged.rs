@@ -399,12 +399,14 @@ impl Qwen3AttentionLayer {
         }
 
         // KVFlash prefill Q-capture: stash this chunk's LAST prompt-token Q
-        // (chosen layer = 0) for the attention keep-set. q_contiguous is
-        // post-RoPE (true attention query); the last token's Q is its final
-        // row. Capture every chunk — the stash is overwritten each call, so
-        // the FINAL chunk's last token (= the prompt's last token) wins.
-        // No-op when no pager is installed.
-        if self.attn_layer_idx == 0 && num_tokens > 0 {
+        // for the attention keep-set. q_contiguous is post-RoPE (true
+        // attention query); the last token's Q is its final row. Capture on
+        // EVERY attention layer (layers run in order, so the last layer's Q
+        // is the one that survives in the stash) — early layers are
+        // sink-dominated; deep layers carry the content attention that
+        // identifies a recall target. Capture every chunk too; the final
+        // chunk's last token wins. No-op when no pager is installed.
+        if num_tokens > 0 {
             let last_q = q_contiguous.offset((num_tokens - 1) * q_dim * bf16);
             spark_runtime::kvflash_pager::capture_prefill_q(last_q, nq, nkv, hd, ctx.gpu, stream);
         }

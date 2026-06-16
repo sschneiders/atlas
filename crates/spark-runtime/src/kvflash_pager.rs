@@ -465,11 +465,15 @@ impl KvflashPager {
             return;
         }
         let bs = self.block_size as usize;
-        // Parse each block's K (layer 0, BF16) to f32 [bs, nkv, hd].
+        // Read K from the LAST attention layer (matches the captured prefill Q,
+        // which is the last layer's — deep layers carry content attention,
+        // early layers are sink-dominated).
+        let k_layer = self.num_layers.saturating_sub(1);
+        // Parse each block's K (BF16) to f32 [bs, nkv, hd].
         let mut block_ks: Vec<Vec<f32>> = Vec::with_capacity(total);
         for b in 0..total as u32 {
             let kf: Vec<f32> = kv_cache
-                .read_block(0, b, gpu)
+                .read_block(k_layer, b, gpu)
                 .map(|(k, _)| {
                     (0..k.len() / 2)
                         .map(|i| {
