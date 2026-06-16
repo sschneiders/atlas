@@ -80,6 +80,19 @@ impl TransformerModel {
         }) {
             res?;
         }
+        // τ-cadence score-driven reselect (recall relevant paged-out chunks,
+        // evict irrelevant resident ones). Cheap no-op when no scorer is
+        // attached — the MVP stays pure-LRU. Fires every cfg.tau steps once a
+        // real drafter forward is wired (PR4 follow-up).
+        if let Some(res) = spark_runtime::kvflash_pager::maybe_reselect(
+            slot,
+            &mut seq.block_table,
+            pool_blocks,
+            kv_ref,
+            gpu,
+        ) {
+            res?;
+        }
         Ok(())
     }
 

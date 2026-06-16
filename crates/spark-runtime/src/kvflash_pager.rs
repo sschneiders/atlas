@@ -60,6 +60,10 @@ struct SlotState {
     /// A block `idx` is protected iff `idx == 0` (sink) OR
     /// `idx >= total() - protected_tail_blocks`.
     protected_tail_blocks: u32,
+    /// Decode steps since the last score-driven reselect on this slot. When it
+    /// reaches `cfg.tau` AND a scorer is attached, [`KvflashPager::reselect`]
+    /// runs and the counter resets.
+    steps_since_reselect: u32,
 }
 
 /// The decode-loop pager. Installed thread-local after `bind_gpu_to_thread`.
@@ -71,13 +75,19 @@ pub struct KvflashPager {
     /// (mirrors `block_size` / `num_layers` being cached at install time so
     /// the per-step decode sites do not re-read the config).
     compact: bool,
+    /// Optional chunk-relevance scorer. When present, [`KvflashPager::reselect`]
+    /// is score-driven (recall relevant paged-out chunks, evict irrelevant
+    /// resident ones). When absent, the pager is pure-LRU (recency-only) — the
+    /// documented MVP quality limitation. Attached via [`set_scorer`] /
+    /// [`KvflashPager::set_scorer`].
+    scorer: Option<Box<dyn crate::kvflash_scorer::KvFlashScorer>>,
     slots: HashMap<usize, SlotState>,
 }
 
 impl KvflashPager {
     /// Construct a pager with the resolved config + KV cache geometry. The
-    /// geometry is cached at install (from the model's `PagedKvCache`) so the
-    /// per-step eviction loop does not re-lock the cache just to read dims.
+    /// geometry is cached at install (from the model's `PagedKvCache`) so
+    /// the per-step eviction loop does not re-lock the cache just to read dims.
     pub fn new(cfg: KvflashConfig, block_size: u32, num_layers: usize) -> Self {
         let compact = cfg.compact;
         Self {
@@ -85,8 +95,22 @@ impl KvflashPager {
             block_size,
             num_layers,
             compact,
+            scorer: None,
             slots: HashMap::new(),
         }
+    }
+
+    /// Attach a chunk-relevance scorer. Once attached, [`Self::reselect`]
+    /// becomes score-driven (recall relevant paged-out chunks). Until a real
+    /// drafter forward is wired, the scorer's `score_chunks` may still return
+    /// LRU-equivalent scores — correctness is preserved either way.
+    pub fn set_scorer(&mut self, scorer: Box<dyn crate::kvflash_scorer::KvFlashScorer>) {
+        self.scorer = Some(scorer);
+    }
+
+    /// True iff a scorer is attached (score-driven reselect available).
+    pub fn has_scorer(&self) -> bool {
+        self.scorer.is_some()
     }
 
     /// The resolved KVFlash config (read-only accessor for callers that need
@@ -150,6 +174,7 @@ impl KvflashPager {
                 host_store: HashMap::new(),
                 dummy_block,
                 protected_tail_blocks,
+                steps_since_reselect: 0,
             },
         );
     }
@@ -278,6 +303,221 @@ impl KvflashPager {
         }
         Ok(evicted)
     }
+
+    /// Evict a single logical block (one iteration of the eviction loop, factored
+    /// out so [`Self::reselect`] can reuse it). Returns true if evicted.
+    fn page_out_one(
+        &mut self,
+        slot: usize,
+        logical: u32,
+        block_table: &mut [u32],
+        kv_cache: &mut PagedKvCache,
+        gpu: &dyn GpuBackend,
+    ) -> Result<bool> {
+        let l = logical as usize;
+        if l >= block_table.len() {
+            return Ok(false);
+        }
+        let num_layers = self.num_layers;
+        let physical = block_table[l];
+        let mut layers_kv = Vec::with_capacity(num_layers);
+        for layer in 0..num_layers {
+            layers_kv.push(kv_cache.read_block(layer, physical, gpu)?);
+        }
+        kv_cache.return_evicted_block(physical);
+        let dummy = match self.slots.get_mut(&slot) {
+            Some(st) => {
+                st.host_store.insert(logical, layers_kv);
+                st.residency.mark_paged_out(l);
+                st.dummy_block
+            }
+            None => return Ok(false),
+        };
+        block_table[l] = dummy;
+        Ok(true)
+    }
+
+    /// Page a single logical block BACK INTO the GPU pool (recall). Allocates a
+    /// fresh GPU block, restores its per-layer K/V from the host store
+    /// ([`PagedKvCache::write_block`]), rewrites `block_table[logical]` to the
+    /// new physical, and marks the block resident. The inverse of eviction.
+    /// Returns true if recalled; false if the block wasn't paged out, the slot
+    /// is unknown, or the KV cache has no free block to spare.
+    pub fn page_in(
+        &mut self,
+        slot: usize,
+        logical: u32,
+        block_table: &mut [u32],
+        kv_cache: &mut PagedKvCache,
+        gpu: &dyn GpuBackend,
+    ) -> Result<bool> {
+        let l = logical as usize;
+        if l >= block_table.len() {
+            return Ok(false);
+        }
+        let num_layers = self.num_layers;
+        // Pull the host copy out of the slot (removed from the host store).
+        let layers_kv = match self.slots.get_mut(&slot) {
+            Some(st) => match st.host_store.remove(&logical) {
+                Some(v) => v,
+                None => return Ok(false), // wasn't paged out
+            },
+            None => return Ok(false),
+        };
+        // Alloc a fresh GPU block + restore K/V per layer. If the cache is full,
+        // put the host copy back and bail (retry next reselect).
+        let physical = match kv_cache.try_alloc_block() {
+            Some(p) => p,
+            None => {
+                if let Some(st) = self.slots.get_mut(&slot) {
+                    st.host_store.insert(logical, layers_kv);
+                }
+                return Ok(false);
+            }
+        };
+        for layer in 0..num_layers {
+            let (k, v) = &layers_kv[layer];
+            kv_cache.write_block(layer, physical, k, v, gpu)?;
+        }
+        block_table[l] = physical;
+        if let Some(st) = self.slots.get_mut(&slot) {
+            st.residency.mark_resident(l);
+        }
+        Ok(true)
+    }
+
+    /// Score-driven reselect: converge the slot's resident set toward the
+    /// top-`pool_blocks` chunks by relevance (plus protected sink+tail). Evicts
+    /// low-score resident non-protected blocks and recalls high-score paged-out
+    /// blocks. No-op (returns `(0, 0)`) when no scorer is attached or the slot
+    /// is unknown — so with no scorer the pager stays pure-LRU via
+    /// [`Self::evict_to_capacity`]. Returns `(n_evicted, n_recalled)`.
+    pub fn reselect(
+        &mut self,
+        slot: usize,
+        block_table: &mut [u32],
+        pool_blocks: usize,
+        kv_cache: &mut PagedKvCache,
+        gpu: &dyn GpuBackend,
+    ) -> Result<(usize, usize)> {
+        self.sync_to_len(slot, block_table.len());
+        let total = match self.slots.get(&slot) {
+            Some(st) => st.residency.total(),
+            None => return Ok((0, 0)),
+        };
+        if total == 0 {
+            return Ok((0, 0));
+        }
+        // 1. Score all materialized chunks (resident or host-backed).
+        let scores = match self.scorer.as_mut() {
+            Some(s) => s.score_chunks(total),
+            None => return Ok((0, 0)),
+        };
+        // 2. Plan (pure logic; reads residency + protected_tail_blocks).
+        let (evict, recall) = {
+            let st = match self.slots.get(&slot) {
+                Some(s) => s,
+                None => return Ok((0, 0)),
+            };
+            plan_reselect(
+                &st.residency,
+                st.protected_tail_blocks,
+                pool_blocks,
+                &scores,
+            )
+        };
+        // 3. Execute: evict first (frees GPU capacity), then recall.
+        let mut n_evict = 0usize;
+        for &logical in &evict {
+            if self.page_out_one(slot, logical, block_table, kv_cache, gpu)? {
+                n_evict += 1;
+            }
+        }
+        let mut n_recall = 0usize;
+        for &logical in &recall {
+            if self.page_in(slot, logical, block_table, kv_cache, gpu)? {
+                n_recall += 1;
+            }
+        }
+        Ok((n_evict, n_recall))
+    }
+
+    /// τ-cadence gate around [`Self::reselect`]. Increments the per-slot step
+    /// counter; when it reaches `cfg.tau` AND a scorer is attached, runs a
+    /// score-driven reselect and resets the counter. With no scorer attached
+    /// this is a cheap no-op (counter still increments but never fires), so the
+    /// MVP stays pure-LRU via [`Self::evict_to_capacity`]. Called every decode
+    /// step by the scheduler after the LRU catch-up eviction.
+    pub fn maybe_reselect(
+        &mut self,
+        slot: usize,
+        block_table: &mut [u32],
+        pool_blocks: usize,
+        kv_cache: &mut PagedKvCache,
+        gpu: &dyn GpuBackend,
+    ) -> Result<()> {
+        let tau = self.cfg.tau;
+        let has_scorer = self.scorer.is_some();
+        let fire = match self.slots.get_mut(&slot) {
+            Some(st) => {
+                st.steps_since_reselect = st.steps_since_reselect.saturating_add(1);
+                if st.steps_since_reselect >= tau && has_scorer {
+                    st.steps_since_reselect = 0;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        };
+        if fire {
+            self.reselect(slot, block_table, pool_blocks, kv_cache, gpu)?;
+        }
+        Ok(())
+    }
+}
+
+/// Pure-logic reselect planner. Given per-chunk relevance `scores` (higher =
+/// more relevant — any [`crate::kvflash_scorer::KvFlashScorer`]'s output),
+/// decide which logical blocks to EVICT (currently resident, non-protected,
+/// outside the desired top-set) and which to RECALL (currently paged-out,
+/// inside the desired top-set), so the resident set converges toward the
+/// top-`pool_blocks` chunks by score plus the protected sink+tail window.
+/// Testable without a GPU; [`KvflashPager::reselect`] executes the plan.
+pub fn plan_reselect(
+    residency: &crate::kvflash_residency::KvflashResidency,
+    protected_tail_blocks: u32,
+    pool_blocks: usize,
+    scores: &[f32],
+) -> (Vec<u32>, Vec<u32>) {
+    use std::collections::HashSet;
+    let total = residency.total();
+    let n = total.min(scores.len());
+    let tail_start = total.saturating_sub(protected_tail_blocks as usize);
+    let is_protected = |idx: usize| residency.is_protected(idx) || idx >= tail_start;
+    // Non-protected candidates (resident OR paged-out), each with score + flag.
+    let mut candidates: Vec<(usize, f32, bool)> = (0..n)
+        .filter(|&idx| !is_protected(idx))
+        .map(|idx| (idx, scores[idx], residency.is_resident(idx)))
+        .collect();
+    let num_protected = (0..n).filter(|&i| is_protected(i)).count();
+    let non_protected_capacity = pool_blocks.saturating_sub(num_protected);
+    // Desired resident among non-protected: top `non_protected_capacity` by score.
+    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let desired: HashSet<usize> = candidates
+        .iter()
+        .take(non_protected_capacity)
+        .map(|(idx, _, _)| *idx)
+        .collect();
+    let (mut evict, mut recall) = (Vec::new(), Vec::new());
+    for (idx, _score, is_resident) in candidates {
+        if is_resident && !desired.contains(&idx) {
+            evict.push(idx as u32);
+        } else if !is_resident && desired.contains(&idx) {
+            recall.push(idx as u32);
+        }
+    }
+    (evict, recall)
 }
 
 // ── Thread-local installation for the scheduler thread (mirrors
@@ -336,6 +576,55 @@ pub fn slot_state_exists(slot: usize) -> bool {
 /// The installed pager's pool cap in blocks, or `None` when no pager is
 /// installed. Convenience for the model dispatch so it does not need to reach
 /// into the config directly.
+/// True iff a scorer is attached to the thread-local pager (score-driven
+/// reselect available). `false` when no pager is installed.
+pub fn has_scorer() -> bool {
+    LOCAL.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|p| p.has_scorer())
+            .unwrap_or(false)
+    })
+}
+
+/// Attach a chunk-relevance scorer to the thread-local pager. No-op when no
+/// pager is installed. Once attached, the scheduler's periodic reselect
+/// (every `tau` decoded tokens) becomes score-driven: relevant paged-out
+/// chunks are recalled, irrelevant resident ones evicted.
+pub fn set_scorer(scorer: Box<dyn crate::kvflash_scorer::KvFlashScorer>) {
+    let _ = with_local(|p| {
+        p.set_scorer(scorer);
+        Ok(())
+    });
+}
+
+/// Run a score-driven [`KvflashPager::reselect`] on the thread-local pager for
+/// `slot`. Returns `Some((n_evicted, n_recalled))` if a pager is installed,
+/// else `None`. No-op when no scorer is attached (returns `Some((0,0))`).
+pub fn reselect(
+    slot: usize,
+    block_table: &mut [u32],
+    pool_blocks: usize,
+    kv_cache: &mut PagedKvCache,
+    gpu: &dyn GpuBackend,
+) -> Option<Result<(usize, usize)>> {
+    with_local(|p| p.reselect(slot, block_table, pool_blocks, kv_cache, gpu))
+}
+
+/// τ-cadence gate around [`reselect`] on the thread-local pager. Called every
+/// decode step by the scheduler; fires a score-driven reselect every `tau`
+/// steps when a scorer is attached, else a cheap no-op. Returns `Some(())` if
+/// a pager is installed.
+pub fn maybe_reselect(
+    slot: usize,
+    block_table: &mut [u32],
+    pool_blocks: usize,
+    kv_cache: &mut PagedKvCache,
+    gpu: &dyn GpuBackend,
+) -> Option<Result<()>> {
+    with_local(|p| p.maybe_reselect(slot, block_table, pool_blocks, kv_cache, gpu))
+}
+
 pub fn pool_blocks() -> Option<usize> {
     LOCAL.with(|cell| cell.borrow().as_ref().map(|p| p.pool_blocks()))
 }
@@ -542,5 +831,74 @@ mod tests {
         uninstall();
         assert!(!is_active());
         assert_eq!(pool_blocks(), None);
+    }
+
+    // ── plan_reselect (the score-driven residency decision, pure logic) ──
+
+    #[test]
+    fn plan_reselect_recalls_high_score_paged_out_evicts_low_score_resident() {
+        // 6 blocks: 0 sink (protected). Non-protected: 1,2,3,4,5. tail=2 -> blocks 4,5 protected.
+        // So candidates = {1,2,3}. pool_blocks=2, num_protected=3 (0,4,5) -> non_protected_capacity = 0.
+        // Hmm that's degenerate; use a bigger setup.
+        let mut r = crate::kvflash_residency::KvflashResidency::new(8);
+        r.protect(0);
+        // Mark block 2 paged out (a "deep" chunk); rest resident.
+        r.mark_paged_out(2);
+        // protected_tail_blocks = 2 -> blocks 6,7 protected. candidates = {1,2,3,4,5}.
+        // scores: make block 2 (paged-out) HIGH, block 1 (resident) LOW.
+        let scores = [0.0, 0.1, 9.0, 5.0, 5.0, 5.0, 0.0, 0.0];
+        let (evict, recall) = plan_reselect(&r, 2, 4, &scores);
+        // non_protected_capacity = 4 - 3 (protected: 0,6,7) = 1. Top-1 by score = block 2.
+        // So desired={2}. Block 2 is paged-out & desired -> recall. Resident non-protected
+        // not desired (1,3,4,5) -> evict.
+        assert!(
+            recall.contains(&2),
+            "high-score paged-out block recalled: {recall:?}"
+        );
+        assert!(
+            evict.contains(&1),
+            "low-score resident block evicted: {evict:?}"
+        );
+    }
+
+    #[test]
+    fn plan_reselect_no_recall_when_nothing_paged_out() {
+        let r = crate::kvflash_residency::KvflashResidency::new(6);
+        let scores = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let (evict, recall) = plan_reselect(&r, 0, 3, &scores);
+        assert!(recall.is_empty(), "nothing paged out -> nothing to recall");
+        // All 6 resident, pool 3 -> 3 to evict (the lowest non-protected scores).
+        assert!(!evict.is_empty());
+    }
+
+    #[test]
+    fn plan_reselect_protected_never_evicted() {
+        let mut r = crate::kvflash_residency::KvflashResidency::new(6);
+        r.protect(0);
+        r.protect(3); // an explicit protect
+        let scores = [9.0, 0.0, 0.0, 9.0, 0.0, 0.0];
+        let (evict, _recall) = plan_reselect(&r, 1, 1, &scores);
+        assert!(
+            !evict.contains(&0) && !evict.contains(&3),
+            "protected blocks never evicted: {evict:?}"
+        );
+    }
+
+    #[test]
+    fn plan_reselect_converges_to_topk_by_score() {
+        // 10 blocks all resident, no protection beyond sink (protected_tail=0).
+        // pool=3 -> keep top-3 by score (block 0 protected always kept).
+        let mut r = crate::kvflash_residency::KvflashResidency::new(10);
+        r.protect(0);
+        let scores = [0.0, 9.0, 1.0, 8.0, 2.0, 7.0, 3.0, 6.0, 4.0, 5.0];
+        let (evict, recall) = plan_reselect(&r, 0, 3, &scores);
+        assert!(recall.is_empty()); // nothing paged out
+        // non_protected_capacity = 3 - 1 (sink) = 2. Top-2 by score: blocks 1 (9.0), 3 (8.0).
+        // The other non-protected resident (2,4,5,6,7,8,9) -> evict (7 blocks).
+        assert_eq!(evict.len(), 7);
+        assert!(
+            !evict.contains(&1) && !evict.contains(&3),
+            "top-score blocks kept"
+        );
     }
 }
