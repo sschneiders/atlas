@@ -864,16 +864,49 @@ pub fn attention_block_weights(
 ) -> Vec<f32> {
     let gqa = nq / nkv.max(1);
     let inv_sqrt = 1.0 / (hd as f32).sqrt();
-    // GQA: collapse the query to one vector per kv_head (mean over the head's
-    // q-head group). [nkv * hd]
-    let mut group_q = vec![0f32; nkv * hd];
-    for h in 0..nkv {
-        let mut acc = vec![0f32; hd];
-        for qi in 0..gqa {
-            let qh = h * gqa + qi;
-            for d in 0..hd {
-                acc[d] += q[qh * hd + d];
+    let mut w = vec![0f32; block_ks.len()];
+    // Per-head attention: each q-head attends independently to its kv-group's
+    // K (the real multi-head mechanism). This preserves the model's learned
+    // sharpness — a head that focuses on the needle contributes a sharp
+    // signal, whereas mean-grouping the heads dilutes it to near-uniform.
+    for h in 0..nq {
+        let g = h / gqa; // this head's kv group
+        let mut raws: Vec<(usize, f32)> = Vec::with_capacity(block_ks.len() * block_size);
+        for (b, k) in block_ks.iter().enumerate() {
+            for t in 0..block_size {
+                let mut dot = 0f32;
+                for d in 0..hd {
+                    dot += q[h * hd + d] * k[(t * nkv + g) * hd + d];
+                }
+                raws.push((b, dot * inv_sqrt));
             }
+        }
+        let mx = raws
+            .iter()
+            .map(|r| r.1)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut exps: Vec<f32> = raws.iter().map(|r| (r.1 - mx).exp()).collect();
+        let sum: f32 = exps.iter().copied().sum();
+        if sum > 0.0 {
+            let inv = 1.0 / sum;
+            for e in exps.iter_mut() {
+                *e *= inv;
+            }
+        }
+        for (i, &(b, _)) in raws.iter().enumerate() {
+            w[b] += exps[i];
+        }
+    }
+    // Normalise the summed per-head weights to a distribution over blocks.
+    let total: f32 = w.iter().copied().sum();
+    if total > 0.0 {
+        let inv = 1.0 / total;
+        for x in w.iter_mut() {
+            *x *= inv;
+        }
+    }
+    w
+}
         }
         let inv = 1.0 / gqa as f32;
         for d in 0..hd {
