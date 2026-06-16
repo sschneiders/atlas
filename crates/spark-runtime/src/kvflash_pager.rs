@@ -436,9 +436,10 @@ impl KvflashPager {
         // One-time novelty keep-set: at the first over-capacity eviction,
         // pin the rarest-content blocks so a distinctive needle (unique
         // content in repetitive filler) stays resident at any depth.
-        let need_novelty = self.slots.get(&slot).map_or(false, |st| {
-            st.novelty_enabled && !st.novelty_keep_set_computed
-        });
+        let need_novelty = self
+            .slots
+            .get(&slot)
+            .is_some_and(|st| st.novelty_enabled && !st.novelty_keep_set_computed);
         if need_novelty {
             self.compute_novelty_keep_set(slot, kv_cache, gpu);
         }
