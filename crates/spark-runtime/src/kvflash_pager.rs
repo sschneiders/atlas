@@ -202,7 +202,16 @@ impl KvflashPager {
         let nq = num_q_heads as usize;
         let nkv = num_kv_heads as usize;
         let hd = head_dim as usize;
-        let start = n.saturating_sub(WINDOW);
+        // ATLAS_KVFLASH_ATTENTION_AGGREGATE_ALL: capture EVERY prompt token's Q
+        // (the full aggregate-attention-received signal, H2O-style) instead of
+        // just the question window. De-risk: does the all-token aggregate
+        // highlight the needle where the question-window did not?
+        let win = if std::env::var("ATLAS_KVFLASH_ATTENTION_AGGREGATE_ALL").is_ok() {
+            n
+        } else {
+            WINDOW.min(n)
+        };
+        let start = n.saturating_sub(win);
         let count = n - start;
         let bytes = count * nq * hd * 2;
         let src = q_base.offset(start * nq * hd * 2);
