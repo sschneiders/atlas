@@ -467,6 +467,8 @@ impl KvflashPager {
                 .collect(),
             None => return Ok((0, 0)),
         };
+        let mut n_refreshed = 0usize;
+        let resident_blocks_len = resident_blocks.len();
         if let Some(scorer) = self.scorer.as_mut() {
             for (logical, physical) in resident_blocks {
                 if scorer.is_projected(logical) {
@@ -477,8 +479,14 @@ impl KvflashPager {
                     scorer.project_evicted_block(layer, logical, &k, gpu);
                 }
                 scorer.mark_projected(logical);
+                n_refreshed += 1;
             }
         }
+        tracing::info!(
+            "kvflash refresh: resident={} refreshed={}",
+            resident_blocks_len,
+            n_refreshed
+        );
         // 2. Score all materialized chunks (resident or host-backed).
         let scores = match self.scorer.as_mut() {
             Some(s) => s.score_chunks(total),
@@ -510,6 +518,14 @@ impl KvflashPager {
                 n_recall += 1;
             }
         }
+        tracing::info!(
+            "kvflash reselect: total={} planned_evict={} planned_recall={} exec_evict={} exec_recall={}",
+            total,
+            evict.len(),
+            recall.len(),
+            n_evict,
+            n_recall
+        );
         Ok((n_evict, n_recall))
     }
 
