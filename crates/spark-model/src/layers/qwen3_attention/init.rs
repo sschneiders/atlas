@@ -402,6 +402,11 @@ impl Qwen3AttentionLayer {
                 .kernel("prefill_paged_fp8", "inferspark_prefill_paged_fp8_64")?,
             prefill_attn_paged_nvfp4_64_k: gpu
                 .kernel("prefill_paged_nvfp4", "inferspark_prefill_paged_nvfp4_64")?,
+            prefill_attn_paged_fibquant_k: super::super::try_kernel(
+                gpu,
+                "prefill_paged_fibquant",
+                "inferspark_prefill_paged_fibquant",
+            ),
             prefill_attn_paged_turbo2_64_k: super::super::try_kernel(
                 gpu,
                 "prefill_paged_turbo2",

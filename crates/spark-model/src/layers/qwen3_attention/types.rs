@@ -252,6 +252,7 @@ pub struct Qwen3AttentionLayer {
     pub(super) prefill_attn_paged_64_k: KernelHandle,
     pub(super) prefill_attn_paged_fp8_64_k: KernelHandle,
     pub(super) prefill_attn_paged_nvfp4_64_k: KernelHandle,
+    pub(super) prefill_attn_paged_fibquant_k: KernelHandle,
     pub(super) prefill_attn_paged_turbo2_64_k: KernelHandle,
     pub(super) prefill_attn_paged_turbo3_64_k: KernelHandle,
     pub(super) prefill_attn_paged_turbo4_64_k: KernelHandle,

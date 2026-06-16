@@ -218,6 +218,55 @@ pub fn prefill_attention_paged_fp8_64(
         .launch(stream)
 }
 
+/// Paged prefill Flash Attention — FibQuant KV cache (BR=64). Reads
+/// `{norm, indices}` per vector, gathers `codebook[index] × norm` into the K/V
+/// tiles (via the shared `prefill_paged_compute.cuh` LOAD_KV_TILE macro). No
+/// FP8 scales; takes the FibQuant block stride. Q is WHT-rotated and output
+/// iWHT'd by the `attention_forward` bookends (`is_wht_rotated`).
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_attention_paged_fibquant(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    output: DevicePtr,
+    block_table: DevicePtr,
+    q_len: u32,
+    kv_len: u32,
+    q_offset: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    cache_block_size: u32,
+    sliding_window: u32,
+    inv_sqrt_d: f32,
+    fibq_block_stride: u64,
+    stream: u64,
+) -> Result<()> {
+    let br = if cfg!(atlas_scale) { 32u32 } else { 64u32 };
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_q_heads, div_ceil(q_len, br), 1])
+        .block([256, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(output)
+        .arg_ptr(block_table)
+        .arg_u32(q_len)
+        .arg_u32(kv_len)
+        .arg_u32(q_offset)
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_u32(head_dim)
+        .arg_u32(cache_block_size)
+        .arg_u32(sliding_window)
+        .arg_u32(1u32) // causal_mask_enabled
+        .arg_f32(inv_sqrt_d)
+        .arg_u64(fibq_block_stride)
+        .launch(stream)
+}
+
 /// Paged prefill Flash Attention — symmetric TurboQuant KV cache, BR=64.
 /// Shared launch wrapper for the turbo8 / turbo4 / turbo3 `_64` kernel
 /// entries: identical ABI, the caller selects the dtype via `kernel` and
