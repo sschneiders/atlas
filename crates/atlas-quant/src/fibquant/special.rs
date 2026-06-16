@@ -246,7 +246,7 @@ mod tests {
             assert!((z - z2).abs() < 1e-6, "erf/erfinv round-trip {z} -> {z2}");
         }
         // Known value: erfinv(0.5) ≈ 0.4769362762.
-        assert!((erfinv(0.5) - 0.4769_362_762_044_678_5).abs() < 1e-6);
+        assert!((erfinv(0.5) - 0.476_936_276).abs() < 1e-6);
         assert!(erfinv(0.0).abs() < 1e-6);
     }
 }

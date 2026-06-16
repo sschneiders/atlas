@@ -26,6 +26,36 @@ pub struct Rotation {
 }
 
 impl Rotation {
+    /// Build the normalized Walsh–Hadamard transform (Sylvester construction),
+    /// `H_d / √d`. Orthogonal, deterministic, no storage needed on GPU (Atlas's
+    /// `wht_bf16` kernel implements the same transform via the butterfly). Used
+    /// to test whether a FibQuant codebook holds fidelity under WHT instead of a
+    /// dense Haar matrix — WHT would let the kernel reuse the existing WHT
+    /// infrastructure rather than upload a d×d (up to 256 KB) rotation buffer.
+    pub fn hadamard(d: usize) -> Self {
+        assert!(d.is_power_of_two(), "Hadamard needs a power-of-two d");
+        let mut h = vec![0.0f64; d * d];
+        h[0] = 1.0; // H_1
+        let mut size = 1;
+        while size < d {
+            // H_{2n} = [[H_n, H_n], [H_n, -H_n]], reading the top-left H_n.
+            for r in 0..size {
+                for c in 0..size {
+                    let v = h[r * d + c];
+                    h[r * d + (size + c)] = v;
+                    h[(size + r) * d + c] = v;
+                    h[(size + r) * d + (size + c)] = -v;
+                }
+            }
+            size *= 2;
+        }
+        let inv_sqrt = 1.0 / (d as f64).sqrt();
+        for v in h.iter_mut() {
+            *v *= inv_sqrt;
+        }
+        Self { d, mat: h }
+    }
+
     /// Build a deterministic Haar-random orthogonal matrix from `seed`.
     /// Same seed ⟹ identical matrix everywhere (spike, host, CUDA constant).
     pub fn from_seed(d: usize, seed: u64) -> Self {

@@ -32,11 +32,18 @@ impl FibQuantCodec {
     /// Build a deterministic codec for `(d, k, N)` from `seed`.
     /// Same `(d,k,N,seed)` ⟹ identical rotation + codebook everywhere.
     pub fn new(d: usize, k: usize, n: usize, seed: u64) -> Self {
+        let rotation = Rotation::from_seed(d, seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA5A5);
+        Self::new_with_rotation(d, k, n, rotation)
+    }
+
+    /// Build a codec with an explicit rotation (e.g. `Rotation::hadamard(d)` to
+    /// test WHT fidelity vs the default dense Haar). The codebook is always
+    /// matched to the canonical spherical-Beta source `f_{d,k}`.
+    pub fn new_with_rotation(d: usize, k: usize, n: usize, rotation: Rotation) -> Self {
         assert!(d > 0 && k > 0 && k <= d, "need 0 < k <= d");
         let nblocks = d / k;
         assert!(nblocks * k == d, "k must divide d (d={d}, k={k})");
-        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
-        let rotation = Rotation::from_seed(d, seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA5A5);
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0xF1B0_0A0B_7041);
         let codebook = build_codebook(d, k, n, &mut rng);
         Self {
             d,

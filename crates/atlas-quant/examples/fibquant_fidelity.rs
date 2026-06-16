@@ -18,12 +18,22 @@
 
 use std::env;
 
-use atlas_quant::fibquant::{FibQuantCodec, attention_output_cosine, mean_vector_cosine};
+use atlas_quant::fibquant::{FibQuantCodec, Rotation, attention_output_cosine, mean_vector_cosine};
 use half::bf16;
 use rand::{Rng, SeedableRng};
 use rand_distr::StandardNormal;
 
 const SEED: u64 = 0xF1B0_0A0B_7041;
+
+/// Pick the rotation from `FIB_ROT` (`hadamard` reuses Atlas's WHT kernel path;
+/// default `haar` is the dense paper rotation). Decides whether the eventual
+/// `.cu` kernel can reuse `wht_bf16` or must upload a d×d rotation buffer.
+fn build_codec(d: usize, k: usize, n: usize) -> FibQuantCodec {
+    match std::env::var("FIB_ROT").as_deref() {
+        Ok("hadamard") => FibQuantCodec::new_with_rotation(d, k, n, Rotation::hadamard(d)),
+        _ => FibQuantCodec::new(d, k, n, SEED),
+    }
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -97,7 +107,7 @@ fn run_real_kv(path: &str) {
         "k", "N", "rate(b)", "compress", "k_vec_cos", "attn_cos"
     );
     for &(k, n) in rates {
-        let codec = FibQuantCodec::new(d, k, n, SEED);
+        let codec = build_codec(d, k, n);
         let kh = codec.decode_tensor(&codec.encode_tensor(&kf));
         let vh = codec.decode_tensor(&codec.encode_tensor(&vf));
         let k_cos = mean_vector_cosine(&kf, &kh, d);
