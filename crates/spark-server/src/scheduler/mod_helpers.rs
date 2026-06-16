@@ -92,16 +92,19 @@ pub(super) fn install_kvflash(model: &dyn Model, cfg: Option<spark_runtime::Kvfl
             let pool_blocks = cfg.pool_tokens / block_size.max(1) as usize;
             let compact = cfg.compact;
             spark_runtime::kvflash_pager::install(cfg, block_size, num_layers);
-            // Attach the PredictorScorer (HSS Predictor-backed relevance) so
-            // reselect becomes score-driven and recalls contextually-relevant
-            // paged-out chunks (deep recall). num_layers comes from the KV
-            // cache (authoritative attention-layer count for hybrids where
-            // num_hidden_layers includes non-attention layers); head/q/kv dims
-            // + max_blocks come from high_speed_swap_dims. On any failure the
-            // pager stays pure-LRU (no scorer attached) — a quality fallback,
-            // not a correctness risk. ATLAS_KVFLASH_NO_SCORER disables attach
-            // for A/B isolation of the scorer's cost.
-            if std::env::var("ATLAS_KVFLASH_NO_SCORER").is_err() {
+            // The PredictorScorer (HSS Predictor-backed Q·K_lowrank relevance)
+            // is OPT-IN (set ATLAS_KVFLASH_SCORER=1). It is dormant by default
+            // because Q-driven reactive recall turned out to be disruptive: the
+            // decode Q is a generation query, not a retrieval query, so its
+            // scores don't discriminate the recall target, and the per-reselect
+            // swap churn destabilises the model's answer even when the prefix
+            // floor keeps the target resident. Deep recall is instead handled
+            // by the prefix recall floor (above) — coverage-based, stable.
+            // num_layers here comes from the KV cache (authoritative
+            // attention-layer count for hybrids where num_hidden_layers
+            // includes non-attention layers); head/q/kv dims + max_blocks come
+            // from high_speed_swap_dims.
+            if std::env::var("ATLAS_KVFLASH_SCORER").is_ok() {
                 if let Some(hs_dims) = model.high_speed_swap_dims() {
                     let pred_dims = spark_storage::ModelDims {
                         num_layers: num_layers as u32,
@@ -115,7 +118,7 @@ pub(super) fn install_kvflash(model: &dyn Model, cfg: Option<spark_runtime::Kvfl
                         Ok(scorer) => {
                             spark_runtime::kvflash_pager::set_scorer(Box::new(scorer));
                             tracing::info!(
-                                "KVFlash PredictorScorer attached (deep recall enabled): \
+                                "KVFlash PredictorScorer attached (EXPERIMENTAL, ATLAS_KVFLASH_SCORER): \
                                  rank={}, max_blocks={}",
                                 super::predictor_scorer::PREDICTOR_RANK,
                                 hs_dims.max_blocks_per_layer
@@ -129,7 +132,10 @@ pub(super) fn install_kvflash(model: &dyn Model, cfg: Option<spark_runtime::Kvfl
                     }
                 }
             } else {
-                tracing::info!("KVFlash PredictorScorer DISABLED (ATLAS_KVFLASH_NO_SCORER)");
+                tracing::info!(
+                    "KVFlash PredictorScorer dormant (recall via prefix floor; set \
+                     ATLAS_KVFLASH_SCORER=1 to experiment with Q-driven reselect)"
+                );
             }
             tracing::info!(
                 "KVFlash pager installed on scheduler thread: block_size={block_size}, \
