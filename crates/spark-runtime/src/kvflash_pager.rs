@@ -508,7 +508,7 @@ impl KvflashPager {
                 agg[b] += w[b];
             }
         }
-        let n_keep = (self.pool_blocks() / 4).max(1);
+        let n_keep = (self.pool_blocks() / 2).max(1);
         let keep = top_blocks_by_weight(&agg, n_keep);
         let top_idx = keep.first().copied().unwrap_or(0) as usize;
         tracing::info!(
