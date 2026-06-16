@@ -756,6 +756,76 @@ fn k_block_norm_sq(k: &[u8]) -> u64 {
     sum.round() as u64
 }
 
+/// Per-block attention weight of a single query Q over a set of KV blocks
+/// (pure logic, GPU-free — testable). Computes the GQA-grouped attention
+/// distribution of `q` across every token/head of every block (softmax over
+/// all keys), aggregated per block (sum of its keys' weights). Higher = the
+/// query attends more to that block. Used by the prefill-attention keep-set:
+/// the prefill last-token Q (the question) attends to the needle block, so
+/// the needle ranks high and is kept resident.
+///
+/// - `q`: `[nq * hd]` f32 (the query, row-major `[nq, hd]`).
+/// - `block_ks`: one `[block_size * nkv * hd]` f32 slice per block
+///   (`[block_size, nkv, hd]` row-major).
+/// - Returns `Vec<f32>` of length `block_ks.len()` (the per-block weight,
+///   summing to ~1.0 across all blocks).
+pub fn attention_block_weights(
+    q: &[f32],
+    block_ks: &[Vec<f32>],
+    nq: usize,
+    nkv: usize,
+    hd: usize,
+    block_size: usize,
+) -> Vec<f32> {
+    let gqa = nq / nkv.max(1);
+    let inv_sqrt = 1.0 / (hd as f32).sqrt();
+    // GQA: collapse the query to one vector per kv_head (mean over the head's
+    // q-head group). [nkv * hd]
+    let mut group_q = vec![0f32; nkv * hd];
+    for h in 0..nkv {
+        let mut acc = vec![0f32; hd];
+        for qi in 0..gqa {
+            let qh = h * gqa + qi;
+            for d in 0..hd {
+                acc[d] += q[qh * hd + d];
+            }
+        }
+        let inv = 1.0 / gqa as f32;
+        for d in 0..hd {
+            group_q[h * hd + d] = acc[d] * inv;
+        }
+    }
+    // Raw scaled dot-product per (block, token, kv_head).
+    let mut raws: Vec<(usize, f32)> = Vec::with_capacity(block_ks.len() * block_size * nkv);
+    for (b, k) in block_ks.iter().enumerate() {
+        for t in 0..block_size {
+            for h in 0..nkv {
+                let mut dot = 0f32;
+                for d in 0..hd {
+                    dot += group_q[h * hd + d] * k[(t * nkv + h) * hd + d];
+                }
+                raws.push((b, dot * inv_sqrt));
+            }
+        }
+    }
+    // Softmax over all keys (numerically stable).
+    let mx = raws.iter().map(|r| r.1).fold(f32::NEG_INFINITY, f32::max);
+    let mut exps: Vec<f32> = raws.iter().map(|r| (r.1 - mx).exp()).collect();
+    let sum: f32 = exps.iter().copied().sum();
+    if sum > 0.0 {
+        let inv = 1.0 / sum;
+        for e in exps.iter_mut() {
+            *e *= inv;
+        }
+    }
+    // Aggregate per block.
+    let mut w = vec![0f32; block_ks.len()];
+    for (i, &(b, _)) in raws.iter().enumerate() {
+        w[b] += exps[i];
+    }
+    w
+}
+
 /// Pure-logic reselect planner. Given per-chunk relevance `scores` (higher =
 /// more relevant — any [`crate::kvflash_scorer::KvFlashScorer`]'s output),
 /// decide which logical blocks to EVICT (currently resident, non-protected,
@@ -1206,6 +1276,58 @@ mod tests {
         assert!(
             !evict.contains(&1) && !evict.contains(&3),
             "top-score blocks kept"
+        );
+    }
+
+    // ── attention_block_weights (the prefill-attention keep-set signal) ──
+
+    #[test]
+    fn attention_weights_favour_the_aligned_block() {
+        // nq=2, nkv=1, hd=4, block_size=2. Query aligned with dim 0.
+        // block 0 (filler): tokens orthogonal to q. block 1 (needle): one
+        // token strongly aligned with q.
+        let nq = 2usize;
+        let nkv = 1usize;
+        let hd = 4usize;
+        let bs = 2usize;
+        let q = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]; // [nq*hd]
+        let filler = vec![0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]; // [bs*nkv*hd]
+        let mut needle = vec![0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        // token 0 of the needle: aligned with q (dim 0 = 10).
+        needle[0] = 10.0;
+        let w = attention_block_weights(&q, &[filler, needle], nq, nkv, hd, bs);
+        assert_eq!(w.len(), 2);
+        // the aligned needle block concentrates almost all the attention mass.
+        assert!(w[1] > 0.99, "needle block should dominate attention: {w:?}");
+        assert!(w[1] > w[0], "needle > filler: {w:?}");
+    }
+
+    #[test]
+    fn attention_weights_sum_to_one() {
+        // uniform blocks + uniform query => weights distribute, sum to ~1.
+        let nq = 1usize;
+        let nkv = 1usize;
+        let hd = 2usize;
+        let bs = 1usize;
+        let q = vec![1.0, 0.0];
+        let blk = vec![1.0, 0.0]; // identical, aligned
+        let w = attention_block_weights(
+            &q,
+            &[blk.clone(), blk.clone(), blk.clone()],
+            nq,
+            nkv,
+            hd,
+            bs,
+        );
+        let total: f32 = w.iter().copied().sum();
+        assert!(
+            (total - 1.0).abs() < 1e-5,
+            "weights sum to 1: total={total}"
+        );
+        // equal blocks => equal weights.
+        assert!(
+            (w[0] - w[1]).abs() < 1e-6 && (w[1] - w[2]).abs() < 1e-6,
+            "uniform: {w:?}"
         );
     }
 }
