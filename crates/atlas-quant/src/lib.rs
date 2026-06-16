@@ -11,6 +11,7 @@
 #![deny(warnings)]
 #![deny(clippy::all)]
 
+pub mod fibquant;
 pub mod fp8;
 pub mod nvfp4;
 pub mod traits;

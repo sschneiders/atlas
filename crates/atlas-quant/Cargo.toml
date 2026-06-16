@@ -10,5 +10,18 @@ repository.workspace = true
 atlas-core = { workspace = true }
 thiserror = { workspace = true }
 
+# FibQuant host-side fidelity spike: deterministic RNG (shared Haar rotation +
+# codebook reproducibility), Beta/normal distributions for the spherical-Beta
+# codebook construction, and `half` to parse dumped BF16 KV blocks. Pure-Rust,
+# no CUDA — versions match the rest of the workspace (see spark-storage).
+half = "2"
+rand = "0.8"
+rand_chacha = "0.3"
+rand_distr = "0.4"
+
+[dev-dependencies]
+# Used by the `fibquant_fidelity` example to read the simple KV-dump container.
+# Kept as a dev-dependency so the library stays zero-extra-dep for real consumers.
+
 [lints]
 workspace = true
