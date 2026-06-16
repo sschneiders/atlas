@@ -256,6 +256,11 @@ Remaining (perf / feature / blocked — separate focused efforts):
 - **#5 (BR=128 + batched prefill variants):** only the BR=64 prefill shim
   exists; `(FibQuant, _)` always routes to it. Add the BR=128 + batched shims
   (clone the fp8 ones) for small-`q_len` / multi-seq serving throughput.
+  **Audited**: the batched dispatch (`paged_attn_batched.rs`) BAILS for FibQuant
+  (no silent wrong-kernel execution — no correctness gap). Single-stream serving
+  (the validated compression use case) is fully functional. Batched multi-seq
+  serving needs a FibQuant batched prefill kernel or per-stream fallback —
+  workaround: `--max-batch-size 1` until added.
 - **#6 (kernel micro-opt):** the write kernel's nearest-codeword search is
   brute-force O(N); decode re-reads the norm per lane; `payload=2+hd/4` is
   unaligned. Profile vs Turbo4, then: vectorized `uint4` index loads, norm
