@@ -355,8 +355,13 @@ impl KvflashPager {
         let mut by_novelty: Vec<u32> = (0..total as u32).collect();
         by_novelty.sort_by_key(|&i| counts[&hashes[i as usize]]);
         let n_keep = (self.pool_blocks() / 4).max(1);
+        let kept: Vec<u32> = by_novelty.iter().take(n_keep).copied().collect();
+        tracing::info!(
+            "kvflash novelty keep-set: total={total} unique_hashes={} n_keep={n_keep} kept={kept:?}",
+            counts.len(),
+        );
         if let Some(st) = self.slots.get_mut(&slot) {
-            for &i in by_novelty.iter().take(n_keep) {
+            for &i in &kept {
                 st.residency.protect(i as usize);
             }
             st.novelty_keep_set_computed = true;
