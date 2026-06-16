@@ -64,6 +64,12 @@ struct SlotState {
     /// reaches `cfg.tau` AND a scorer is attached, [`KvflashPager::reselect`]
     /// runs and the counter resets.
     steps_since_reselect: u32,
+    /// True until the first score-driven reselect fires for this slot. A
+    /// request's prompt (the user's question) arrives at prefill; the answer
+    /// is decoded immediately after, so the first decode step must recall any
+    /// relevant paged-out chunks BEFORE the answer is generated — waiting τ
+    /// steps would page them in too late. Cleared on the first reselect.
+    first_reselect_pending: bool,
 }
 
 /// The decode-loop pager. Installed thread-local after `bind_gpu_to_thread`.
@@ -194,6 +200,7 @@ impl KvflashPager {
                 dummy_block,
                 protected_tail_blocks,
                 steps_since_reselect: 0,
+                first_reselect_pending: true,
             },
         );
     }
@@ -561,8 +568,14 @@ impl KvflashPager {
         let fire = match self.slots.get_mut(&slot) {
             Some(st) => {
                 st.steps_since_reselect = st.steps_since_reselect.saturating_add(1);
-                if st.steps_since_reselect >= tau && has_scorer {
+                // Fire on the first decode step (right after the prefill
+                // question) so relevant paged-out chunks are recalled before
+                // the answer is generated, AND every τ steps thereafter.
+                let due =
+                    (st.steps_since_reselect >= tau || st.first_reselect_pending) && has_scorer;
+                if due {
                     st.steps_since_reselect = 0;
+                    st.first_reselect_pending = false;
                     true
                 } else {
                     false

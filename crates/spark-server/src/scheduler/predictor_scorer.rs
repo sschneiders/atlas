@@ -237,6 +237,13 @@ impl KvFlashScorer for PredictorScorer {
             }
         }
         // Blocks beyond max_blocks are unscoreable (A_g is bounded) → score 0.
+        if let Some((mx, &ms)) = acc
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            tracing::info!("kvflash score_chunks: num={num_chunks} argmax={mx} max_score={ms:.4}");
+        }
         acc.resize(num_chunks, 0.0);
         acc
     }
