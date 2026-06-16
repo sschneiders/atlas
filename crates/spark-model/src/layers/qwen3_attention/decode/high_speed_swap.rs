@@ -8,8 +8,8 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kv_cache::{KvCacheDtype, PagedKvCache};
 use spark_runtime::kv_dequant::{
-    NVFP4_E2M1_LUT, TURBO4_LUT, dequant_4bit_block_to_bf16, dequant_fp8_to_bf16,
-    dequant_turbo3_block_to_bf16, dequant_turbo8_block_to_bf16,
+    NVFP4_E2M1_LUT, TURBO4_LUT, dequant_4bit_block_to_bf16, dequant_fibquant_block_to_bf16,
+    dequant_fp8_to_bf16, dequant_turbo3_block_to_bf16, dequant_turbo8_block_to_bf16,
 };
 
 use super::super::Qwen3AttentionLayer;
@@ -31,7 +31,10 @@ impl Qwen3AttentionLayer {
         // dequant path that produces BF16 for the orchestrator's tiled-attention
         // kernel. For Turbo3/4/8 the cache stores WHT(K)/WHT(V) which round-trip
         // correctly because production already applies WHT(Q) and iWHT(out)
-        // around the orchestrator call (decode.rs WHT bookends).
+        // around the orchestrator call (decode.rs WHT bookends). FibQuant stores
+        // the same WHT-domain K/V (per-vector codebook + norm), so the same
+        // bookends apply — its host dequant reconstructs WHT-domain BF16 only
+        // (issue #9).
         matches!(
             kv_cache.dtype_for_layer(self.attn_layer_idx),
             KvCacheDtype::Bf16
@@ -39,7 +42,8 @@ impl Qwen3AttentionLayer {
                 | KvCacheDtype::Nvfp4
                 | KvCacheDtype::Turbo3
                 | KvCacheDtype::Turbo4
-                | KvCacheDtype::Turbo8,
+                | KvCacheDtype::Turbo8
+                | KvCacheDtype::FibQuant,
         )
     }
 
@@ -289,14 +293,41 @@ impl Qwen3AttentionLayer {
                     dequant_turbo8_block_to_bf16(&v_raw, bs_us, nkv_us, hd_us, &mut v_host);
                 }
                 KvCacheDtype::FibQuant => {
-                    // Host-side FibQuant dequant (codebook gather + Πᵀ) is not
-                    // wired into the HSS offload path yet (Step 3+). FibQuant's
-                    // purpose is to keep the whole context HBM-resident, so HSS
-                    // eviction is not its primary mechanism; fail loudly rather
-                    // than silently mis-dequant.
-                    anyhow::bail!(
-                        "FibQuant KV cache + --high-speed-swap is not yet supported; \
-                         run without --high-speed-swap or use a different --kv-cache-dtype"
+                    // Host-side FibQuant dequant (issue #9): the cache stores
+                    // WHT-domain K/V as `{bf16 norm, 1-byte codebook indices}`
+                    // per (token, kv_head). Gather codewords × norm on the host
+                    // into BF16; the WHT(Q)/iWHT(out) bookends around the
+                    // orchestrator call (decode.rs) handle the rotation — do NOT
+                    // iWHT here. Same D2H shape as Turbo3/4/8: one
+                    // `layer_block_bytes` pull per side into `k_raw`/`v_raw`,
+                    // dequant into the `block_floats`-long BF16 host buffers.
+                    let mut k_raw = vec![0u8; layer_block_bytes];
+                    let mut v_raw = vec![0u8; layer_block_bytes];
+                    ctx.gpu.copy_d2h_on_stream(
+                        spark_runtime::gpu::DevicePtr(k_block_dev),
+                        &mut k_raw,
+                        stream,
+                    )?;
+                    ctx.gpu.copy_d2h_on_stream(
+                        spark_runtime::gpu::DevicePtr(v_block_dev),
+                        &mut v_raw,
+                        stream,
+                    )?;
+                    dequant_fibquant_block_to_bf16(
+                        &k_raw,
+                        bs_us,
+                        nkv_us,
+                        hd_us,
+                        &self.fibq_codebook_host,
+                        &mut k_host,
+                    );
+                    dequant_fibquant_block_to_bf16(
+                        &v_raw,
+                        bs_us,
+                        nkv_us,
+                        hd_us,
+                        &self.fibq_codebook_host,
+                        &mut v_host,
                     );
                 }
             }

@@ -26,6 +26,11 @@ use half::bf16;
 /// per-quant attention kernels.
 pub const NVFP4_GROUP_SIZE: usize = 16;
 
+/// FibQuant codebook dimensionality (each index selects a `FIBQUANT_K`-vector
+/// codeword). Matches `FIB_K` in `paged_decode_attn_fibquant.cu` and the `k = 4`
+/// passed to `atlas_quant::fibquant::FibQuantCodec::new` at init.
+pub const FIBQUANT_K: usize = 4;
+
 /// E2M1 4-bit codebook (NVFP4). Matches
 /// `kernels/gb10/common/paged_decode_attn_nvfp4.cu:118`.
 pub const NVFP4_E2M1_LUT: [f32; 16] = [
@@ -233,6 +238,69 @@ pub fn dequant_turbo8_block_to_bf16(
     }
 }
 
+/// Dequant a FibQuant (WHT + spherical-Beta vector codebook) KV block to BF16.
+///
+/// Produces the **WHT-domain** BF16 K/V — production applies WHT(Q) before
+/// and iWHT(out) after the HSS streaming-attention call (the `decode.rs` WHT
+/// bookends), so this function must NOT apply iWHT itself; it only reverses the
+/// FibQuant vector-codebook quantization.
+///
+/// Block layout (mirrors `kernels/gb10/common/paged_decode_attn_fibquant.cu`
+/// and `spark_runtime::kv_cache::block_bytes_dims`): row-major
+/// `[block_size, num_kv_heads, payload]`, where each (token, kv_head) payload
+/// is:
+///   - bytes `[0..2]`: BF16 norm of the WHT-domain vector (little-endian),
+///     shared across all `head_dim` elements reconstructed from this payload.
+///   - bytes `[2..2 + head_dim/FIBQUANT_K]`: 1-byte codebook indices (N=256 ⇒
+///     one byte each). Index `idx` selects the codeword at
+///     `codebook[idx * FIBQUANT_K .. idx * FIBQUANT_K + FIBQUANT_K]` from the
+///     row-major `[N, FIBQUANT_K]` codebook.
+///
+/// For each index the dequant gathers the `FIBQUANT_K` codeword values and
+/// multiplies all of them by the payload's BF16 norm, writing `FIBQUANT_K` BF16
+/// values per index into `out` in `[bs, nkv, hd]` row-major order. The total
+/// output length is exactly `bs * nkv * hd` BF16 values.
+pub fn dequant_fibquant_block_to_bf16(
+    raw: &[u8],
+    bs: usize,
+    nkv: usize,
+    hd: usize,
+    codebook: &[f32],
+    out: &mut [bf16],
+) {
+    debug_assert!(hd.is_multiple_of(FIBQUANT_K));
+    debug_assert_eq!(out.len(), bs * nkv * hd);
+    let nidx = hd / FIBQUANT_K;
+    let payload = 2 + nidx;
+    let token_stride = nkv * payload;
+    debug_assert!(raw.len() >= bs * token_stride);
+    // `codebook` must cover every selectable index: N * FIBQUANT_K floats.
+    debug_assert!(
+        codebook.len() >= 256 * FIBQUANT_K,
+        "FibQuant codebook too small: {} < {}",
+        codebook.len(),
+        256 * FIBQUANT_K
+    );
+    for tok in 0..bs {
+        for kv_h in 0..nkv {
+            let payload_off = tok * token_stride + kv_h * payload;
+            let norm = bf16::from_le_bytes([raw[payload_off], raw[payload_off + 1]]);
+            let norm_f = norm.to_f32();
+            let idx_bytes = &raw[payload_off + 2..payload_off + 2 + nidx];
+            let out_row = (tok * nkv + kv_h) * hd;
+            for (b, &idx) in idx_bytes.iter().enumerate() {
+                let cb_row = (idx as usize) * FIBQUANT_K;
+                let out_base = out_row + b * FIBQUANT_K;
+                let cb_slice = &codebook[cb_row..cb_row + FIBQUANT_K];
+                let out_slice = &mut out[out_base..out_base + FIBQUANT_K];
+                for (cv, out_v) in cb_slice.iter().zip(out_slice.iter_mut()) {
+                    *out_v = bf16::from_f32(cv * norm_f);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +438,62 @@ mod tests {
                 (out[i].to_f32() - 1.0).abs() < 1e-2,
                 "elem {i}: expected 1.0, got {}",
                 out[i].to_f32(),
+            );
+        }
+    }
+
+    #[test]
+    fn fibquant_dequant_layout() {
+        // Synthetic [N=256, FIBQUANT_K=4] codebook: codeword `idx` holds
+        // [idx, idx+1, idx+2, idx+3] so the gather is unambiguous.
+        let codebook: Vec<f32> = (0..256u32)
+            .flat_map(|idx| {
+                let base = idx as f32;
+                [base, base + 1.0, base + 2.0, base + 3.0]
+            })
+            .collect();
+
+        // 1 token × 2 kv_heads × hd=8 ⇒ 2 indices per (tok, kv_head),
+        // payload = 2 + 2 = 4 bytes.
+        let bs = 1;
+        let nkv = 2;
+        let hd = 8;
+        let payload = 2 + hd / FIBQUANT_K;
+        let mut raw = vec![0u8; bs * nkv * payload];
+        // kv_head 0: norm = 2.0, indices [10, 20].
+        let n0 = bf16::from_f32(2.0).to_le_bytes();
+        raw[0] = n0[0];
+        raw[1] = n0[1];
+        raw[2] = 10;
+        raw[3] = 20;
+        // kv_head 1: norm = 0.5, indices [100, 200].
+        let n1 = bf16::from_f32(0.5).to_le_bytes();
+        raw[payload] = n1[0];
+        raw[payload + 1] = n1[1];
+        raw[payload + 2] = 100;
+        raw[payload + 3] = 200;
+
+        let mut out = vec![bf16::ZERO; bs * nkv * hd];
+        dequant_fibquant_block_to_bf16(&raw, bs, nkv, hd, &codebook, &mut out);
+
+        // kv_head 0, norm=2.0: idx 10 → [10,11,12,13]*2, idx 20 → [20,21,22,23]*2.
+        let exp0: [f32; 8] = [10.0, 11.0, 12.0, 13.0, 20.0, 21.0, 22.0, 23.0];
+        for (i, e) in exp0.iter().enumerate() {
+            assert!(
+                (out[i].to_f32() - e * 2.0).abs() < 1e-2,
+                "kv0 elem {i}: expected {}, got {}",
+                e * 2.0,
+                out[i].to_f32(),
+            );
+        }
+        // kv_head 1, norm=0.5: idx 100 → [100..103]*0.5, idx 200 → [200..203]*0.5.
+        let exp1: [f32; 8] = [100.0, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0];
+        for (i, e) in exp1.iter().enumerate() {
+            assert!(
+                (out[hd + i].to_f32() - e * 0.5).abs() < 1e-2,
+                "kv1 elem {i}: expected {}, got {}",
+                e * 0.5,
+                out[hd + i].to_f32(),
             );
         }
     }

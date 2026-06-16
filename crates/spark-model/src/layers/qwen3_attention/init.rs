@@ -97,25 +97,26 @@ impl Qwen3AttentionLayer {
         // FibQuant: build the per-head_dim codebook on the host from
         // `atlas-quant` (SSOT — no checked-in codebook to drift), flatten to f32,
         // and upload a 4 KB device buffer once. Passed to every FibQuant kernel
-        // as the trailing `fibq_codebook` arg. NULL for other dtypes.
-        let fibq_codebook_dev = if kv_dtype == KvCacheDtype::FibQuant {
+        // as the trailing `fibq_codebook` arg. The same f32 words are retained
+        // in `fibq_codebook_host` for the HSS host-side dequant path (issue #9).
+        // NULL + empty for non-FibQuant dtypes.
+        let (fibq_codebook_dev, fibq_codebook_host) = if kv_dtype == KvCacheDtype::FibQuant {
             let codec = atlas_quant::fibquant::FibQuantCodec::new(
                 config.head_dim,
                 4,
                 256,
                 0xF1B0_0A0B_7041,
             );
-            let host_bytes: Vec<u8> = codec
-                .codebook
-                .words
-                .iter()
-                .flat_map(|v| (*v as f32).to_ne_bytes())
-                .collect();
+            // SSOT: flatten the f64 codebook words to f32 once. This single
+            // Vec feeds both the device upload (via to_ne_bytes) and the host
+            // mirror used by `dequant_fibquant_block_to_bf16` for HSS.
+            let host_words: Vec<f32> = codec.codebook.words.iter().map(|v| *v as f32).collect();
+            let host_bytes: Vec<u8> = host_words.iter().flat_map(|w| w.to_ne_bytes()).collect();
             let ptr = gpu.alloc(host_bytes.len())?;
             gpu.copy_h2d(&host_bytes, ptr)?;
-            ptr
+            (ptr, host_words)
         } else {
-            spark_runtime::gpu::DevicePtr::NULL
+            (spark_runtime::gpu::DevicePtr::NULL, Vec::new())
         };
         Ok(Self {
             input_norm,
@@ -127,6 +128,7 @@ impl Qwen3AttentionLayer {
             mrope_interleaved,
             kv_dtype,
             fibq_codebook_dev,
+            fibq_codebook_host,
             head_dim_override: None,
             num_q_heads_override: None,
             num_kv_heads_override: None,

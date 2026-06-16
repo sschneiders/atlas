@@ -117,6 +117,13 @@ pub struct Qwen3AttentionLayer {
     /// uploaded as a 4 KB f32 device buffer. `DevicePtr::NULL` when
     /// `kv_dtype != FibQuant` (never dereferenced outside the FibQuant arms).
     pub(super) fibq_codebook_dev: spark_runtime::gpu::DevicePtr,
+    /// Host mirror of `fibq_codebook_dev` as flattened f32 words (row-major
+    /// `[N, FIBQUANT_K]`, length `N * FIBQUANT_K`). Populated only for FibQuant
+    /// layers; empty (`Vec::new()`) otherwise. Consumed by the
+    /// `--high-speed-swap` host-side dequant
+    /// (`spark_runtime::kv_dequant::dequant_fibquant_block_to_bf16`) so
+    /// compressed KV blocks can page to disk without a codebook D2H per call.
+    pub(super) fibq_codebook_host: Vec<f32>,
     /// Turbo4 sparse-V pruning threshold (0.0 = disabled).
     pub(super) sparse_v_threshold: f32,
     // ── Decode weights (QuantWeight enum: Nvfp4 | Fp8 | Dense) ──
