@@ -77,8 +77,16 @@ struct SlotState {
     /// makes the resident set "prefix + recent", covering both ends while
     /// staying pool-sized (O(pool) attention, flatness preserved). Defaults
     /// to pool/4 — enough to cover a ~5%-depth needle without crowding the
-    /// recent window (the deep needle stays in the recent tail).
+    /// recent window (the deep needle stays in the recent tail). Set to 0
+    /// when the novelty keep-set is enabled (it supersedes the prefix floor).
     prefix_blocks: usize,
+    /// True when the content-novelty recall keep-set is enabled
+    /// (ATLAS_KVFLASH_NOVELTY). When true the prefix floor is disabled and a
+    /// keep-set of the rarest-content blocks is computed at first eviction.
+    novelty_enabled: bool,
+    /// True once [`KvflashPager::compute_novelty_keep_set`] has run for this
+    /// slot (one-time; the keep-set is fixed for the request's life).
+    novelty_keep_set_computed: bool,
 }
 
 /// The decode-loop pager. Installed thread-local after `bind_gpu_to_thread`.
@@ -199,11 +207,16 @@ impl KvflashPager {
         let mut residency = KvflashResidency::new(n);
         // Sink block 0 is always resident (FlashMemory always-resident floor).
         residency.protect(0);
-        // Prefix recall floor: pin the first `prefix_blocks` so a fact stated
-        // early in the prompt stays resident (re-asserted in sync_to_len as
-        // blocks arrive). pool/4 covers a ~5%-depth needle without crowding
-        // the recent window.
-        let prefix_blocks = (self.pool_blocks() / 4).max(1);
+        // Recall floor: either the prompt prefix (default) or, when
+        // ATLAS_KVFLASH_NOVELTY is set, a content-novelty keep-set computed at
+        // first eviction (rarest-content blocks — finds a distinctive needle at
+        // any depth, unlike the fixed prefix which doesn't scale with context).
+        let novelty_enabled = std::env::var("ATLAS_KVFLASH_NOVELTY").is_ok();
+        let prefix_blocks = if novelty_enabled {
+            0
+        } else {
+            (self.pool_blocks() / 4).max(1)
+        };
         residency.protect_range(0, prefix_blocks);
         // NOTE: the trailing window is NOT protect()ed here — it slides as the
         // sequence grows, so it is derived dynamically at eviction time.
@@ -217,6 +230,8 @@ impl KvflashPager {
                 steps_since_reselect: 0,
                 first_reselect_pending: true,
                 prefix_blocks,
+                novelty_enabled,
+                novelty_keep_set_computed: false,
             },
         );
     }
@@ -304,6 +319,50 @@ impl KvflashPager {
     /// `physical_block` is read from `block_table[logical]` BEFORE it is
     /// overwritten with the dummy — the caller's table is the source of truth
     /// for the current physical mapping.
+    /// One-time content-novelty keep-set for recall. Hashes each block's K
+    /// (layer 0) and pins the `pool/4` blocks with the RAREST hash (most
+    /// distinctive content). In a repetitive context a distinctive needle is
+    /// the unique block → top novelty → kept resident at any depth. This is a
+    /// content signal (not Q-driven), so it avoids the reactive-recall
+    /// chicken-and-egg. Cheap one-time O(context) read; the keep-set is fixed
+    /// for the request's life. See [`Self::evict_to_capacity`] (gate).
+    fn compute_novelty_keep_set(
+        &mut self,
+        slot: usize,
+        kv_cache: &PagedKvCache,
+        gpu: &dyn GpuBackend,
+    ) {
+        let total = match self.slots.get(&slot) {
+            Some(st) => st.residency.total(),
+            None => return,
+        };
+        if total == 0 {
+            return;
+        }
+        let mut hashes: Vec<u64> = Vec::with_capacity(total);
+        for b in 0..total as u32 {
+            let h = kv_cache
+                .read_block(0, b, gpu)
+                .map(|(k, _)| k_block_hash(&k))
+                .unwrap_or(0);
+            hashes.push(h);
+        }
+        let mut counts: HashMap<u64, u32> = HashMap::new();
+        for &h in &hashes {
+            *counts.entry(h).or_insert(0) += 1;
+        }
+        // Rarest hashes first = most novel content; ties broken by index.
+        let mut by_novelty: Vec<u32> = (0..total as u32).collect();
+        by_novelty.sort_by_key(|&i| counts[&hashes[i as usize]]);
+        let n_keep = (self.pool_blocks() / 4).max(1);
+        if let Some(st) = self.slots.get_mut(&slot) {
+            for &i in by_novelty.iter().take(n_keep) {
+                st.residency.protect(i as usize);
+            }
+            st.novelty_keep_set_computed = true;
+        }
+    }
+
     pub fn evict_to_capacity(
         &mut self,
         slot: usize,
@@ -316,6 +375,15 @@ impl KvflashPager {
         // blocks appended by the decode loop since the last step are tracked
         // (resident) before eviction planning. Cheap no-op when unchanged.
         self.sync_to_len(slot, block_table.len());
+        // One-time novelty keep-set: at the first over-capacity eviction,
+        // pin the rarest-content blocks so a distinctive needle (unique
+        // content in repetitive filler) stays resident at any depth.
+        let need_novelty = self.slots.get(&slot).map_or(false, |st| {
+            st.novelty_enabled && !st.novelty_keep_set_computed
+        });
+        if need_novelty {
+            self.compute_novelty_keep_set(slot, kv_cache, gpu);
+        }
         let victims = self.pick_eviction_victims(slot, pool_blocks);
         if victims.is_empty() {
             return Ok(0);
@@ -608,6 +676,16 @@ impl KvflashPager {
         }
         Ok(())
     }
+}
+
+/// Stable hash of one block's raw K bytes (any dtype) — a content signature
+/// for the novelty keep-set. Blocks with identical K collide; a distinctive
+/// needle in repetitive filler gets a unique hash.
+fn k_block_hash(k: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    k.hash(&mut h);
+    h.finish()
 }
 
 /// Pure-logic reselect planner. Given per-chunk relevance `scores` (higher =
