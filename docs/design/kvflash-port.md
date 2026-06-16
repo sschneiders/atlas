@@ -601,11 +601,73 @@ eliminated across sessions 2-4.
 
 - `ATLAS_KVFLASH_NOVELTY=1` — content-novelty keep-set (RoPE/context-confounded;
   degenerates to prefix).
-- `ATLAS_KVFLASH_ATTENTION=1` — prefill-attention keep-set (single-Q; sink+
-  recent dominated; does not achieve mid-depth recall).
+- `ATLAS_KVFLASH_ATTENTION=1` — prefill-attention keep-set (question-window;
+  marginal — needle-attention is generation-only).
+- `ATLAS_KVFLASH_ATTENTION_AGGREGATE_ALL=1` (with ATTENTION) — all-token
+  aggregate attention (H2O-style); sink-dominated.
 - `ATLAS_KVFLASH_SCORER=1` — Q-driven PredictorScorer (non-discriminatory).
 - default — prefix recall floor (pool/4) + pure-LRU. Passes the simple
   validation; the only config that holds flatness without churn.
+
+---
+
+# SESSION 5 — kernel hook DE-RISKED and RULED OUT (no accurate scorer exists for this signal)
+
+Before building a CUDA kernel hook, de-risked the two attention signals it
+could capture. Both fail, so the kernel hook is **not worth building**.
+
+## Model fact (rules out the sliding-window hypothesis)
+
+The A3B's 10 attention layers are ALL `full_attention` (`sliding_window: None`;
+verified from `text_config.layer_types`). So there is no sliding-window
+locality masking the needle — full global attention is in play.
+
+## De-risk 1: question-window attention (built in session 4) — marginal
+
+The 16-token question window's attention is sharp (`top_weight` 6-7 vs 0.0004
+for single-token) and identifies the needle for SOME positions, but it is
+marginal: the needle's rank wobbles 16→33+ across positions/runs, landing in
+the keep-set only sometimes (1/12 mid-depth). The needle-attention is
+**generation-only** — it emerges at the decode step that produces the answer,
+which is circular (needs the needle already resident).
+
+## De-risk 2: all-token aggregate attention (H2O-style) — sink-dominated
+
+`ATLAS_KVFLASH_ATTENTION_AGGREGATE_ALL` captures every prompt token's Q and
+sums each token's attention over all blocks. Result: `top_weight` ~1000,
+**entirely sink-dominated** — blocks 1, 2, 207 (sink + recent) absorb ~all the
+mass; the needle is nowhere in the top-32. 0/3 mid-depth. The attention-sink
+phenomenon drowns the needle in the aggregate.
+
+## Why the kernel hook cannot help
+
+Since all attention layers are full, the host-side Q·K recomputation IS the
+exact attention (type-correct). A kernel hook would capture the SAME
+sink-dominated / generation-only signal. **No prefill-attention signal
+identifies a mid-depth needle** — the only attention that reliably finds it
+(control: 92% mid-depth with full KV) is the GENERATION attention, which is
+circular (exists only once the needle is resident).
+
+## Conclusion
+
+Mid-depth long-doc recall is **not achievable via any attention-based scorer**
+for this model/test, kernel hook or otherwise. Every cheap proxy (Q-driven,
+content-novelty, prefix floor) AND the principled attention signals
+(question-window, all-token aggregate) have been built and empirically
+eliminated across sessions 2-5. The fundamental obstruction is circular:
+the signal that identifies the needle is the generation-time attention, which
+requires the needle to already be resident.
+
+## Pragmatic recommendation
+
+- **Keep the prefix recall floor (default)** — flat decode (the KVFlash
+  headline) + recall for prompt-start and recent-tail content. Passes the
+  simple validation on BF16 and FP8 KV.
+- **For recall-sensitive workloads**, the honest lever is a **larger pool**
+  (more resident KV) or **full-KV mode** (no `--kvflash`) — there is no cheap
+  scorer that recovers mid-depth recall at a small pool.
+- The recall-grid test (`tests/test_kvflash_recall_grid.py`) is the right
+  benchmark for any future recall mechanism.
 
 
 
