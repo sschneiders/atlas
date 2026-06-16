@@ -132,6 +132,20 @@ impl PredictorScorer {
             tracing::warn!("kvflash PredictorScorer: K upload failed (l={layer}): {e}");
             return;
         }
+        if let Err(e) = self
+            .predictor
+            .project_kv_block_on_stream(self.stream, layer, block_id as usize, self.k_scratch.ptr)
+        {
+            tracing::warn!("kvflash PredictorScorer: project failed (l={layer}, b={block_id}): {e}");
+            return;
+        }
+        // Sync the projection stream so THIS kernel finishes reading k_scratch
+        // before the next call's copy_h2d overwrites it. Without this, all
+        // blocks' A_g slots end up holding the last block's K (the async kernel
+        // is queued behind the next sync copy on the default stream) and every
+        // block scores identically — recall can't discriminate the target.
+        let _ = stream_sync(self.stream);
+    }
         if let Err(e) = self.predictor.project_kv_block_on_stream(
             self.stream,
             layer,
