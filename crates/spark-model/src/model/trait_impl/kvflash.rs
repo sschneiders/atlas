@@ -73,7 +73,7 @@ impl TransformerModel {
         // `&mut PagedKvCache` (not the guard), avoiding a double-indirection
         // borrow inside the FnOnce.
         let mut kv = self.kv_cache.lock();
-        let kv_ref: &mut spark_runtime::kv_cache::PagedKvCache = &mut *kv;
+        let kv_ref: &mut spark_runtime::kv_cache::PagedKvCache = &mut kv;
         let gpu = self.gpu.as_ref();
         if let Some(res) = spark_runtime::kvflash_pager::with_local(|pager| {
             pager.evict_to_capacity(slot, &mut seq.block_table, pool_blocks, kv_ref, gpu)
