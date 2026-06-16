@@ -881,10 +881,7 @@ pub fn attention_block_weights(
                 raws.push((b, dot * inv_sqrt));
             }
         }
-        let mx = raws
-            .iter()
-            .map(|r| r.1)
-            .fold(f32::NEG_INFINITY, f32::max);
+        let mx = raws.iter().map(|r| r.1).fold(f32::NEG_INFINITY, f32::max);
         let mut exps: Vec<f32> = raws.iter().map(|r| (r.1 - mx).exp()).collect();
         let sum: f32 = exps.iter().copied().sum();
         if sum > 0.0 {
@@ -904,42 +901,6 @@ pub fn attention_block_weights(
         for x in w.iter_mut() {
             *x *= inv;
         }
-    }
-    w
-}
-        }
-        let inv = 1.0 / gqa as f32;
-        for d in 0..hd {
-            group_q[h * hd + d] = acc[d] * inv;
-        }
-    }
-    // Raw scaled dot-product per (block, token, kv_head).
-    let mut raws: Vec<(usize, f32)> = Vec::with_capacity(block_ks.len() * block_size * nkv);
-    for (b, k) in block_ks.iter().enumerate() {
-        for t in 0..block_size {
-            for h in 0..nkv {
-                let mut dot = 0f32;
-                for d in 0..hd {
-                    dot += group_q[h * hd + d] * k[(t * nkv + h) * hd + d];
-                }
-                raws.push((b, dot * inv_sqrt));
-            }
-        }
-    }
-    // Softmax over all keys (numerically stable).
-    let mx = raws.iter().map(|r| r.1).fold(f32::NEG_INFINITY, f32::max);
-    let mut exps: Vec<f32> = raws.iter().map(|r| (r.1 - mx).exp()).collect();
-    let sum: f32 = exps.iter().copied().sum();
-    if sum > 0.0 {
-        let inv = 1.0 / sum;
-        for e in exps.iter_mut() {
-            *e *= inv;
-        }
-    }
-    // Aggregate per block.
-    let mut w = vec![0f32; block_ks.len()];
-    for (i, &(b, _)) in raws.iter().enumerate() {
-        w[b] += exps[i];
     }
     w
 }
