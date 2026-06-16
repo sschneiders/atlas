@@ -169,6 +169,18 @@ pub fn build_model(
     // ── Step 5: Size KV cache from actual free memory ──
     // MLA absorbed: cache compressed latent [kv_lora + rope] instead of expanded [nkv * hd]
     // This gives 12.8x smaller KV cache AND better precision (no expand→cache→read roundtrip)
+    //
+    // FibQuant is incompatible with MLA: the MLA decode kernel reads the absorbed
+    // latent as BF16 (`paged_decode_attn_bf16`), so a FibQuant cache would be
+    // silently mis-decoded. Fail fast at build. (This is a pre-existing gap for
+    // every non-BF16 dtype on MLA; scoped to FibQuant here.)
+    if config.kv_lora_rank > 0 && kv_dtype == KvCacheDtype::FibQuant {
+        anyhow::bail!(
+            "FibQuant KV cache is not supported for MLA models (kv_lora_rank > 0, e.g. \
+             Mistral): the MLA decode kernel reads the absorbed latent as BF16. Use \
+             --kv-cache-dtype bf16 (or fp8) for MLA models."
+        );
+    }
     let (kv_num_heads, kv_head_dim) = if config.kv_lora_rank > 0 {
         let mla_cache_dim = config.kv_lora_rank + config.qk_rope_head_dim;
         tracing::info!(
