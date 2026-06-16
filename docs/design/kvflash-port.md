@@ -535,5 +535,78 @@ Prefix recall floor (pool/4) + pure-LRU, PredictorScorer dormant. Passes the
 simple validation (shallow+deep HIT, flatness ~0.92) at moderate context on
 both BF16 and FP8 KV. Does NOT provide mid-depth recall — see the grid.
 
+---
+
+# SESSION 4 — prefill-attention keep-set built (step-verified); signal insufficient
+
+Built the principled FlashMemory-style fix and verified each step; the
+end-to-end still does not achieve mid-depth recall. Root cause now pinned by a
+decisive control.
+
+## The control (the key finding)
+
+Ran the recall grid **without `--kvflash`** (full KV, BF16): the A3B finds a
+mid-depth needle **92% of the time** (11/12 mid-depth HIT; 8x pool ALL HIT).
+So the model *can* retrieve a mid-depth needle — the failures are purely
+KVFlash paging evicting it, NOT a model-quality limit.
+
+## Prefill-attention keep-set (ATLAS_KVFLASH_ATTENTION) — built + step-verified
+
+- **Step A** — prefill Q-capture hook in `paged.rs` + `cache_skip.rs` (post-
+  RoPE last-token Q, every attention layer → last layer wins in the stash).
+  Verified: log shows `captured prefill Q: nq=16 nkv=2 hd=256`.
+- **Step B** — `attention_block_weights(q, block_ks, ...)` pure fn (per-head
+  GQA softmax, aggregated per block). 2 unit tests pass (aligned block
+  dominates; weights sum to 1).
+- **Step C** — `compute_attention_keep_set`: read each block's K (last layer,
+  BF16), score with the stashed prefill Q, pin pool/4 highest-attention
+  blocks. `top_blocks_by_weight` pure selector unit-tested.
+- **Step D** — end-to-end grid: **does NOT achieve mid-depth recall** (mid
+  0-8%). The keep-set's top blocks are the attention sink + recent window,
+  never the mid-depth needle.
+
+## Why it fails (definitive)
+
+The model retrieves a mid-depth needle **during generation** — the decode Q at
+the token that needs the answer (e.g. "BLUE-FALCON") attends to the needle.
+No *single* Q — prefill-last-token (tried layers 0 and last, mean-grouped and
+per-head) or first-decode — identifies the needle, because the needle-attention
+*emerges at the generation step that needs it*, by which point KVFlash has
+paged it out. **Circular dependency**: the signal that identifies the needle
+only exists once the needle is already resident. K is confirmed post-RoPE
+(`ops::rope_yarn` on `k_contiguous`) so the Q·K recomputation is in the right
+space — the signal is genuinely diffuse at every single Q, not a bug.
+
+## Path to real mid-depth recall (the remaining option)
+
+The signal that works is **aggregate attention received** — the per-block
+column-sum of attention over ALL prompt tokens (during prefill, every later
+token attends back, so a distinctive needle accumulates attention). This is
+what KV-compression methods (H2O etc.) use. It is NOT capturable from a single
+Q; it needs either:
+
+1. A **kernel hook** that accumulates per-key attention received during the
+   prefill attention kernel (the kernel computes the full attention matrix
+   internally; expose the column-sum). One-time, at prefill. This is the
+   principled fix.
+2. A **separate GPU attention pass** at first decode step (all blocks
+   resident): matmul of the full prefill Q matrix against all K, column-sum.
+   O(context^2) but one-time; needs a kernel launch (not host-side).
+
+Both are moderate kernel-level features, not pager logic. Everything cheaper
+(single-Q proxy, content novelty, prefix floor) has been built and empirically
+eliminated across sessions 2-4.
+
+## Mechanisms on the branch (all gated, dormant by default)
+
+- `ATLAS_KVFLASH_NOVELTY=1` — content-novelty keep-set (RoPE/context-confounded;
+  degenerates to prefix).
+- `ATLAS_KVFLASH_ATTENTION=1` — prefill-attention keep-set (single-Q; sink+
+  recent dominated; does not achieve mid-depth recall).
+- `ATLAS_KVFLASH_SCORER=1` — Q-driven PredictorScorer (non-discriminatory).
+- default — prefix recall floor (pool/4) + pure-LRU. Passes the simple
+  validation; the only config that holds flatness without churn.
+
+
 
 
