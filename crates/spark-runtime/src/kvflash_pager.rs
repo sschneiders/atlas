@@ -87,6 +87,13 @@ struct SlotState {
     /// True once [`KvflashPager::compute_novelty_keep_set`] has run for this
     /// slot (one-time; the keep-set is fixed for the request's life).
     novelty_keep_set_computed: bool,
+    /// True when the prefill-attention recall keep-set is enabled
+    /// (ATLAS_KVFLASH_ATTENTION). When true the prefix floor is disabled and
+    /// the top-attention blocks (what the prompt's query attends to) are pinned
+    /// at first eviction — finds a needle at any depth.
+    attention_enabled: bool,
+    /// True once [`KvflashPager::compute_attention_keep_set`] has run.
+    attention_keep_set_computed: bool,
 }
 
 /// The decode-loop pager. Installed thread-local after `bind_gpu_to_thread`.
@@ -265,7 +272,8 @@ impl KvflashPager {
         // first eviction (rarest-content blocks — finds a distinctive needle at
         // any depth, unlike the fixed prefix which doesn't scale with context).
         let novelty_enabled = std::env::var("ATLAS_KVFLASH_NOVELTY").is_ok();
-        let prefix_blocks = if novelty_enabled {
+        let attention_enabled = std::env::var("ATLAS_KVFLASH_ATTENTION").is_ok();
+        let prefix_blocks = if novelty_enabled || attention_enabled {
             0
         } else {
             (self.pool_blocks() / 4).max(1)
@@ -285,6 +293,8 @@ impl KvflashPager {
                 prefix_blocks,
                 novelty_enabled,
                 novelty_keep_set_computed: false,
+                attention_enabled,
+                attention_keep_set_computed: false,
             },
         );
     }
@@ -421,6 +431,71 @@ impl KvflashPager {
         }
     }
 
+    /// One-time prefill-attention keep-set for recall. Uses the stashed prefill
+    /// last-token Q (the question's retrieval query) to compute its attention
+    /// over every block's K (layer 0, BF16) and pins the `pool/4` highest-
+    /// attention blocks. The block the prompt attends to (a needle at any
+    /// depth) ranks high → kept resident. This is the principled FlashMemory-
+    /// style importance signal (computed while the full context is visible),
+    /// which the cheap Q/content proxies could not provide. One-time O(context)
+    /// read; the keep-set is fixed for the request's life.
+    fn compute_attention_keep_set(
+        &mut self,
+        slot: usize,
+        kv_cache: &PagedKvCache,
+        gpu: &dyn GpuBackend,
+    ) {
+        let (q, nq, nkv, hd) = match self.prefill_q.as_ref() {
+            Some(q) => (
+                q.as_slice(),
+                self.prefill_q_nq,
+                self.prefill_q_nkv,
+                self.prefill_q_hd,
+            ),
+            None => {
+                tracing::debug!("kvflash attention keep-set: no prefill Q captured yet");
+                return;
+            }
+        };
+        let total = match self.slots.get(&slot) {
+            Some(st) => st.residency.total(),
+            None => return,
+        };
+        if total == 0 || nkv == 0 || hd == 0 {
+            return;
+        }
+        let bs = self.block_size as usize;
+        // Parse each block's K (layer 0, BF16) to f32 [bs, nkv, hd].
+        let mut block_ks: Vec<Vec<f32>> = Vec::with_capacity(total);
+        for b in 0..total as u32 {
+            let kf: Vec<f32> = kv_cache
+                .read_block(0, b, gpu)
+                .map(|(k, _)| {
+                    (0..k.len() / 2)
+                        .map(|i| {
+                            let bits = u16::from_le_bytes([k[i * 2], k[i * 2 + 1]]) as u32;
+                            f32::from_bits(bits << 16)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            block_ks.push(kf);
+        }
+        let weights = attention_block_weights(q, &block_ks, nq, nkv, hd, bs);
+        let n_keep = (self.pool_blocks() / 4).max(1);
+        let keep = top_blocks_by_weight(&weights, n_keep);
+        tracing::debug!(
+            "kvflash attention keep-set: total={total} n_keep={n_keep} top_weight={:.4} kept={keep:?}",
+            weights.first().copied().unwrap_or(0.0),
+        );
+        if let Some(st) = self.slots.get_mut(&slot) {
+            for &i in &keep {
+                st.residency.protect(i as usize);
+            }
+            st.attention_keep_set_computed = true;
+        }
+    }
+
     pub fn evict_to_capacity(
         &mut self,
         slot: usize,
@@ -442,6 +517,16 @@ impl KvflashPager {
             .is_some_and(|st| st.novelty_enabled && !st.novelty_keep_set_computed);
         if need_novelty {
             self.compute_novelty_keep_set(slot, kv_cache, gpu);
+        }
+        // One-time prefill-attention keep-set: pin the blocks the prompt's
+        // query attends to (the real recall signal — finds a needle at any
+        // depth, unlike content-novelty which RoPE/context confound).
+        let need_attention = self
+            .slots
+            .get(&slot)
+            .is_some_and(|st| st.attention_enabled && !st.attention_keep_set_computed);
+        if need_attention {
+            self.compute_attention_keep_set(slot, kv_cache, gpu);
         }
         let victims = self.pick_eviction_victims(slot, pool_blocks);
         if victims.is_empty() {
@@ -824,6 +909,19 @@ pub fn attention_block_weights(
         w[b] += exps[i];
     }
     w
+}
+
+/// Indices of the `n` highest-weight blocks, highest first (pure logic).
+/// Used by the prefill-attention keep-set to pick which blocks to pin.
+pub fn top_blocks_by_weight(weights: &[f32], n: usize) -> Vec<u32> {
+    let mut idxs: Vec<u32> = (0..weights.len() as u32).collect();
+    idxs.sort_by(|a, b| {
+        weights[*b as usize]
+            .partial_cmp(&weights[*a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    idxs.truncate(n);
+    idxs
 }
 
 /// Pure-logic reselect planner. Given per-chunk relevance `scores` (higher =
@@ -1329,5 +1427,17 @@ mod tests {
             (w[0] - w[1]).abs() < 1e-6 && (w[1] - w[2]).abs() < 1e-6,
             "identical blocks => identical weights: {w:?}"
         );
+    }
+
+    #[test]
+    fn top_blocks_by_weight_picks_highest_first() {
+        // block 5 is the needle (highest weight), then 2, then 0.
+        let weights = [0.4, 0.01, 0.5, 0.02, 0.03, 0.9, 0.05];
+        let top = top_blocks_by_weight(&weights, 3);
+        assert_eq!(top, vec![5, 2, 0], "top-3 highest-first: {top:?}");
+        // n larger than len is clamped.
+        let all = top_blocks_by_weight(&weights, 100);
+        assert_eq!(all.len(), weights.len());
+        assert_eq!(all[0], 5, "highest first");
     }
 }
