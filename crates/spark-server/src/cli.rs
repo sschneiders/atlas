@@ -464,6 +464,14 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 4)]
     pub kvflash_protected_tail_blocks: u32,
 
+    /// Enable block-table compaction so decode attention iterates over only
+    /// the resident pool (O(pool)) instead of the full context (O(ctx)). Off
+    /// by default — experimental (PR8); validate output correctness vs the
+    /// dummy-mask MVP before trusting it. Env fallback: `ATLAS_KVFLASH_COMPACT`
+    /// (set to `1`/`true`/`on`/`yes` to enable, case-insensitive).
+    #[arg(long, default_value_t = false)]
+    pub kvflash_compact: bool,
+
     /// Default request timeout in seconds. 0 = no timeout.
     #[arg(long, default_value_t = 300)]
     pub request_timeout: u32,

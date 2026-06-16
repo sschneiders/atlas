@@ -108,11 +108,34 @@ impl TransformerModel {
         self.gpu
             .copy_h2d_async(&global_slot.to_le_bytes(), meta_base.offset(8), stream)?;
 
-        let actual_seq_len = (seq.seq_len + 1) as i32;
+        // PR8 block-table compaction: when enabled, drop paged-out (dummy)
+        // entries so the decode kernel iterates over only resident blocks
+        // (O(pool)) with a matching reduced seq_len. RoPE is baked into cached
+        // K at write time and the kernel takes no positions array, so dropping
+        // / reordering resident blocks is position-safe. The WRITE slot
+        // (global_slot above, where the new token's K/V lands) is decoupled
+        // from the READ seq_len and is NOT touched here.
+        let (attn_seq_len, attn_block_table_owned): (i32, Option<Vec<u32>>) =
+            if spark_runtime::kvflash_pager::compact_enabled() {
+                match spark_runtime::kvflash_compact::compact_for_attention(
+                    &seq.block_table,
+                    seq.seq_len + 1,
+                    bs,
+                    self.dummy_kv_block,
+                ) {
+                    Some((resident, reduced)) => (reduced as i32, Some(resident)),
+                    None => ((seq.seq_len + 1) as i32, None),
+                }
+            } else {
+                ((seq.seq_len + 1) as i32, None)
+            };
         self.gpu
-            .copy_h2d_async(&actual_seq_len.to_le_bytes(), meta_base.offset(16), stream)?;
+            .copy_h2d_async(&attn_seq_len.to_le_bytes(), meta_base.offset(16), stream)?;
 
-        let bt_i32: Vec<i32> = seq.block_table.iter().map(|&b| b as i32).collect();
+        let attn_block_table_src = attn_block_table_owned
+            .as_deref()
+            .unwrap_or(&seq.block_table);
+        let bt_i32: Vec<i32> = attn_block_table_src.iter().map(|&b| b as i32).collect();
         let bt_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(bt_i32.as_ptr() as *const u8, bt_i32.len() * 4) };
         self.gpu

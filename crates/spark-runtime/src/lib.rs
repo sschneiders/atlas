@@ -14,6 +14,7 @@ pub mod kernel_audit;
 pub mod kv_cache;
 pub mod kv_dequant;
 pub mod kv_spill;
+pub mod kvflash_compact;
 pub mod kvflash_config;
 pub mod kvflash_pager;
 pub mod kvflash_residency;

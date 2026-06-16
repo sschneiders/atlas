@@ -77,6 +77,14 @@ pub struct KvflashConfig {
     /// Logical blocks protected from eviction at the tail (for causal
     /// continuity of in-flight generation). In BLOCKS, not tokens.
     pub protected_tail_blocks: u32,
+    /// Enable block-table compaction (PR8): when true, the decode attention
+    /// sites drop paged-out (dummy) entries from the per-seq block table and
+    /// pass a matching reduced `seq_len`, so the kernel iterates over only the
+    /// resident pool (O(pool)) instead of the full context (O(ctx)). Off by
+    /// default — experimental; validate output correctness vs the dummy-mask
+    /// MVP before trusting it. No new invariant (carried by [`Self::validate`]
+    /// for completeness; a bool needs no cross-field check).
+    pub compact: bool,
 }
 
 impl KvflashConfig {
@@ -132,6 +140,7 @@ mod tests {
             tau: 64,
             policy: KvflashPolicy::Lru,
             protected_tail_blocks: 4,
+            compact: false,
         };
         assert!(cfg.validate().is_err());
     }
@@ -143,6 +152,7 @@ mod tests {
             tau: 0,
             policy: KvflashPolicy::Lru,
             protected_tail_blocks: 4,
+            compact: false,
         };
         assert!(cfg.validate().is_err());
     }
@@ -154,6 +164,7 @@ mod tests {
             tau: 64,
             policy: KvflashPolicy::Drafter,
             protected_tail_blocks: 4,
+            compact: false,
         };
         assert!(cfg.validate().is_ok());
     }

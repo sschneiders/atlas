@@ -67,6 +67,10 @@ pub struct KvflashPager {
     cfg: KvflashConfig,
     block_size: u32,
     num_layers: usize,
+    /// Cached `cfg.compact` for the thread-local [`compact_enabled`] fast path
+    /// (mirrors `block_size` / `num_layers` being cached at install time so
+    /// the per-step decode sites do not re-read the config).
+    compact: bool,
     slots: HashMap<usize, SlotState>,
 }
 
@@ -75,10 +79,12 @@ impl KvflashPager {
     /// geometry is cached at install (from the model's `PagedKvCache`) so the
     /// per-step eviction loop does not re-lock the cache just to read dims.
     pub fn new(cfg: KvflashConfig, block_size: u32, num_layers: usize) -> Self {
+        let compact = cfg.compact;
         Self {
             cfg,
             block_size,
             num_layers,
+            compact,
             slots: HashMap::new(),
         }
     }
@@ -97,6 +103,13 @@ impl KvflashPager {
     /// Cached number of KV cache layers.
     pub fn num_layers(&self) -> usize {
         self.num_layers
+    }
+
+    /// Cached `cfg.compact` — true iff block-table compaction (PR8) is enabled.
+    /// Decode attention sites read this (via the thread-local
+    /// [`compact_enabled`]) to decide whether to build the resident-only view.
+    pub fn compact(&self) -> bool {
+        self.compact
     }
 
     /// Resident pool cap in BLOCKS (floor of `pool_tokens / block_size`).
@@ -337,6 +350,14 @@ pub fn protected_tail_blocks() -> Option<u32> {
     })
 }
 
+/// True iff block-table compaction (PR8) is enabled on the installed pager.
+/// Returns `false` when no pager is installed. Decode attention sites call
+/// this to gate the resident-only block-table build (off by default — no
+/// behavior change unless `--kvflash-compact` is set).
+pub fn compact_enabled() -> bool {
+    LOCAL.with(|cell| cell.borrow().as_ref().map(|p| p.compact()).unwrap_or(false))
+}
+
 /// Register a decode slot on the thread-local pager. No-op when no pager is
 /// installed. Thin wrapper over [`KvflashPager::begin_request`].
 pub fn begin_request(
@@ -377,6 +398,7 @@ mod tests {
             tau: 16,
             policy: KvflashPolicy::Lru,
             protected_tail_blocks: 2,
+            compact: false,
         }
     }
 

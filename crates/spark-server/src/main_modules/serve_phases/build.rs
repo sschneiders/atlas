@@ -179,6 +179,21 @@ fn env_usize(name: &str) -> Option<usize> {
         .and_then(|s| s.parse().ok())
 }
 
+/// Parse `ATLAS_*` truthy env vars: `1`/`true`/`on`/`yes` (case-insensitive)
+/// → `true`; `0`/`false`/`off`/`no` → `false`; anything else → `None` (kept
+/// absent so the CLI flag default wins). Manual dual-check idiom (no
+/// `#[arg(env=...)]` in this codebase — mirrors `env_u32` / `env_usize`).
+fn env_bool(name: &str) -> Option<bool> {
+    std::env::var(name)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => Some(true),
+            "0" | "false" | "off" | "no" => Some(false),
+            _ => None,
+        })
+}
+
 /// Build the resolved KVFlash config from CLI flags + env fallback. Returns
 /// `Ok(None)` when KVFlash is not requested (neither `--kvflash` nor
 /// `ATLAS_KVFLASH` set). Mirrors `build_high_speed_swap_config`'s shape: takes
@@ -209,6 +224,9 @@ pub(crate) fn build_kvflash_config(
         Some(s) => s.parse::<spark_runtime::KvflashPolicy>()?,
         None => args.kvflash_policy.into(),
     };
+    // PR8 block-table compaction: explicit --kvflash-compact flag, else env
+    // fallback (manual dual-check idiom, same as tau/max_pool above).
+    let compact = env_bool("ATLAS_KVFLASH_COMPACT").unwrap_or(args.kvflash_compact);
 
     let pool_tokens = resolve_pool_tokens(&spec, max_pool, args.max_seq_len, args.block_size)?;
     let cfg = spark_runtime::KvflashConfig {
@@ -216,6 +234,7 @@ pub(crate) fn build_kvflash_config(
         tau,
         policy,
         protected_tail_blocks: args.kvflash_protected_tail_blocks,
+        compact,
     };
     cfg.validate()?;
     Ok(Some(cfg))

@@ -66,12 +66,35 @@ impl TransformerModel {
             let slot = (physical_block as i64) * (block_size as i64) + (block_offset as i64);
             slots.push(slot);
 
-            seq_lens_host.push((seq.seq_len + 1) as i32);
+            // PR8 block-table compaction: when enabled, drop paged-out (dummy)
+            // entries for THIS seq and pass the reduced seq_len, so the decode
+            // kernel iterates over only resident blocks (O(pool)). RoPE is
+            // baked into cached K at write time and the kernel takes no
+            // positions array, so dropping/reordering resident blocks is
+            // position-safe. The WRITE slot (computed above) is decoupled from
+            // the READ seq_len and is NOT touched.
+            let (attn_seq_len, resident_owned): (i32, Option<Vec<u32>>) =
+                if spark_runtime::kvflash_pager::compact_enabled() {
+                    match spark_runtime::kvflash_compact::compact_for_attention(
+                        &seq.block_table,
+                        seq.seq_len + 1,
+                        block_size,
+                        self.dummy_kv_block,
+                    ) {
+                        Some((resident, reduced)) => (reduced as i32, Some(resident)),
+                        None => ((seq.seq_len + 1) as i32, None),
+                    }
+                } else {
+                    ((seq.seq_len + 1) as i32, None)
+                };
+            seq_lens_host.push(attn_seq_len);
 
             // CONCURRENT-DECODE INVARIANT: a real seq's block_table must cover
             // its (seq_len + 1) tokens. If shorter, paged attention OOB-reads
             // dummy_kv_block (now safe via sentinel above) but SSM state has
             // already been advanced — corruption follows. Catch in dev builds.
+            // (Unaffected by compaction: it gates the WRITE path's table
+            // coverage, not the resident-only READ view built above.)
             debug_assert!(
                 seq.block_table.len() > (seq.seq_len / block_size),
                 "seq slot={} seq_len={} block_table.len={} (need >= {})",
@@ -81,8 +104,22 @@ impl TransformerModel {
                 (seq.seq_len / block_size) + 1,
             );
 
-            for (j, &block) in seq.block_table.iter().take(max_blocks as usize).enumerate() {
-                block_table_flat[i * max_blocks as usize + j] = block as i32;
+            // Stage this seq's block-table entries into its `max_blocks` stride
+            // slot. When compacted, only the first `resident.len()` entries are
+            // real (resident) physicals; trailing stride slots stay dummy
+            // (never read — the kernel caps attention at the reduced
+            // `attn_seq_len`). When not compacted, the full logical table is
+            // copied as before.
+            let attn_block_table_src: &[u32] = resident_owned
+                .as_deref()
+                .unwrap_or(seq.block_table.as_slice());
+            let stride = i * max_blocks as usize;
+            for (j, &block) in attn_block_table_src
+                .iter()
+                .take(max_blocks as usize)
+                .enumerate()
+            {
+                block_table_flat[stride + j] = block as i32;
             }
         }
 
