@@ -269,6 +269,82 @@ Remaining (perf / feature / blocked — separate focused efforts):
   on PPL — **blocked on #7** (needs an asym variant first). Step 1 measured both
   K+V; V lacks K's softmax robustness so may want a different rate.
 
+## #7 design — tunable rate (decided + build mechanism mapped)
+
+**Decisions (agreed):**
+1. **Variant menu** (not runtime config): separate `KvCacheDtype` variants, like
+   `Turbo{2,3,4,8}`. CLI `--kv-cache-dtype fibquant8x`.
+2. **Compile-time per variant** (not runtime-k): the `.cu` kernels keep
+   `FIB_K`/`FIB_N` as `#define`s; the build compiles the kernels once per rate.
+   Keeps the attention hot path branch-free.
+3. **1-byte indices** (`N ≤ 256`): covers the useful 4×–16× range via
+   `k∈{2,4,8}, N=256`. Sub-one-bit / `N>256` (2-byte) deferred.
+4. **Symmetric now, per-side later via the existing asym pattern**: ship
+   `FibQuant4x`/`FibQuant8x` (both sides same rate). #8 (K≠V rate) adds
+   `Bf16KFibquant8xV` / `Fp8KFibquant8xV` style variants — no new mechanism
+   needed (`kv_pair()` + per-side byte-math already exist).
+5. **Ship 4× + 8×** (Step-1 attn-cosine 0.9997 / 0.992); **16× deferred** (recall
+   grid showed degradation at 16K — needs its own validation/tuning pass).
+
+**Variant menu → `(k, N, rate b, compression)`:**
+
+| variant | k | N | b (bits/coord) | vs fp16 | Step-1 attn_cos |
+|---|---|---|---|---|---|
+| `FibQuant4x` | 2 | 256 | 4.0 | 4× | 0.9997 |
+| `FibQuant8x` | 4 | 256 | 2.0 | 8× | 0.992 |
+
+**The reusable capability: a `[[variants]]` KERNEL.toml table.** Today
+`atlas-kernels/build.rs` compiles each `.cu` once into one PTX module. To compile
+one `.cu` into N modules (one per rate, differing only by `-D`), add a new table:
+
+```toml
+# kernels/gb10/common/KERNEL.toml
+[[variants]]
+stem  = "paged_decode_attn_fibquant"     # which .cu
+name  = "paged_decode_fibquant_8x"        # registry module name
+flags = ["-DFIB_K=4", "-DFIB_N=256", "-DFIB_RATE=8x"]
+[[variants]]
+stem  = "paged_decode_attn_fibquant"
+name  = "paged_decode_fibquant_4x"
+flags = ["-DFIB_K=2", "-DFIB_N=256", "-DFIB_RATE=4x"]
+# (same for reshape_and_cache_fibquant + inferspark_prefill_paged_fibquant)
+```
+
+The runtime then does `gpu.kernel("paged_decode_fibquant_8x",
+"paged_decode_attn_fibquant")` — the symbol name is identical across variants
+(macros change the body, not the exported name), so each module's blob resolves
+the same symbol but with the variant's compiled code.
+
+**Build-mechanism change plan (from `atlas-kernels/build*.rs` audit):**
+- `build_parse.rs`: add `VariantSpec { stem, name, flags }`; parse `[[variants]]`
+  as a 3rd return of `parse_kernel_toml`.
+- `build.rs`: add `Target.variants`; in the compile loop emit one `CompileJob`
+  per variant — `out_file` gets a `__{name}` slug (so each blob is distinct), the
+  cache key `extend`s the variant flags before sorting (flag-aware dedup already
+  correct), `extra_flags` chains target + variant flags. Loop B emits N
+  `(slug, name)` tuples per variant stem.
+- `build_codegen.rs`: **no change** — it already iterates the `(stem, module)`
+  list generically; distinct module names → distinct Rust consts + registry
+  entries.
+- Runtime (`registry.rs`): **no change** — keys by module name, resolves the
+  symbol inside. Confirmed the `cuModuleGetFunction` symbol (`paged_decode_attn_
+  fibquant`) is identical across `-D` compilations.
+- Remove the now-redundant `[modules] paged_decode_attn_fibquant = ...` lines
+  once a stem moves to `[[variants]]`.
+
+**FibQuant-side changes (mechanical, follow from #1+#2):**
+- `kv_cache.rs`: `FibQuant4x`/`FibQuant8x` variants + Display/FromStr
+  (`fibquant4x`/`fibquant8x`); `block_bytes_dims` arms
+  (`n_vecs * (2 + hd/k)`); keep `kv_pair()` symmetric.
+- `init_kernel_dispatch.rs` + `kernel_requirements.rs` + the other exhaustive
+  sites: arms per variant routing to `paged_decode_fibquant_{4x,8x}` etc.
+- `init.rs`: build the codebook with the variant's `(k, N)` (the #1+#2 upload
+  mechanism already parameterizes — just pass `k`/`N` from the variant).
+- The 3 `.cu` kernels: unchanged source (they already use `FIB_K`/`FIB_N`
+  macros); only compiled N times with different `-D`.
+- Validate each shipped rate on the recall grid + the #3 quality gate before
+  merge (4× expected best; 8× already validated = current FibQuant).
+
 ## Step 1 results (fidelity spike — DONE, mechanism validated)
 
 Pure-Rust reference in `crates/atlas-quant/src/fibquant/` (codebook = Beta-
