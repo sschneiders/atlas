@@ -230,6 +230,45 @@ prefill (write + prefill-attn) + decode + CUDA-graph path at 51 tok/s. The
 blind-written `.cu` kernels (write/decode/prefill, all cloning the Turbo4 path
 with the FibQuant codebook gather) are functionally correct on the first run.
 
+## Production-hardening progress (issues #1–#10)
+
+Done & gb10-verified:
+- **#1+#2 (per-head_dim codebook + SSOT):** the codebook is no longer a
+  hardcoded hd=256 `__constant__`; it is built at model-init from `atlas-quant`
+  for the layer's actual `head_dim`, uploaded as a 4 KB device buffer, and passed
+  to every kernel. Any `head_dim` now correct; the drift-prone checked-in `.cuh`
+  is deleted. (Verified: "What is 2+2?"→"4" identical before/after.)
+- **#4 (split-K decode):** `paged_decode_attn_splitk_fibquant` + reuse of the
+  dtype-independent `paged_decode_attn_reduce_nvfp4`; `run_paged_decode` picks
+  split-K when `num_splits > 1` (mirrors NVFP4). Long-context (8K–16K) decode.
+- **#9 (HSS host dequant):** `dequant_fibquant_block_to_bf16` + host codebook
+  mirror; `--high-speed-swap` works for FibQuant (unbounded-context paging of
+  compressed blocks), no longer bails.
+- **#10 (MLA guard):** FibQuant + MLA fails fast at build (MLA decode reads the
+  absorbed latent as BF16 — incompatible with FibQuant). Scoped to FibQuant.
+- **#3 (quality gate):** greedy generation-agreement vs bf16 = **8/8
+  exact-match, token-Jaccard 1.000** on diverse prompts — no detectable quality
+  regression. Tool: `tests/fibquant_quality.py`. (True WikiText PPL is a
+  follow-up: needs `/v1/completions` per-token logprobs, which Atlas's
+  completions endpoint doesn't currently return.)
+
+Remaining (perf / feature / blocked — separate focused efforts):
+- **#5 (BR=128 + batched prefill variants):** only the BR=64 prefill shim
+  exists; `(FibQuant, _)` always routes to it. Add the BR=128 + batched shims
+  (clone the fp8 ones) for small-`q_len` / multi-seq serving throughput.
+- **#6 (kernel micro-opt):** the write kernel's nearest-codeword search is
+  brute-force O(N); decode re-reads the norm per lane; `payload=2+hd/4` is
+  unaligned. Profile vs Turbo4, then: vectorized `uint4` index loads, norm
+  broadcast, payload alignment, the paper's hierarchical list decoding (App. F).
+  Needs a profiling session — not safe to do blind.
+- **#7 (tunable rate):** v1 is fixed k=4,N=256 (8×). `FIB_K`/`FIB_N` are
+  compile-time `#define`s in the kernels, so a runtime rate needs either
+  multiple compiled variants (like Turbo{2,3,4,8}) or parameterizing the
+  dequant. Largest remaining piece; design before implementing.
+- **#8 (V policy):** empirically compare symmetric FibQuant vs K=FibQuant/V=fp8
+  on PPL — **blocked on #7** (needs an asym variant first). Step 1 measured both
+  K+V; V lacks K's softmax robustness so may want a different rate.
+
 ## Step 1 results (fidelity spike — DONE, mechanism validated)
 
 Pure-Rust reference in `crates/atlas-quant/src/fibquant/` (codebook = Beta-
