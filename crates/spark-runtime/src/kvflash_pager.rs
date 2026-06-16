@@ -104,6 +104,15 @@ pub struct KvflashPager {
     /// documented MVP quality limitation. Attached via [`set_scorer`] /
     /// [`KvflashPager::set_scorer`].
     scorer: Option<Box<dyn crate::kvflash_scorer::KvFlashScorer>>,
+    /// Stashed PREFILL last-token Q (host, BF16→f32) for the attention
+    /// keep-set. Captured during prefill (when the full context is visible)
+    /// by [`KvflashPager::capture_prefill_q`]; consumed once at first
+    /// eviction by [`KvflashPager::compute_attention_keep_set`]. Single-slot
+    /// (KVFlash decode paging is single-stream); `None` until prefill runs.
+    prefill_q: Option<Vec<f32>>,
+    prefill_q_nq: usize,
+    prefill_q_nkv: usize,
+    prefill_q_hd: usize,
     slots: HashMap<usize, SlotState>,
 }
 
@@ -119,6 +128,10 @@ impl KvflashPager {
             num_layers,
             compact,
             scorer: None,
+            prefill_q: None,
+            prefill_q_nq: 0,
+            prefill_q_nkv: 0,
+            prefill_q_hd: 0,
             slots: HashMap::new(),
         }
     }
@@ -153,6 +166,46 @@ impl KvflashPager {
         if let Some(s) = self.scorer.as_mut() {
             s.capture_q(q, num_q_heads, head_dim, gpu, stream);
         }
+    }
+
+    /// Capture the PREFILL last-token Query (host, BF16→f32) for the attention
+    /// keep-set. Called from the prefill attention path (one chosen layer, the
+    /// final prompt token) — the question's retrieval query, computed while the
+    /// full context is visible. Consumed once at first eviction by
+    /// [`Self::compute_attention_keep_set`] to pin the blocks this query
+    /// attends to. `copy_d2h_on_stream` on the model stream keeps the read
+    /// ordered after the Q write. No-op effect when the keep-set is disabled.
+    pub fn capture_prefill_q(
+        &mut self,
+        q: DevicePtr,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) {
+        let nq = num_q_heads as usize;
+        let nkv = num_kv_heads as usize;
+        let hd = head_dim as usize;
+        let bytes = nq * hd * 2;
+        let mut buf = vec![0u8; bytes];
+        if gpu.copy_d2h_on_stream(q, &mut buf, stream).is_err() {
+            return;
+        }
+        let qf: Vec<f32> = (0..nq * hd)
+            .map(|i| {
+                let bits = u16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]) as u32;
+                f32::from_bits(bits << 16)
+            })
+            .collect();
+        tracing::debug!(
+            "kvflash captured prefill Q: nq={nq} nkv={nkv} hd={hd} ({} floats)",
+            qf.len()
+        );
+        self.prefill_q = Some(qf);
+        self.prefill_q_nq = nq;
+        self.prefill_q_nkv = nkv;
+        self.prefill_q_hd = hd;
     }
 
     /// The resolved KVFlash config (read-only accessor for callers that need
@@ -830,6 +883,23 @@ pub fn set_scorer(scorer: Box<dyn crate::kvflash_scorer::KvFlashScorer>) {
 pub fn capture_q(q: DevicePtr, num_q_heads: u32, head_dim: u32, gpu: &dyn GpuBackend, stream: u64) {
     let _ = with_local(|p| {
         p.capture_q(q, num_q_heads, head_dim, gpu, stream);
+        Ok(())
+    });
+}
+
+/// Capture the prefill last-token Q to the thread-local pager (attention
+/// keep-set). Called from the prefill attention path for the chosen layer's
+/// final prompt token. No-op when no pager is installed.
+pub fn capture_prefill_q(
+    q: DevicePtr,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    gpu: &dyn GpuBackend,
+    stream: u64,
+) {
+    let _ = with_local(|p| {
+        p.capture_prefill_q(q, num_q_heads, num_kv_heads, head_dim, gpu, stream);
         Ok(())
     });
 }

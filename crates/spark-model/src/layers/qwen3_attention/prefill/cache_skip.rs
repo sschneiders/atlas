@@ -308,6 +308,13 @@ impl Qwen3AttentionLayer {
             .map_err(|e| anyhow::anyhow!("rope failed: {e}"))?;
         }
 
+        // KVFlash prefill Q-capture: stash this chunk's LAST prompt-token Q
+        // (chosen layer = 0) for the attention keep-set (see paged.rs).
+        if self.attn_layer_idx == 0 && num_tokens > 0 {
+            let last_q = q_contiguous.offset((num_tokens - 1) * q_dim * bf16);
+            spark_runtime::kvflash_pager::capture_prefill_q(last_q, nq, nkv, hd, ctx.gpu, stream);
+        }
+
         // ATLAS_OP_DUMP: k AFTER RoPE (final K that gets written to KV cache).
         if num_tokens > 0 {
             let kv_dim_e = (nkv * hd) as usize;
