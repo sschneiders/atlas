@@ -34,6 +34,21 @@ pub trait KvFlashScorer: Send {
         _stream: u64,
     ) {
     }
+    /// Project an about-to-be-evicted block's K into the scorer's low-rank K
+    /// store so the block stays scoreable for recall after it is paged out.
+    /// Called by the pager's eviction path once per (layer, block), right
+    /// after the K is read back to host. `k_host` is the raw K bytes for one
+    /// layer's block (FP8 for FP8 caches, BF16 for BF16 caches); a relevance
+    /// scorer dequantizes as needed and projects into its store. Default:
+    /// no-op (recency scorers don't project).
+    fn project_evicted_block(
+        &mut self,
+        _layer: usize,
+        _block_id: u32,
+        _k_host: &[u8],
+        _gpu: &dyn GpuBackend,
+    ) {
+    }
 }
 
 /// Recency-only scorer (the default and the fallback when no drafter is

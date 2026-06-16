@@ -289,7 +289,6 @@ impl KvflashPager {
         // blocks appended by the decode loop since the last step are tracked
         // (resident) before eviction planning. Cheap no-op when unchanged.
         self.sync_to_len(slot, block_table.len());
-        let num_layers = self.num_layers;
         let victims = self.pick_eviction_victims(slot, pool_blocks);
         if victims.is_empty() {
             return Ok(0);
@@ -301,11 +300,9 @@ impl KvflashPager {
                 break;
             }
             let physical = block_table[l];
-            // Read K/V per layer from GPU into host buffers.
-            let mut layers_kv = Vec::with_capacity(num_layers);
-            for layer in 0..num_layers {
-                layers_kv.push(kv_cache.read_block(layer, physical, gpu)?);
-            }
+            // Read K/V per layer + project into the scorer's low-rank store
+            // so the block stays scoreable for recall after page-out.
+            let layers_kv = self.read_block_layers(physical, kv_cache, gpu)?;
             // Free the GPU block (bypasses ref-counting: the pager owns it).
             kv_cache.return_evicted_block(physical);
             // Stash the host copy + repoint the table at the zeroed dummy.
@@ -337,12 +334,9 @@ impl KvflashPager {
         if l >= block_table.len() {
             return Ok(false);
         }
-        let num_layers = self.num_layers;
         let physical = block_table[l];
-        let mut layers_kv = Vec::with_capacity(num_layers);
-        for layer in 0..num_layers {
-            layers_kv.push(kv_cache.read_block(layer, physical, gpu)?);
-        }
+        // Read K/V per layer + project into the scorer's low-rank store.
+        let layers_kv = self.read_block_layers(physical, kv_cache, gpu)?;
         kv_cache.return_evicted_block(physical);
         let dummy = match self.slots.get_mut(&slot) {
             Some(st) => {
@@ -354,6 +348,33 @@ impl KvflashPager {
         };
         block_table[l] = dummy;
         Ok(true)
+    }
+
+    /// Read one physical block's per-layer K/V back from the GPU into host
+    /// buffers, and (if a scorer is attached) project each layer's K into the
+    /// scorer's low-rank K store so the block stays scoreable for recall after
+    /// it is paged out. The projection is the relevance signal for recall: a
+    /// paged-out block whose low-rank K was captured here can later be ranked
+    /// by the scorer and paged back in. No-op projection when no scorer is
+    /// attached (pure-LRU). Shared by [`Self::evict_to_capacity`] and
+    /// [`Self::page_out_one`] (SSOT for the read-back path).
+    fn read_block_layers(
+        &mut self,
+        physical: u32,
+        kv_cache: &mut PagedKvCache,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Vec<HostKvLayer>> {
+        let num_layers = self.num_layers;
+        let mut layers_kv = Vec::with_capacity(num_layers);
+        for layer in 0..num_layers {
+            layers_kv.push(kv_cache.read_block(layer, physical, gpu)?);
+        }
+        if let Some(s) = self.scorer.as_mut() {
+            for (layer, (k, _v)) in layers_kv.iter().enumerate() {
+                s.project_evicted_block(layer, physical, k, gpu);
+            }
+        }
+        Ok(layers_kv)
     }
 
     /// Page a single logical block BACK INTO the GPU pool (recall). Allocates a
