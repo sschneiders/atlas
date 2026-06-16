@@ -186,6 +186,7 @@ impl KvflashPager {
     /// after the Q write. Stashed as `[ntok, nq, hd]`; consumed by
     /// [`Self::compute_attention_keep_set`] to aggregate the question tokens'
     /// attention over all blocks.
+    #[allow(clippy::too_many_arguments)]
     pub fn capture_prefill_q(
         &mut self,
         q_base: DevicePtr,
@@ -1080,6 +1081,7 @@ pub fn capture_q(q: DevicePtr, num_q_heads: u32, head_dim: u32, gpu: &dyn GpuBac
 /// keep-set). Called from the prefill attention path (last layer). `q_base` is
 /// the per-chunk Q buffer base ([num_tokens, nq, hd] BF16); the last
 /// `PREFILL_Q_WINDOW` tokens are stashed. No-op when no pager is installed.
+#[allow(clippy::too_many_arguments)]
 pub fn capture_prefill_q(
     q_base: DevicePtr,
     num_tokens: u32,
