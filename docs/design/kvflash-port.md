@@ -296,3 +296,110 @@ ssh gb10 'cd ~/dev/public/atlas && python3 tests/test_kvflash_validation.py --ur
 ```
 **Success**: `needle recall: {'shallow': 'HIT', ...}` (was MISS) + `decode flatness ~0.9`.
 
+---
+
+# SESSION 2 RESULTS — PredictorScorer wired, flatness held, recall blocked
+
+Branch tip: `feat/kvflash-9-drafter-scorer`. Steps 1-3 landed + compile-clean
+on the gb10 (real CUDA, `cargo clippy -Dwarnings` across spark-runtime /
+spark-model / spark-server). Step 4 (FP8 dequant) is NOT done — the A3B was
+validated with `--kv-cache-dtype bf16` instead (BF16 KV path in the scorer).
+
+## What works
+
+- **Decode flatness 0.92-0.93 held** with the scorer attached (BF16 KV,
+  `--kvflash 1024 --kvflash-compact`). This is the headline KVFlash benefit
+  and it is NOT regressed by the scorer. A/B-confirmed: same config with
+  `ATLAS_KVFLASH_NO_SCORER=1` (scorer disabled) is 0.93; with scorer 0.92.
+- The full plumbing is live and dormant-safe: Q-capture hook, eviction-time
+  projection into A_g, resident-block refresh, score-driven reselect,
+  PredictorScorer attached in `install_kvflash`. Smoke test passes.
+
+## Recall is BLOCKED — root cause diagnosed (NOT a plumbing bug)
+
+`shallow` (and `deep`) needle stay **MISS** with the scorer. Diagnosis:
+
+- The Predictor's per-block scores are **uniformly ~30-40** across ALL blocks
+  (filler + needle). The argmax jumps around randomly and is **never the
+  needle block**. So `plan_reselect` recalls the wrong paged-out chunks.
+- This is **not** the cross-stream `k_scratch` race (that was real and is
+  fixed — `stream_sync` after each projection kernel — but the score
+  distribution was already uniform before and after). Verified by the
+  `score_chunks argmax` debug log.
+- It is **not** the capture layer (tried layer 0 and layer 9 — same uniform
+  distribution).
+- It is the **fundamental reactive-recall limitation**: the decode Q only
+  aligns with a paged-out chunk if the model is already "attending toward"
+  it. Once the needle is paged out the model can't attend to it, so the
+  decode Q doesn't reflect it, so `Q·K_lowrank` doesn't rank it high, so it
+  isn't recalled. The HSS Predictor was designed for proactive *eviction*
+  (which blocks to drop); it does not provide a signal that can *find*
+  unseen content. Q-driven relevance cannot anticipate future relevance.
+
+## What it took to keep flatness at 0.92 (three fixes on top of step 3)
+
+1. **Cap per-reselect swap to 8** (`reselect`, NOT `plan_reselect` — the
+   pure planner + its 4 unit tests are untouched). `plan_reselect` aims for
+   the full top-pool each call, but scores move with each decode Q so an
+   unbounded swap churned 50/50 blocks every τ → 5x decode slowdown
+   (flatness 0.22). Cap → gradual convergence → flatness restored.
+2. **Zero A_g at construction** (cuMemAlloc doesn't zero) so unprojected
+   blocks score exactly 0 instead of garbage (which churned on noise).
+3. **`first_reselect_pending`**: fire reselect on the FIRST decode step
+   (right after the prefill question) in addition to every τ, so a relevant
+   paged-out chunk is recalled before the answer is generated.
+4. **`mark_projected` in the eviction path** so a recalled block isn't
+   re-projected every reselect.
+5. (Race fix) **`stream_sync` after each projection kernel** so each block's
+   kernel reads its own `k_scratch`.
+
+## Status of the 5 steps
+
+- Step 1 (Q-capture): DONE.
+- Step 2 (A_g population at eviction): DONE (uses logical block id).
+- Step 3 (PredictorScorer): DONE (BF16 path).
+- Step 4 (FP8 dequant): NOT DONE. The scorer's `project_bf16` skips non-BF16
+  K (score ~0). For the A3B's default FP8 KV, dequant is needed. The FP8
+  scale lives on the attention layer (`Qwen3AttentionLayer::effective_fp8_scales`
+  → `self.attn.k_scale`), NOT on the cache — needs a bridge (capture via the
+  Q-capture hook, or a model accessor) to reach the scorer.
+- Step 5 (wire + validate): wiring DONE; validation PARTIAL (flatness ✓,
+  recall ✗).
+
+## Next steps for recall (the open problem)
+
+The Q-driven Predictor score can't find unseen paged-out content. Options to
+explore, in rough order of promise:
+
+1. **Proactive diverse retention** instead of reactive recall: keep a
+   rolling diverse sample of paged-out chunks resident (not just Q-relevant
+   ones) so the needle has a chance to be in-window when asked. Trade some
+   pool slots for recall coverage.
+2. **On-demand re-prefetch**: when the model's decode logits show
+   uncertainty / a "looking-back" pattern (e.g. lookback lens spike),
+   re-prefetch a span of paged-out chunks. Heuristic, not Q-driven.
+3. **Score normalization / rank tuning**: the uniform ~30-40 scores suggest
+   the dot product is magnitude-dominated. A cosine-like score (normalize
+   A_g per block) or higher rank *might* discriminate — but r=64 already
+   costs ~1.7-3.4 GB of A_g on the A3B, and the chicken-and-egg argument
+   above suggests the signal isn't there to find. Low promise.
+4. **Re-examine the FlashMemory paper's recall mechanism** (arXiv:2606.09079)
+   — KVFlash is based on it; it may use a non-Q-driven recall we haven't
+   ported.
+
+## gb10 validation commands (current)
+
+```bash
+# wildcard rebuild (the default cargo build only does qwen3-next-80b-a3b):
+ssh gb10 'cd ~/dev/public/atlas && PATH=/usr/local/cuda/bin:$PATH ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=* ATLAS_TARGET_QUANT=* cargo build --release 2>&1 | tail -3'
+# A3B + scorer + BF16 KV (FP8 needs step 4):
+ssh gb10 'cd ~/dev/public/atlas && pkill -f "spark serve"; nohup target/release/spark serve Qwen/Qwen3.6-35B-A3B-FP8 --kvflash 1024 --kvflash-compact --kv-cache-dtype bf16 --port 8888 > /tmp/kv_srv.log 2>&1 &'
+ssh gb10 'cd ~/dev/public/atlas && python3 tests/test_kvflash_validation.py --url http://localhost:8888 --pool 1024'
+# A/B isolation (scorer off = pure LRU baseline):
+ssh gb10 'cd ~/dev/public/atlas && ATLAS_KVFLASH_NO_SCORER=1 target/release/spark serve ...'
+```
+NB: ssh quoting from PowerShell is brutal — write scripts to /tmp on the
+gb10 (scp a .sh) instead of inline heredocs. nvcc is at `/usr/local/cuda/bin`
+but NOT on PATH in non-interactive ssh shells, so prefix `PATH=...:$PATH`
+for any build (cudarc's build script needs `nvcc --version`).
+
