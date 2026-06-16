@@ -55,6 +55,47 @@ pub fn reshape_and_cache_nvfp4(
         .launch(stream)
 }
 
+/// Write K/V to a FibQuant paged cache (WHT applied on the host before this
+/// kernel). Stores `{bf16 norm, 1-byte codebook indices}` per vector; no
+/// separate scale section, so this takes no `data_section_bytes`.
+/// Kernel: `reshape_and_cache_flash_fibquant(key, value, k_cache, v_cache,
+///          slot_mapping, num_kv_heads, head_dim, block_size,
+///          key_stride, value_stride, block_stride_bytes)`
+/// Grid: (num_tokens * num_kv_heads, 1, 1)  Block: (128, 1, 1)
+pub fn reshape_and_cache_fibquant(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    key: DevicePtr,
+    value: DevicePtr,
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    slot_mapping: DevicePtr,
+    num_tokens: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    block_size: u32,
+    key_stride: u32,
+    value_stride: u32,
+    block_stride_bytes: u64,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_tokens * num_kv_heads, 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(slot_mapping)
+        .arg_u32(num_kv_heads)
+        .arg_u32(head_dim)
+        .arg_u32(block_size)
+        .arg_u32(key_stride)
+        .arg_u32(value_stride)
+        .arg_u64(block_stride_bytes)
+        .launch(stream)
+}
+
 /// Compute max absolute value of a BF16 buffer into a device-side f32.
 ///
 /// Used for FP8 KV cache online scale calibration: accumulates max |K| and

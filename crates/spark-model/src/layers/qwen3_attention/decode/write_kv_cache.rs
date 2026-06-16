@@ -460,6 +460,51 @@ impl Qwen3AttentionLayer {
                     _ => unreachable!(),
                 }
             }
+            KvCacheDtype::FibQuant => {
+                // WHT bookend reused from the turbo dtypes (`is_wht_rotated()`
+                // is true): rotate K and V before FibQuant's vector-codebook
+                // quantize, so <WHT(Q), WHT(K)> = <Q,K> (Parseval) and the
+                // decode bookend (WHT(Q) / iWHT(out)) preserves attention.
+                let weight_pre_rotated = std::env::var("TQ_PLUS_WEIGHT_ROTATION")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if !weight_pre_rotated
+                    && self.wht_bf16_k.0 != 0
+                    && (head_dim == 128 || head_dim == 256 || head_dim == 512)
+                {
+                    use spark_runtime::kernel_args::KernelLaunch;
+                    let total_heads = num_kv_heads * num_tokens;
+                    KernelLaunch::new(gpu, self.wht_bf16_k)
+                        .grid([total_heads, 1, 1])
+                        .block([32, 1, 1])
+                        .arg_ptr(k)
+                        .arg_u32(head_dim)
+                        .launch(stream)?;
+                    KernelLaunch::new(gpu, self.wht_bf16_k)
+                        .grid([total_heads, 1, 1])
+                        .block([32, 1, 1])
+                        .arg_ptr(v)
+                        .arg_u32(head_dim)
+                        .launch(stream)?;
+                }
+                ops::reshape_and_cache_fibquant(
+                    gpu,
+                    self.reshape_cache_k,
+                    k,
+                    v,
+                    kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    slot,
+                    num_tokens,
+                    num_kv_heads,
+                    head_dim,
+                    block_size,
+                    key_stride,
+                    value_stride,
+                    kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
+                    stream,
+                )
+            }
             KvCacheDtype::Bf16 => ops::reshape_and_cache(
                 gpu,
                 self.reshape_cache_k,
