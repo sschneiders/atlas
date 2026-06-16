@@ -67,7 +67,27 @@ def main():
     nq = cfg.num_attention_heads
     nkv = cfg.num_key_value_heads
     hd = cfg.head_dim if hasattr(cfg, "head_dim") else (cfg.hidden_size // nq)
-    layer = model.model.layers[args.layer].self_attn
+    # The A3B is a hybrid (10 full-attention + 30 SSM layers); only attention
+    # layers expose `self_attn.q_proj`. Scan for the first such layer at/after
+    # `args.layer` (or the first overall) so any hybrid pattern works.
+    n_layers = len(model.model.layers)
+    attn_idx = next(
+        (
+            i
+            for i in range(args.layer, n_layers)
+            if hasattr(model.model.layers[i], "self_attn")
+            and hasattr(model.model.layers[i].self_attn, "q_proj")
+        ),
+        None,
+    )
+    if attn_idx is None:
+        attn_idx = next(
+            i
+            for i in range(n_layers)
+            if hasattr(model.model.layers[i], "self_attn")
+            and hasattr(model.model.layers[i].self_attn, "q_proj")
+        )
+    layer = model.model.layers[attn_idx].self_attn
     rotary = model.model.rotary_emb
     dev = layer.q_proj.weight.device
 
@@ -119,7 +139,7 @@ def main():
         f.write(bf16_bytes(q))
 
     print(f"wrote {args.out}: d={hd} nkv={nkv} nq={nq} T={T} "
-          f"(model_type={cfg.model_type}, layer={args.layer})")
+          f"(model_type={cfg.model_type}, attn_layer={attn_idx})")
 
 
 if __name__ == "__main__":
