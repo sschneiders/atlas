@@ -60,6 +60,7 @@ const ALL_VARIANTS: &[KvCacheDtype] = &[
     KvCacheDtype::Fp8KTurbo4V,
     KvCacheDtype::Fp8KTurbo3V,
     KvCacheDtype::Fp8KTurbo2V,
+    KvCacheDtype::FibQuant4x,
 ];
 
 const ASYM_VARIANTS: &[KvCacheDtype] = &[
@@ -82,6 +83,7 @@ const SYM_VARIANTS: &[KvCacheDtype] = &[
     KvCacheDtype::Turbo3,
     KvCacheDtype::Turbo2,
     KvCacheDtype::Turbo8,
+    KvCacheDtype::FibQuant4x,
 ];
 
 #[test]

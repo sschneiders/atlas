@@ -101,6 +101,16 @@ pub(super) fn required_optional_kernels_for_dtype(
                 "inferspark_prefill_paged_fibquant",
             ));
         }
+        KvCacheDtype::FibQuant4x => {
+            // FibQuant 4× rate: same WHT + codebook mechanism as FibQuant (8×),
+            // recompiled into `*_4x` modules via `[[variants]]`. Requires the
+            // `_4x` chunked-prefill module (same `inferspark_prefill_paged_fibquant`
+            // symbol, distinct module). WHT bookend gate below fires identically.
+            req.push((
+                "prefill_paged_fibquant_4x",
+                "inferspark_prefill_paged_fibquant",
+            ));
+        }
         KvCacheDtype::Bf16 | KvCacheDtype::Fp8 | KvCacheDtype::Nvfp4 => {}
     }
     // WHT rotation bookends: the write path stores turbo cache contents in
@@ -199,7 +209,9 @@ mod tests {
         }
         // FibQuant needs its own chunked-prefill kernel AND (like the turbo
         // dtypes) the WHT bookends — it reuses `wht_bf16` for the rotation,
-        // validated Haar-equivalent on real KV in Step 1.
+        // validated Haar-equivalent on real KV in Step 1. FibQuant4x (k=2, 4×)
+        // shares the same mechanism (recompiled into `*_4x` modules), so it
+        // must satisfy the same requirements with its own `_4x` prefill module.
         let fq_req = required_optional_kernels_for_dtype(KvCacheDtype::FibQuant, 256);
         assert!(
             fq_req.iter().any(|(m, _)| *m == "prefill_paged_fibquant"),
@@ -210,6 +222,19 @@ mod tests {
                 .iter()
                 .any(|(m, f)| *m == "wht_bf16" && *f == "wht_bf16_inplace"),
             "FibQuant must require the WHT bookends (it reuses wht_bf16)"
+        );
+        let fq4x_req = required_optional_kernels_for_dtype(KvCacheDtype::FibQuant4x, 256);
+        assert!(
+            fq4x_req
+                .iter()
+                .any(|(m, _)| *m == "prefill_paged_fibquant_4x"),
+            "FibQuant4x: requirement list missing prefill_paged_fibquant_4x"
+        );
+        assert!(
+            fq4x_req
+                .iter()
+                .any(|(m, f)| *m == "wht_bf16" && *f == "wht_bf16_inplace"),
+            "FibQuant4x must require the WHT bookends (same WHT mechanism as FibQuant)"
         );
     }
 
@@ -224,6 +249,7 @@ mod tests {
             KvCacheDtype::Turbo4,
             KvCacheDtype::Turbo8,
             KvCacheDtype::FibQuant,
+            KvCacheDtype::FibQuant4x,
         ] {
             assert!(d.is_wht_rotated(), "{d:?} must gate the WHT bookends");
         }

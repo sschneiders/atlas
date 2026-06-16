@@ -99,25 +99,38 @@ impl Qwen3AttentionLayer {
         // and upload a 4 KB device buffer once. Passed to every FibQuant kernel
         // as the trailing `fibq_codebook` arg. The same f32 words are retained
         // in `fibq_codebook_host` for the HSS host-side dequant path (issue #9).
-        // NULL + empty for non-FibQuant dtypes.
-        let (fibq_codebook_dev, fibq_codebook_host) = if kv_dtype == KvCacheDtype::FibQuant {
-            let codec = atlas_quant::fibquant::FibQuantCodec::new(
-                config.head_dim,
-                4,
-                256,
-                0xF1B0_0A0B_7041,
-            );
-            // SSOT: flatten the f64 codebook words to f32 once. This single
-            // Vec feeds both the device upload (via to_ne_bytes) and the host
-            // mirror used by `dequant_fibquant_block_to_bf16` for HSS.
-            let host_words: Vec<f32> = codec.codebook.words.iter().map(|v| *v as f32).collect();
-            let host_bytes: Vec<u8> = host_words.iter().flat_map(|w| w.to_ne_bytes()).collect();
-            let ptr = gpu.alloc(host_bytes.len())?;
-            gpu.copy_h2d(&host_bytes, ptr)?;
-            (ptr, host_words)
-        } else {
-            (spark_runtime::gpu::DevicePtr::NULL, Vec::new())
-        };
+        // NULL + empty for non-FibQuant dtypes. Both rates share this path:
+        // FibQuant (8×) uses k=4 (FIBQUANT_K), FibQuant4x (4×) uses k=2
+        // (FIBQUANT_4X_K) — the codebook shape (N × k) differs per rate but the
+        // build + upload flow is identical.
+        let (fibq_codebook_dev, fibq_codebook_host) =
+            if kv_dtype == KvCacheDtype::FibQuant || kv_dtype == KvCacheDtype::FibQuant4x {
+                // k = 4 for the 8× rate, k = 2 for the 4× rate. Must match the
+                // `-DFIB_K` the corresponding `_4x` (or default) module was
+                // compiled with (KERNEL.toml `[[variants]]`) and the host-side
+                // dequant (`dequant_fibquant_block_to_bf16`).
+                let fibq_k = if kv_dtype == KvCacheDtype::FibQuant {
+                    4
+                } else {
+                    2
+                };
+                let codec = atlas_quant::fibquant::FibQuantCodec::new(
+                    config.head_dim,
+                    fibq_k,
+                    256,
+                    0xF1B0_0A0B_7041,
+                );
+                // SSOT: flatten the f64 codebook words to f32 once. This single
+                // Vec feeds both the device upload (via to_ne_bytes) and the host
+                // mirror used by `dequant_fibquant_block_to_bf16` for HSS.
+                let host_words: Vec<f32> = codec.codebook.words.iter().map(|v| *v as f32).collect();
+                let host_bytes: Vec<u8> = host_words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+                let ptr = gpu.alloc(host_bytes.len())?;
+                gpu.copy_h2d(&host_bytes, ptr)?;
+                (ptr, host_words)
+            } else {
+                (spark_runtime::gpu::DevicePtr::NULL, Vec::new())
+            };
         Ok(Self {
             input_norm,
             attn,
@@ -341,6 +354,12 @@ impl Qwen3AttentionLayer {
                 KvCacheDtype::FibQuant => {
                     Some(gpu.kernel("paged_decode_fibquant", "paged_decode_attn_splitk_fibquant")?)
                 }
+                // FibQuant4x: same split-K symbol, resolved in the `_4x` module
+                // (compiled with `-DFIB_K=2` via KERNEL.toml `[[variants]]`).
+                KvCacheDtype::FibQuant4x => Some(gpu.kernel(
+                    "paged_decode_fibquant_4x",
+                    "paged_decode_attn_splitk_fibquant",
+                )?),
                 KvCacheDtype::Turbo3
                 | KvCacheDtype::Turbo4
                 | KvCacheDtype::Turbo8
@@ -364,7 +383,7 @@ impl Qwen3AttentionLayer {
                 // output — it never reads the KV cache. FibQuant therefore
                 // reuses the compiled NVFP4 reduce symbol verbatim (the split-K
                 // FibQuant kernel writes partials in the identical layout).
-                KvCacheDtype::FibQuant => {
+                KvCacheDtype::FibQuant | KvCacheDtype::FibQuant4x => {
                     Some(gpu.kernel("paged_decode_nvfp4", "paged_decode_attn_reduce_nvfp4")?)
                 }
                 KvCacheDtype::Turbo3
@@ -444,6 +463,14 @@ impl Qwen3AttentionLayer {
             prefill_attn_paged_fibquant_k: super::super::try_kernel(
                 gpu,
                 "prefill_paged_fibquant",
+                "inferspark_prefill_paged_fibquant",
+            ),
+            // FibQuant 4× rate prefill handle: same symbol as the 8× handle
+            // (`inferspark_prefill_paged_fibquant`), resolved in the
+            // `prefill_paged_fibquant_4x` module (compiled with `-DFIB_K=2`).
+            prefill_attn_paged_fibquant_4x_k: super::super::try_kernel(
+                gpu,
+                "prefill_paged_fibquant_4x",
                 "inferspark_prefill_paged_fibquant",
             ),
             prefill_attn_paged_turbo2_64_k: super::super::try_kernel(

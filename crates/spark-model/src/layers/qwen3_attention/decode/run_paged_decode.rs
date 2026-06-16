@@ -185,11 +185,14 @@ impl Qwen3AttentionLayer {
             // basic kernel underutilizes the GPU (long seqs, few heads), write
             // f32 partials to `workspace`, then merge with the shared
             // dtype-independent reduce kernel. hd=256 codebook.
-            KvCacheDtype::FibQuant => {
+            KvCacheDtype::FibQuant | KvCacheDtype::FibQuant4x => {
                 // Split count derived from the configured max batch (constant),
                 // not the runtime co-batched count, so a sequence's reduction
                 // tree is identical alone vs co-batched (determinism fix — same
-                // as NVFP4).
+                // as NVFP4). Both FibQuant rates share this arm: `paged_decode_k`
+                // + `paged_decode_splitk_k` are routed by dispatch / init to the
+                // `*_4x` modules for FibQuant4x (k=2); `fibq_codebook_dev`
+                // carries the variant-matched codebook.
                 let current_ctas = num_q_heads * super::super::split_ref_seqs(num_seqs);
                 let num_splits = if current_ctas >= NUM_SMS {
                     1u32

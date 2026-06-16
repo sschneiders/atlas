@@ -460,11 +460,14 @@ impl Qwen3AttentionLayer {
                     _ => unreachable!(),
                 }
             }
-            KvCacheDtype::FibQuant => {
+            KvCacheDtype::FibQuant | KvCacheDtype::FibQuant4x => {
                 // WHT bookend reused from the turbo dtypes (`is_wht_rotated()`
                 // is true): rotate K and V before FibQuant's vector-codebook
                 // quantize, so <WHT(Q), WHT(K)> = <Q,K> (Parseval) and the
                 // decode bookend (WHT(Q) / iWHT(out)) preserves attention.
+                // Both rates share this arm: `reshape_cache_k` is routed by
+                // dispatch to the `*_4x` module for FibQuant4x (k=2), and
+                // `fibq_codebook_dev` carries the variant-matched codebook.
                 let weight_pre_rotated = std::env::var("TQ_PLUS_WEIGHT_ROTATION")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);

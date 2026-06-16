@@ -173,6 +173,18 @@ pub(super) fn kernel_modules_for_dtype(
             "paged_decode_fibquant",
             "paged_decode_attn_fibquant",
         ),
+        // FibQuant 4× rate: same `.cu` sources recompiled with `-DFIB_K=2`
+        // into `*_4x` modules (see KERNEL.toml `[[variants]]`). The kernel
+        // *symbol* names are identical across variants (only FIB_K differs),
+        // so the reshape/decode *function* names stay the same as FibQuant's —
+        // only the *module* names carry the `_4x` suffix. The runtime resolves
+        // the same symbol in each (distinct) module.
+        KvCacheDtype::FibQuant4x => (
+            "reshape_and_cache_fibquant_4x",
+            "reshape_and_cache_flash_fibquant",
+            "paged_decode_fibquant_4x",
+            "paged_decode_attn_fibquant",
+        ),
     }
 }
 
@@ -206,6 +218,7 @@ mod tests {
             KvCacheDtype::Turbo4KTurbo8V,
             KvCacheDtype::Turbo3KTurbo8V,
             KvCacheDtype::FibQuant,
+            KvCacheDtype::FibQuant4x,
         ];
         for &d in ALL {
             for &hd in &[128usize, 256] {

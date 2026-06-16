@@ -174,7 +174,9 @@ pub fn build_model(
     // latent as BF16 (`paged_decode_attn_bf16`), so a FibQuant cache would be
     // silently mis-decoded. Fail fast at build. (This is a pre-existing gap for
     // every non-BF16 dtype on MLA; scoped to FibQuant here.)
-    if config.kv_lora_rank > 0 && kv_dtype == KvCacheDtype::FibQuant {
+    if config.kv_lora_rank > 0
+        && (kv_dtype == KvCacheDtype::FibQuant || kv_dtype == KvCacheDtype::FibQuant4x)
+    {
         anyhow::bail!(
             "FibQuant KV cache is not supported for MLA models (kv_lora_rank > 0, e.g. \
              Mistral): the MLA decode kernel reads the absorbed latent as BF16. Use \
@@ -233,6 +235,7 @@ pub fn build_model(
             | KvCacheDtype::Fp8KTurbo2V => "FP8",
             KvCacheDtype::Nvfp4 => "NVFP4",
             KvCacheDtype::FibQuant => "FibQuant",
+            KvCacheDtype::FibQuant4x => "FibQuant4x",
             KvCacheDtype::Turbo3 | KvCacheDtype::Turbo3KTurbo8V | KvCacheDtype::Turbo2 => "Turbo3",
             KvCacheDtype::Turbo4 | KvCacheDtype::Turbo4KTurbo3V | KvCacheDtype::Turbo4KTurbo8V => {
                 "Turbo4"

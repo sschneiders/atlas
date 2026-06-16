@@ -20,6 +20,12 @@ pub(crate) const FIBQUANT_K: usize = 4;
 /// calibration); the same `(k, N, seed)` is shared by host (atlas-quant) and
 /// the `.cu` kernel (Step 3).
 pub(crate) const FIBQUANT_N: usize = 256;
+/// FibQuant 4× rate block dimension `k`. Same mechanism as `FIBQUANT_K` (8×)
+/// but k=2 halves the index count per vector → ~4× compression vs bf16 at a
+/// higher fidelity operating point. The `.cu` kernels are compiled a second
+/// time with `-DFIB_K=2` (the `[[variants]]` table in KERNEL.toml) into
+/// `*_4x` modules; the host codebook is built with this `k` at init.
+pub(crate) const FIBQUANT_4X_K: usize = 2;
 // The byte math in `block_bytes_dims` stores 1 byte per index; enforce the
 // `N ≤ 256` invariant it depends on.
 const _: () = assert!(FIBQUANT_N <= 256, "FibQuant index width assumes N <= 256");
@@ -95,6 +101,16 @@ pub enum KvCacheDtype {
     /// (the gap KVFlash paging could not close). See
     /// `docs/design/fibquant-kv-compression.md`.
     FibQuant,
+    /// FibQuant 4× rate: same WHT + radial-angular vector codebook mechanism
+    /// as `FibQuant` (8×) but at `k = FIBQUANT_4X_K = 2` (N=256), yielding
+    /// ~4× compression vs bf16 at a higher-fidelity operating point. The
+    /// `.cu` kernels are the same three sources, recompiled with `-DFIB_K=2`
+    /// into `*_4x` modules (see the `[[variants]]` table in
+    /// `kernels/gb10/common/KERNEL.toml`); runtime dispatch routes via
+    /// `KvCacheDtype::FibQuant4x`. Same WHT bookends + codebook-arg ABI as
+    /// `FibQuant`; only the codebook `k` (and thus the per-vector index
+    /// count + `block_bytes_dims` stride) differ.
+    FibQuant4x,
 }
 
 impl std::fmt::Display for KvCacheDtype {
@@ -117,6 +133,7 @@ impl std::fmt::Display for KvCacheDtype {
             KvCacheDtype::Bf16KTurbo2V => write!(f, "bf16k_turbo2v"),
             KvCacheDtype::Fp8KTurbo2V => write!(f, "fp8k_turbo2v"),
             KvCacheDtype::FibQuant => write!(f, "fibquant"),
+            KvCacheDtype::FibQuant4x => write!(f, "fibquant4x"),
         }
     }
 }
@@ -153,6 +170,7 @@ impl KvCacheDtype {
                 | KvCacheDtype::Turbo4
                 | KvCacheDtype::Turbo8
                 | KvCacheDtype::FibQuant
+                | KvCacheDtype::FibQuant4x
         )
     }
 
@@ -194,9 +212,10 @@ impl std::str::FromStr for KvCacheDtype {
             "bf16k_turbo2v" | "bf16k2v" => Ok(KvCacheDtype::Bf16KTurbo2V),
             "fp8k_turbo2v" | "fp8k2v" => Ok(KvCacheDtype::Fp8KTurbo2V),
             "fibquant" => Ok(KvCacheDtype::FibQuant),
+            "fibquant4x" => Ok(KvCacheDtype::FibQuant4x),
             other => bail!(
                 "Unsupported --kv-cache-dtype '{other}'. Symmetric: 'bf16', 'fp8', 'nvfp4', \
-                 'turbo4', 'turbo3', 'turbo8', 'fibquant'. \
+                 'turbo4', 'turbo3', 'turbo8', 'fibquant', 'fibquant4x'. \
                  Asymmetric (TQ+): turbo*_turbo*v, bf16k_turbo[34]v (safer asym: K baseline, V compressed), fp8k_turbo[34]v."
             ),
         }
@@ -300,6 +319,13 @@ impl KvCacheConfig {
                 // ~8× vs bf16 at k=4, N=256.
                 let n_vecs = self.block_size * nkv;
                 n_vecs * (2 + hd / FIBQUANT_K)
+            }
+            KvCacheDtype::FibQuant4x => {
+                // Same {fp16 norm, 1-byte indices} layout as FibQuant but at
+                // k = FIBQUANT_4X_K = 2 → twice the indices per vector → ~4×
+                // vs bf16 (vs ~8× at k=4). Same N=256 codebook.
+                let n_vecs = self.block_size * nkv;
+                n_vecs * (2 + hd / FIBQUANT_4X_K)
             }
         }
     }

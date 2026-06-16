@@ -43,7 +43,8 @@ impl Qwen3AttentionLayer {
                 | KvCacheDtype::Turbo3
                 | KvCacheDtype::Turbo4
                 | KvCacheDtype::Turbo8
-                | KvCacheDtype::FibQuant,
+                | KvCacheDtype::FibQuant
+                | KvCacheDtype::FibQuant4x,
         )
     }
 
@@ -292,7 +293,7 @@ impl Qwen3AttentionLayer {
                     dequant_turbo8_block_to_bf16(&k_raw, bs_us, nkv_us, hd_us, &mut k_host);
                     dequant_turbo8_block_to_bf16(&v_raw, bs_us, nkv_us, hd_us, &mut v_host);
                 }
-                KvCacheDtype::FibQuant => {
+                KvCacheDtype::FibQuant | KvCacheDtype::FibQuant4x => {
                     // Host-side FibQuant dequant (issue #9): the cache stores
                     // WHT-domain K/V as `{bf16 norm, 1-byte codebook indices}`
                     // per (token, kv_head). Gather codewords × norm on the host
@@ -301,6 +302,16 @@ impl Qwen3AttentionLayer {
                     // iWHT here. Same D2H shape as Turbo3/4/8: one
                     // `layer_block_bytes` pull per side into `k_raw`/`v_raw`,
                     // dequant into the `block_floats`-long BF16 host buffers.
+                    // Both rates share this arm; `k` must match the `-DFIB_K`
+                    // the module was compiled with (KERNEL.toml `[[variants]]`)
+                    // and the codebook built in init — 4 for FibQuant, 2 for
+                    // FibQuant4x. `fibq_codebook_host` carries the matching
+                    // row-major `[N, k]` codebook.
+                    let fibq_k = match layer_dtype {
+                        KvCacheDtype::FibQuant => 4,
+                        KvCacheDtype::FibQuant4x => 2,
+                        _ => unreachable!("FibQuant dequant arm guards FibQuant|FibQuant4x"),
+                    };
                     let mut k_raw = vec![0u8; layer_block_bytes];
                     let mut v_raw = vec![0u8; layer_block_bytes];
                     ctx.gpu.copy_d2h_on_stream(
@@ -318,6 +329,7 @@ impl Qwen3AttentionLayer {
                         bs_us,
                         nkv_us,
                         hd_us,
+                        fibq_k,
                         &self.fibq_codebook_host,
                         &mut k_host,
                     );
@@ -326,6 +338,7 @@ impl Qwen3AttentionLayer {
                         bs_us,
                         nkv_us,
                         hd_us,
+                        fibq_k,
                         &self.fibq_codebook_host,
                         &mut v_host,
                     );

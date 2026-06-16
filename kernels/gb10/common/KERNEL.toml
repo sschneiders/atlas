@@ -18,7 +18,6 @@ quantize_bf16_to_nvfp4 = "quantize_nvfp4"
 paged_decode_attn = "paged_decode"
 paged_decode_attn_fp8 = "paged_decode_fp8"
 paged_decode_attn_nvfp4 = "paged_decode_nvfp4"
-paged_decode_attn_fibquant = "paged_decode_fibquant"
 w4a16_gemm = "w4a16"
 kv_cache_append = "kv_cache"
 moe_w4a16_grouped_gemm = "moe_w4a16"
@@ -27,7 +26,6 @@ moe_shared_expert_fused_batch3 = "moe_fused_batch3"
 inferspark_prefill_paged = "prefill_paged"
 inferspark_prefill_paged_fp8 = "prefill_paged_fp8"
 inferspark_prefill_paged_nvfp4 = "prefill_paged_nvfp4"
-inferspark_prefill_paged_fibquant = "prefill_paged_fibquant"
 inferspark_prefill_paged_turbo2 = "prefill_paged_turbo2"
 inferspark_prefill_paged_turbo3 = "prefill_paged_turbo3"
 inferspark_prefill_paged_turbo4 = "prefill_paged_turbo4"
@@ -62,3 +60,43 @@ paged_decode_attn_turbo3k_turbo8v_128 = "paged_decode_turbo3k_turbo8v_128"
 paged_decode_attn_fp8k_turbo3v = "paged_decode_fp8k_turbo3v"
 paged_decode_attn_fp8k_turbo4v = "paged_decode_fp8k_turbo4v"
 paged_decode_attn_fp8k_turbo2v = "paged_decode_fp8k_turbo2v"
+
+# FibQuant tunable rate: the same three `.cu` sources are compiled twice —
+# once at k=4 (the existing 8× modules, names UNCHANGED so the FibQuant
+# dispatch path stays byte-identical) and once at k=2 (new `_4x` modules for
+# FibQuant4x, ~4× compression). `stem` is the `.cu` file stem; `name` is the
+# emitted module name. The kernel symbol names are identical across variants
+# (only `-D FIB_K` differs), so runtime resolves the same symbol per module.
+# A stem listed here MUST NOT also appear in `[modules]` above — the build
+# emits only the variants for variant-stems (build.rs: the `stem_variants`
+# branch supersedes the single-compile + `[modules]`-override branch).
+
+# paged_decode_attn_fibquant.cu → paged_decode_fibquant (8x) + _4x
+[[variants]]
+stem = "paged_decode_attn_fibquant"
+name = "paged_decode_fibquant"
+flags = ["-DFIB_K=4", "-DFIB_N=256"]
+[[variants]]
+stem = "paged_decode_attn_fibquant"
+name = "paged_decode_fibquant_4x"
+flags = ["-DFIB_K=2", "-DFIB_N=256"]
+
+# inferspark_prefill_paged_fibquant.cu → prefill_paged_fibquant (8x) + _4x
+[[variants]]
+stem = "inferspark_prefill_paged_fibquant"
+name = "prefill_paged_fibquant"
+flags = ["-DFIB_K=4", "-DFIB_N=256"]
+[[variants]]
+stem = "inferspark_prefill_paged_fibquant"
+name = "prefill_paged_fibquant_4x"
+flags = ["-DFIB_K=2", "-DFIB_N=256"]
+
+# reshape_and_cache_fibquant.cu → reshape_and_cache_fibquant (8x) + _4x
+[[variants]]
+stem = "reshape_and_cache_fibquant"
+name = "reshape_and_cache_fibquant"
+flags = ["-DFIB_K=4", "-DFIB_N=256"]
+[[variants]]
+stem = "reshape_and_cache_fibquant"
+name = "reshape_and_cache_fibquant_4x"
+flags = ["-DFIB_K=2", "-DFIB_N=256"]

@@ -264,6 +264,12 @@ pub struct Qwen3AttentionLayer {
     pub(super) prefill_attn_paged_fp8_64_k: KernelHandle,
     pub(super) prefill_attn_paged_nvfp4_64_k: KernelHandle,
     pub(super) prefill_attn_paged_fibquant_k: KernelHandle,
+    /// FibQuant 4× rate chunked-prefill paged-attention kernel. Same symbol
+    /// (`inferspark_prefill_paged_fibquant`) as the 8× handle but resolved in
+    /// the `prefill_paged_fibquant_4x` module (compiled with `-DFIB_K=2`).
+    /// Zero handle when the `_4x` module isn't loaded; dispatch checks
+    /// `.0 != 0` before launching.
+    pub(super) prefill_attn_paged_fibquant_4x_k: KernelHandle,
     pub(super) prefill_attn_paged_turbo2_64_k: KernelHandle,
     pub(super) prefill_attn_paged_turbo3_64_k: KernelHandle,
     pub(super) prefill_attn_paged_turbo4_64_k: KernelHandle,
