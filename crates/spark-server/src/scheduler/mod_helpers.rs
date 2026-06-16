@@ -99,32 +99,37 @@ pub(super) fn install_kvflash(model: &dyn Model, cfg: Option<spark_runtime::Kvfl
             // num_hidden_layers includes non-attention layers); head/q/kv dims
             // + max_blocks come from high_speed_swap_dims. On any failure the
             // pager stays pure-LRU (no scorer attached) — a quality fallback,
-            // not a correctness risk.
-            if let Some(hs_dims) = model.high_speed_swap_dims() {
-                let pred_dims = spark_storage::ModelDims {
-                    num_layers: num_layers as u32,
-                    max_blocks_per_layer: hs_dims.max_blocks_per_layer,
-                    num_q_heads: hs_dims.num_q_heads,
-                    num_kv_heads: hs_dims.num_kv_heads,
-                    head_dim: hs_dims.head_dim,
-                    block_size: hs_dims.block_size,
-                };
-                match super::predictor_scorer::PredictorScorer::new(pred_dims) {
-                    Ok(scorer) => {
-                        spark_runtime::kvflash_pager::set_scorer(Box::new(scorer));
-                        tracing::info!(
-                            "KVFlash PredictorScorer attached (deep recall enabled): \
-                             rank={}, max_blocks={}",
-                            super::predictor_scorer::PREDICTOR_RANK,
-                            hs_dims.max_blocks_per_layer
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "KVFlash PredictorScorer construction failed (LRU fallback): {e:#}"
-                        );
+            // not a correctness risk. ATLAS_KVFLASH_NO_SCORER disables attach
+            // for A/B isolation of the scorer's cost.
+            if std::env::var("ATLAS_KVFLASH_NO_SCORER").is_err() {
+                if let Some(hs_dims) = model.high_speed_swap_dims() {
+                    let pred_dims = spark_storage::ModelDims {
+                        num_layers: num_layers as u32,
+                        max_blocks_per_layer: hs_dims.max_blocks_per_layer,
+                        num_q_heads: hs_dims.num_q_heads,
+                        num_kv_heads: hs_dims.num_kv_heads,
+                        head_dim: hs_dims.head_dim,
+                        block_size: hs_dims.block_size,
+                    };
+                    match super::predictor_scorer::PredictorScorer::new(pred_dims) {
+                        Ok(scorer) => {
+                            spark_runtime::kvflash_pager::set_scorer(Box::new(scorer));
+                            tracing::info!(
+                                "KVFlash PredictorScorer attached (deep recall enabled): \
+                                 rank={}, max_blocks={}",
+                                super::predictor_scorer::PREDICTOR_RANK,
+                                hs_dims.max_blocks_per_layer
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "KVFlash PredictorScorer construction failed (LRU fallback): {e:#}"
+                            );
+                        }
                     }
                 }
+            } else {
+                tracing::info!("KVFlash PredictorScorer DISABLED (ATLAS_KVFLASH_NO_SCORER)");
             }
             tracing::info!(
                 "KVFlash pager installed on scheduler thread: block_size={block_size}, \
