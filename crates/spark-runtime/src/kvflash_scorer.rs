@@ -49,6 +49,17 @@ pub trait KvFlashScorer: Send {
         _gpu: &dyn GpuBackend,
     ) {
     }
+    /// Has `block_id` already been projected into the scorer's low-rank K
+    /// store? The pager's reselect refreshes only newly-resident blocks
+    /// (new decode tokens) into the store, keeping the per-reselect projection
+    /// cost O(new blocks) rather than O(pool). Default `true` so recency
+    /// scorers (which never project) skip the refresh entirely.
+    fn is_projected(&self, _block_id: u32) -> bool {
+        true
+    }
+    /// Mark `block_id` as projected (all layers written). Called by the pager
+    /// after projecting a block across all layers. Default no-op.
+    fn mark_projected(&mut self, _block_id: u32) {}
 }
 
 /// Recency-only scorer (the default and the fallback when no drafter is

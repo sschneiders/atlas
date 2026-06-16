@@ -302,7 +302,7 @@ impl KvflashPager {
             let physical = block_table[l];
             // Read K/V per layer + project into the scorer's low-rank store
             // so the block stays scoreable for recall after page-out.
-            let layers_kv = self.read_block_layers(physical, kv_cache, gpu)?;
+            let layers_kv = self.read_block_layers(logical, physical, kv_cache, gpu)?;
             // Free the GPU block (bypasses ref-counting: the pager owns it).
             kv_cache.return_evicted_block(physical);
             // Stash the host copy + repoint the table at the zeroed dummy.
@@ -336,7 +336,7 @@ impl KvflashPager {
         }
         let physical = block_table[l];
         // Read K/V per layer + project into the scorer's low-rank store.
-        let layers_kv = self.read_block_layers(physical, kv_cache, gpu)?;
+        let layers_kv = self.read_block_layers(logical, physical, kv_cache, gpu)?;
         kv_cache.return_evicted_block(physical);
         let dummy = match self.slots.get_mut(&slot) {
             Some(st) => {
@@ -360,6 +360,7 @@ impl KvflashPager {
     /// [`Self::page_out_one`] (SSOT for the read-back path).
     fn read_block_layers(
         &mut self,
+        logical: u32,
         physical: u32,
         kv_cache: &mut PagedKvCache,
         gpu: &dyn GpuBackend,
@@ -371,7 +372,7 @@ impl KvflashPager {
         }
         if let Some(s) = self.scorer.as_mut() {
             for (layer, (k, _v)) in layers_kv.iter().enumerate() {
-                s.project_evicted_block(layer, physical, k, gpu);
+                s.project_evicted_block(layer, logical, k, gpu);
             }
         }
         Ok(layers_kv)
@@ -446,7 +447,35 @@ impl KvflashPager {
         if total == 0 {
             return Ok((0, 0));
         }
-        // 1. Score all materialized chunks (resident or host-backed).
+        // 1. Refresh A_g: project resident blocks not yet in the scorer's
+        //    low-rank K store (new decode tokens since the last reselect) so
+        //    they rank alongside paged-out blocks (which were projected at
+        //    eviction). Without this, resident blocks would score as 0 and
+        //    plan_reselect would thrash the whole pool every τ steps.
+        let num_layers = self.num_layers;
+        let resident_blocks: Vec<(u32, u32)> = match self.slots.get(&slot) {
+            Some(st) => (0..total as u32)
+                .filter(|l| {
+                    let li = *l as usize;
+                    st.residency.is_resident(li) && li < block_table.len()
+                })
+                .map(|l| (l, block_table[l as usize]))
+                .collect(),
+            None => return Ok((0, 0)),
+        };
+        if let Some(scorer) = self.scorer.as_mut() {
+            for (logical, physical) in resident_blocks {
+                if scorer.is_projected(logical) {
+                    continue;
+                }
+                for layer in 0..num_layers {
+                    let (k, _v) = kv_cache.read_block(layer, physical, gpu)?;
+                    scorer.project_evicted_block(layer, logical, &k, gpu);
+                }
+                scorer.mark_projected(logical);
+            }
+        }
+        // 2. Score all materialized chunks (resident or host-backed).
         let scores = match self.scorer.as_mut() {
             Some(s) => s.score_chunks(total),
             None => return Ok((0, 0)),

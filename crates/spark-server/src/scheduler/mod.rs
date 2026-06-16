@@ -29,6 +29,7 @@ mod mtp_step;
 mod phase_continue_prefills;
 mod phase_promote_prefills;
 mod phase_start_prefills;
+mod predictor_scorer;
 mod prefill_a_step;
 mod prefill_b_step;
 mod repetition;
