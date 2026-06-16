@@ -31,7 +31,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
-use crate::gpu::GpuBackend;
+use crate::gpu::{DevicePtr, GpuBackend};
 use crate::kv_cache::PagedKvCache;
 use crate::kvflash_config::KvflashConfig;
 use crate::kvflash_residency::KvflashResidency;
@@ -111,6 +111,25 @@ impl KvflashPager {
     /// True iff a scorer is attached (score-driven reselect available).
     pub fn has_scorer(&self) -> bool {
         self.scorer.is_some()
+    }
+
+    /// Forward the per-step decode Query to the attached scorer (if any).
+    /// Called from the model's chosen attention layer each decode step so the
+    /// scorer's later [`KvFlashScorer::score_chunks`] can rank chunks by
+    /// relevance to the current query. No-op when no scorer is attached
+    /// (recency/LRU residency) — the scorer's `capture_q` default is itself a
+    /// no-op, so this is doubly inert for recency-only scorers.
+    pub fn capture_q(
+        &mut self,
+        q: DevicePtr,
+        num_q_heads: u32,
+        head_dim: u32,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) {
+        if let Some(s) = self.scorer.as_mut() {
+            s.capture_q(q, num_q_heads, head_dim, gpu, stream);
+        }
     }
 
     /// The resolved KVFlash config (read-only accessor for callers that need
@@ -594,6 +613,17 @@ pub fn has_scorer() -> bool {
 pub fn set_scorer(scorer: Box<dyn crate::kvflash_scorer::KvFlashScorer>) {
     let _ = with_local(|p| {
         p.set_scorer(scorer);
+        Ok(())
+    });
+}
+
+/// Forward the per-step decode Q to the thread-local pager's scorer. Called
+/// from the model's chosen attention layer each decode step so the scorer's
+/// later `score_chunks` can rank chunks by relevance to the current query.
+/// No-op when no pager / no scorer is installed.
+pub fn capture_q(q: DevicePtr, num_q_heads: u32, head_dim: u32, gpu: &dyn GpuBackend, stream: u64) {
+    let _ = with_local(|p| {
+        p.capture_q(q, num_q_heads, head_dim, gpu, stream);
         Ok(())
     });
 }

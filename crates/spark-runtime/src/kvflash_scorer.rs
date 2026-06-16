@@ -6,6 +6,7 @@
 //! materialized chunks; the top-`pool` chunks stay resident, the rest page
 //! out to the host-RAM backend. See docs/design/kvflash-port.md PR4.
 
+use crate::gpu::{DevicePtr, GpuBackend};
 use crate::weights::WeightStore;
 
 /// Chunk-relevance policy interface. Object-safe: `&mut self` (the drafter
@@ -17,6 +18,22 @@ pub trait KvFlashScorer: Send {
     fn score_chunks(&mut self, num_chunks: usize) -> Vec<f32>;
     /// Lowercase policy name for logs ("lru" / "drafter").
     fn name(&self) -> &'static str;
+    /// Capture the current decode-step Query for later scoring. Called once
+    /// per decode step from the chosen attention layer's decode path, BEFORE
+    /// [`KvFlashScorer::score_chunks`] runs in the pager's reselect loop on
+    /// the same step. The default is a no-op, so recency/LRU scorers ignore
+    /// it; a relevance scorer copies the device-side Q into its own buffer
+    /// here and reads it back in `score_chunks`. `q` is BF16
+    /// `[num_q_heads, head_dim]` on device.
+    fn capture_q(
+        &mut self,
+        _q: DevicePtr,
+        _num_q_heads: u32,
+        _head_dim: u32,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) {
+    }
 }
 
 /// Recency-only scorer (the default and the fallback when no drafter is
