@@ -1299,15 +1299,35 @@ mod tests {
         assert_eq!(w.len(), 2);
         // the aligned needle block concentrates almost all the attention mass.
         assert!(w[1] > 0.9, "needle block should dominate attention: {w:?}");
+        assert!(w[1] > w[0], "needle > filler: {w:?}");
+    }
+
+    #[test]
+    fn attention_weights_sum_to_one_and_uniform_for_identical_blocks() {
+        // 3 identical aligned blocks + 1 head => weights split equally, sum to 1.
+        let nq = 1usize;
+        let nkv = 1usize;
+        let hd = 2usize;
+        let bs = 1usize;
+        let q = vec![1.0, 0.0];
+        let blk = vec![1.0, 0.0];
+        let w = attention_block_weights(
+            &q,
+            &[blk.clone(), blk.clone(), blk.clone()],
+            nq,
+            nkv,
+            hd,
+            bs,
+        );
+        assert_eq!(w.len(), 3);
         let total: f32 = w.iter().copied().sum();
         assert!(
             (total - 1.0).abs() < 1e-5,
             "weights sum to 1: total={total}"
         );
-        // equal blocks => equal weights.
         assert!(
             (w[0] - w[1]).abs() < 1e-6 && (w[1] - w[2]).abs() < 1e-6,
-            "uniform: {w:?}"
+            "identical blocks => identical weights: {w:?}"
         );
     }
 }
