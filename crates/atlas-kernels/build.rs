@@ -61,6 +61,10 @@ struct Target {
     common_kernel_dir: Option<PathBuf>,
     extra_flags: Vec<String>,
     module_overrides: HashMap<String, String>,
+    /// `[[variants]]` table: compile one `.cu` stem into N PTX modules with
+    /// extra `-D` flags each (FibQuant tunable rate). Empty for the vast
+    /// majority of targets → single-compile path is byte-identical to before.
+    variants: Vec<build_parse::VariantSpec>,
     sampling_thinking_text: SamplingCat,
     sampling_thinking_coding: SamplingCat,
     sampling_non_thinking: SamplingCat,
@@ -295,7 +299,6 @@ fn main() {
         // in parallel after the full work plan is built).
         for cu_file in &cu_files {
             let stem = cu_file.file_stem().unwrap().to_str().unwrap().to_string();
-            let out_file = out_dir.join(format!("t{idx}__{stem}.{output_ext}"));
 
             // HIP: compile a mask-widened MIRROR of the source (kernels/ is
             // never mutated). The whole source directory is mirrored once so
@@ -307,22 +310,44 @@ fn main() {
                 cu_file.clone()
             };
 
-            // Dedup key: same (source, arch, sorted-flags) → identical
-            // binary output. Sort flags so flag-order doesn't bust the cache.
-            let mut sorted_flags = target.extra_flags.clone();
-            sorted_flags.sort();
-            let key = (compile_source.clone(), target.arch.clone(), sorted_flags);
-
-            if let Some(existing) = compile_cache.get(&key) {
-                copy_jobs.push((existing.clone(), out_file));
+            // Compilation units for this source: one (slug, flags) per variant,
+            // or a single no-variant unit. No-variant → slug == stem, flags ==
+            // target.extra_flags (byte-identical to the original single compile).
+            let stem_variants: Vec<&build_parse::VariantSpec> =
+                target.variants.iter().filter(|v| v.stem == stem).collect();
+            let units: Vec<(String, Vec<String>)> = if stem_variants.is_empty() {
+                vec![(stem.clone(), target.extra_flags.clone())]
             } else {
-                compile_jobs.push(CompileJob {
-                    cu_file: compile_source.clone(),
-                    arch: target.arch.clone(),
-                    extra_flags: target.extra_flags.clone(),
-                    out_file: out_file.clone(),
-                });
-                compile_cache.insert(key, out_file);
+                stem_variants
+                    .iter()
+                    .map(|v| {
+                        let mut f = target.extra_flags.clone();
+                        f.extend(v.flags.iter().cloned());
+                        (format!("{}__{}", stem, v.name), f)
+                    })
+                    .collect()
+            };
+
+            for (slug, flags) in units {
+                let out_file = out_dir.join(format!("t{idx}__{slug}.{output_ext}"));
+                // Dedup key: same (source, arch, sorted-flags) → identical
+                // binary output. Variant flags are part of the key, so distinct
+                // rates never false-share a cache entry.
+                let mut sorted_flags = flags.clone();
+                sorted_flags.sort();
+                let key = (compile_source.clone(), target.arch.clone(), sorted_flags);
+
+                if let Some(existing) = compile_cache.get(&key) {
+                    copy_jobs.push((existing.clone(), out_file));
+                } else {
+                    compile_jobs.push(CompileJob {
+                        cu_file: compile_source.clone(),
+                        arch: target.arch.clone(),
+                        extra_flags: flags,
+                        out_file: out_file.clone(),
+                    });
+                    compile_cache.insert(key, out_file);
+                }
             }
         }
 
@@ -330,19 +355,27 @@ fn main() {
             println!("cargo:rerun-if-changed={}", cu_file.display());
         }
 
-        // Collect (stem, module_name) pairs sorted by module_name
-        let mut modules: Vec<(String, String)> = cu_files
-            .iter()
-            .map(|f| {
-                let stem = f.file_stem().unwrap().to_str().unwrap().to_string();
+        // Collect (slug, module_name) pairs sorted by module_name. The slug is
+        // the `t{idx}__{slug}` filename stem the codegen loads; for variants it
+        // is `{stem}__{variant.name}` so each rate's PTX blob is distinct.
+        let mut modules: Vec<(String, String)> = Vec::new();
+        for f in &cu_files {
+            let stem = f.file_stem().unwrap().to_str().unwrap().to_string();
+            let stem_variants: Vec<&build_parse::VariantSpec> =
+                target.variants.iter().filter(|v| v.stem == stem).collect();
+            if stem_variants.is_empty() {
                 let module_name = target
                     .module_overrides
                     .get(&stem)
                     .cloned()
                     .unwrap_or_else(|| stem.clone());
-                (stem, module_name)
-            })
-            .collect();
+                modules.push((stem, module_name));
+            } else {
+                for v in stem_variants {
+                    modules.push((format!("{}__{}", stem, v.name), v.name.clone()));
+                }
+            }
+        }
         modules.sort_by(|a, b| a.1.cmp(&b.1));
 
         all_target_modules.push(modules);
@@ -749,19 +782,22 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
             // flags (deduped, model last) and wins per-key on [modules].
             let mut extra_flags: Vec<String> = Vec::new();
             let mut module_overrides: HashMap<String, String> = HashMap::new();
+            let mut variants: Vec<build_parse::VariantSpec> = Vec::new();
             if has_common_dir && common_kernel_dir.join("KERNEL.toml").exists() {
-                let (f, m) = parse_kernel_toml(&common_kernel_dir, &target_vendor);
+                let (f, m, v) = parse_kernel_toml(&common_kernel_dir, &target_vendor);
                 extra_flags.extend(f);
                 module_overrides.extend(m);
+                variants.extend(v);
             }
             if has_model_dir && model_kernel_dir.join("KERNEL.toml").exists() {
-                let (f, m) = parse_kernel_toml(&model_kernel_dir, &target_vendor);
+                let (f, m, v) = parse_kernel_toml(&model_kernel_dir, &target_vendor);
                 for flag in f {
                     if !extra_flags.contains(&flag) {
                         extra_flags.push(flag);
                     }
                 }
                 module_overrides.extend(m);
+                variants.extend(v);
             }
 
             // Parse sampling presets, behavior, and model_types from MODEL.toml
@@ -784,6 +820,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 },
                 extra_flags,
                 module_overrides,
+                variants,
                 sampling_thinking_text: s_tt,
                 sampling_thinking_coding: s_tc,
                 sampling_non_thinking: s_nt,

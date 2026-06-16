@@ -8,10 +8,22 @@ use std::collections::HashMap;
 
 use super::{DflashRaw, KvflashRaw, ModelTypeMatch, SamplingCat};
 
+/// One compile variant of a `.cu`: compile the source for `stem` into an extra
+/// PTX module `name`, adding `flags` (e.g. `-DFIB_K=4`). Used by the
+/// `[[variants]]` KERNEL.toml table to emit multiple rate-specialised modules
+/// from a single source (FibQuant tunable rate). Stems with no variant entry
+/// (the vast majority) are compiled exactly once, unchanged.
+#[derive(Debug, Clone)]
+pub(super) struct VariantSpec {
+    pub stem: String,
+    pub name: String,
+    pub flags: Vec<String>,
+}
+
 pub(super) fn parse_kernel_toml(
     kernel_dir: &std::path::Path,
     vendor: &str,
-) -> (Vec<String>, HashMap<String, String>) {
+) -> (Vec<String>, HashMap<String, String>, Vec<VariantSpec>) {
     let kernel_toml_path = kernel_dir.join("KERNEL.toml");
     let kernel_toml: toml::Value = toml::from_str(
         &std::fs::read_to_string(&kernel_toml_path)
@@ -49,7 +61,36 @@ pub(super) fn parse_kernel_toml(
         })
         .unwrap_or_default();
 
-    (extra_flags, module_overrides)
+    // `[[variants]]`: compile one .cu (`stem`) into extra PTX modules, each
+    // with its own `name` + extra `-D` `flags`. Used for rate-specialised
+    // kernels (e.g. FibQuant 4x/8x from the same source). Missing table → empty.
+    let variants: Vec<VariantSpec> = kernel_toml
+        .get("variants")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let t = e.as_table()?;
+                    Some(VariantSpec {
+                        stem: t.get("stem")?.as_str()?.to_string(),
+                        name: t.get("name")?.as_str()?.to_string(),
+                        flags: t
+                            .get("flags")
+                            .and_then(|f| f.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|x| x.as_str())
+                                    .map(String::from)
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    (extra_flags, module_overrides, variants)
 }
 
 /// Parse sampling presets from MODEL.toml `[sampling.*]` sections.
