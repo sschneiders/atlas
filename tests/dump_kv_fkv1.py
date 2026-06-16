@@ -57,9 +57,11 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16, device_map="cuda"
-    ).eval()
+    model = (
+        AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16)
+        .to("cuda")
+        .eval()
+    )
     cfg = model.config
     model_type = cfg.model_type.replace("-", "_")
     apply_rope = get_apply_rope(model_type)
