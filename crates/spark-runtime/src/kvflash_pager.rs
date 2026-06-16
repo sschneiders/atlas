@@ -120,6 +120,9 @@ pub struct KvflashPager {
     prefill_q_nq: usize,
     prefill_q_nkv: usize,
     prefill_q_hd: usize,
+    /// Number of prompt tokens whose Q is stashed in `prefill_q` (the question
+    /// window — the last `PREFILL_Q_WINDOW` tokens). `0` until prefill runs.
+    prefill_q_ntok: usize,
     slots: HashMap<usize, SlotState>,
 }
 
@@ -139,6 +142,7 @@ impl KvflashPager {
             prefill_q_nq: 0,
             prefill_q_nkv: 0,
             prefill_q_hd: 0,
+            prefill_q_ntok: 0,
             slots: HashMap::new(),
         }
     }
@@ -175,44 +179,50 @@ impl KvflashPager {
         }
     }
 
-    /// Capture the PREFILL last-token Query (host, BF16→f32) for the attention
-    /// keep-set. Called from the prefill attention path (one chosen layer, the
-    /// final prompt token) — the question's retrieval query, computed while the
-    /// full context is visible. Consumed once at first eviction by
-    /// [`Self::compute_attention_keep_set`] to pin the blocks this query
-    /// attends to. `copy_d2h_on_stream` on the model stream keeps the read
-    /// ordered after the Q write. No-op effect when the keep-set is disabled.
+    /// Capture the last `PREFILL_Q_WINDOW` prompt-token Qs (the question
+    /// window, host BF16→f32) for the attention keep-set. Called from the
+    /// prefill attention path (last attention layer; every chunk, last chunk
+    /// wins). `copy_d2h_on_stream` on the model stream keeps the read ordered
+    /// after the Q write. Stashed as `[ntok, nq, hd]`; consumed by
+    /// [`Self::compute_attention_keep_set`] to aggregate the question tokens'
+    /// attention over all blocks.
     pub fn capture_prefill_q(
         &mut self,
-        q: DevicePtr,
+        q_base: DevicePtr,
+        num_tokens: u32,
         num_q_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
         gpu: &dyn GpuBackend,
         stream: u64,
     ) {
+        const WINDOW: usize = 16;
+        let n = num_tokens as usize;
         let nq = num_q_heads as usize;
         let nkv = num_kv_heads as usize;
         let hd = head_dim as usize;
-        let bytes = nq * hd * 2;
+        let start = n.saturating_sub(WINDOW);
+        let count = n - start;
+        let bytes = count * nq * hd * 2;
+        let src = q_base.offset(start * nq * hd * 2);
         let mut buf = vec![0u8; bytes];
-        if gpu.copy_d2h_on_stream(q, &mut buf, stream).is_err() {
+        if gpu.copy_d2h_on_stream(src, &mut buf, stream).is_err() {
             return;
         }
-        let qf: Vec<f32> = (0..nq * hd)
+        let qf: Vec<f32> = (0..count * nq * hd)
             .map(|i| {
                 let bits = u16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]) as u32;
                 f32::from_bits(bits << 16)
             })
             .collect();
         tracing::debug!(
-            "kvflash captured prefill Q: nq={nq} nkv={nkv} hd={hd} ({} floats)",
-            qf.len()
+            "kvflash captured prefill Q window: ntok={count} nq={nq} nkv={nkv} hd={hd}"
         );
         self.prefill_q = Some(qf);
         self.prefill_q_nq = nq;
         self.prefill_q_nkv = nkv;
         self.prefill_q_hd = hd;
+        self.prefill_q_ntok = count;
     }
 
     /// The resolved KVFlash config (read-only accessor for callers that need
@@ -445,17 +455,66 @@ impl KvflashPager {
         kv_cache: &PagedKvCache,
         gpu: &dyn GpuBackend,
     ) {
-        let (q, nq, nkv, hd) = match self.prefill_q.as_ref() {
-            Some(q) => (
-                q.as_slice(),
-                self.prefill_q_nq,
-                self.prefill_q_nkv,
-                self.prefill_q_hd,
-            ),
+        let (qs, nq, nkv, hd, ntok) = match self.prefill_q.as_ref() {
+            Some(q) => (q.as_slice(), self.prefill_q_nq, self.prefill_q_nkv, self.prefill_q_hd, self.prefill_q_ntok),
             None => {
                 tracing::debug!("kvflash attention keep-set: no prefill Q captured yet");
                 return;
             }
+        };
+        let total = match self.slots.get(&slot) {
+            Some(st) => st.residency.total(),
+            None => return,
+        };
+        if total == 0 || nkv == 0 || hd == 0 || ntok == 0 {
+            return;
+        }
+        let bs = self.block_size as usize;
+        // Read K from the LAST attention layer (matches the captured prefill Q,
+        // which is the last layer's — deep layers carry content attention,
+        // early layers are sink-dominated).
+        let k_layer = self.num_layers.saturating_sub(1);
+        // Parse each block's K (BF16) to f32 [bs, nkv, hd].
+        let mut block_ks: Vec<Vec<f32>> = Vec::with_capacity(total);
+        for b in 0..total as u32 {
+            let kf: Vec<f32> = kv_cache
+                .read_block(k_layer, b, gpu)
+                .map(|(k, _)| {
+                    (0..k.len() / 2)
+                        .map(|i| {
+                            let bits = u16::from_le_bytes([k[i * 2], k[i * 2 + 1]]) as u32;
+                            f32::from_bits(bits << 16)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            block_ks.push(kf);
+        }
+        // Aggregate the question-window tokens' attention: sum each token's
+        // per-block attention distribution. A block the question attends to
+        // (the needle) accumulates weight across the question tokens.
+        let mut agg = vec![0f32; total];
+        for t in 0..ntok {
+            let q_t = &qs[t * nq * hd..(t + 1) * nq * hd];
+            let w = attention_block_weights(q_t, &block_ks, nq, nkv, hd, bs);
+            for b in 0..total {
+                agg[b] += w[b];
+            }
+        }
+        let n_keep = (self.pool_blocks() / 4).max(1);
+        let keep = top_blocks_by_weight(&agg, n_keep);
+        let top_idx = keep.first().copied().unwrap_or(0) as usize;
+        tracing::info!(
+            "kvflash attention keep-set (q-window={ntok}): total={total} n_keep={n_keep} top_weight={:.4} kept={keep:?}",
+            agg[top_idx],
+        );
+        if let Some(st) = self.slots.get_mut(&slot) {
+            for &i in &keep {
+                st.residency.protect(i as usize);
+            }
+            st.attention_keep_set_computed = true;
+        }
+    }
         };
         let total = match self.slots.get(&slot) {
             Some(st) => st.residency.total(),
@@ -1054,11 +1113,13 @@ pub fn capture_q(q: DevicePtr, num_q_heads: u32, head_dim: u32, gpu: &dyn GpuBac
     });
 }
 
-/// Capture the prefill last-token Q to the thread-local pager (attention
-/// keep-set). Called from the prefill attention path for the chosen layer's
-/// final prompt token. No-op when no pager is installed.
+/// Capture the prefill question-window Qs to the thread-local pager (attention
+/// keep-set). Called from the prefill attention path (last layer). `q_base` is
+/// the per-chunk Q buffer base ([num_tokens, nq, hd] BF16); the last
+/// `PREFILL_Q_WINDOW` tokens are stashed. No-op when no pager is installed.
 pub fn capture_prefill_q(
-    q: DevicePtr,
+    q_base: DevicePtr,
+    num_tokens: u32,
     num_q_heads: u32,
     num_kv_heads: u32,
     head_dim: u32,
@@ -1066,7 +1127,7 @@ pub fn capture_prefill_q(
     stream: u64,
 ) {
     let _ = with_local(|p| {
-        p.capture_prefill_q(q, num_q_heads, num_kv_heads, head_dim, gpu, stream);
+        p.capture_prefill_q(q_base, num_tokens, num_q_heads, num_kv_heads, head_dim, gpu, stream);
         Ok(())
     });
 }

@@ -407,8 +407,15 @@ impl Qwen3AttentionLayer {
         // identifies a recall target. Capture every chunk too; the final
         // chunk's last token wins. No-op when no pager is installed.
         if num_tokens > 0 {
-            let last_q = q_contiguous.offset((num_tokens - 1) * q_dim * bf16);
-            spark_runtime::kvflash_pager::capture_prefill_q(last_q, nq, nkv, hd, ctx.gpu, stream);
+            spark_runtime::kvflash_pager::capture_prefill_q(
+                q_contiguous,
+                num_tokens as u32,
+                nq,
+                nkv,
+                hd,
+                ctx.gpu,
+                stream,
+            );
         }
 
         // ── 7. Write all K/V to paged cache ──
