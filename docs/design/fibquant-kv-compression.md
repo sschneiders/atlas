@@ -244,6 +244,44 @@ the venv (HF infra, not FibQuant); the real-A3B-KV number will be taken via
 actual Atlas stack. Capture tooling: `tests/dump_kv_fkv1.py` (HF path) +
 `crates/atlas-quant/examples/fibquant_fidelity.rs` (the sweep).
 
+## Step 3 architecture decision — WHT reuse (validated Haar-equivalent)
+
+The paper specifies a dense Haar-random rotation `Π` (`Q·K=(ΠQ)·(ΠK)`). For
+d=256 that matrix is 256 KB — over CUDA's 64 KB `__constant__` cap, so it would
+need a **new device-buffer-upload pattern** (allocate at model load, thread a
+`DevicePtr` through every kernel launch) — the first Atlas dtype to do so.
+
+**Empirical pivot (gb10):** FibQuant's universality holds for *any* orthogonal
+mixing rotation, and Atlas already ships `wht_bf16` (Walsh–Hadamard) used by
+every turbo dtype. Re-running the Step-1 sweep with `FIB_ROT=hadamard` on the
+same Qwen3-0.6B KV gives **identical fidelity to Haar** (marginally *better* at
+8×: 0.9891 vs 0.9880; 0.9923 vs 0.9921). Diff < 0.001.
+
+⇒ **FibQuant reuses `wht_bf16`** (set `is_wht_rotated() = true`), so the kernel
+is a close clone of the **Turbo4** path, not a novel upload path:
+
+- **Write** (`reshape_and_cache_fibquant.cu`, clone of
+  `reshape_and_cache_turbo.cu::reshape_and_cache_flash_turbo4`): the host write
+  path already applies `wht_bf16` to K/V (the turbo bookend); inside the kernel,
+  normalize the rotated vector → nearest-codeword over the 256-entry FibQuant
+  codebook → store `{fp16 norm, 1-byte index}`.
+- **Decode** (`paged_decode_attn_fibquant.cu`, clone of
+  `paged_decode_attn_turbo4.cu`): K-read = gather `codebook[index] × norm` from
+  a `__constant__`-staged codebook (4 KB, fits); Q/output WHT bookends are the
+  existing `wht_bf16` ones.
+- **Prefill** (`inferspark_prefill_paged_fibquant.cu`, clone of the fp8 shim):
+  redefine `LOAD_KV_TILE` to do the codebook gather.
+- **Registration:** drop the 3 `.cu` files in `kernels/gb10/common/`; add
+  `paged_decode_attn_fibquant = "paged_decode_fibquant"` and
+  `inferspark_prefill_paged_fibquant = "prefill_paged_fibquant"` to
+  `KERNEL.toml [modules]` (reshape stem already matches).
+- **Codebook constant:** the 256×4 f32 codebook is a `__device__ __constant__`
+  array (generated from the same seed as `atlas-quant`), staged to `__shared__`
+  per-CTA (NVFP4 precedent). Same `f_{d,k}` codebook works under WHT.
+- **Rust wiring still needed:** `decode/run_paged_decode.rs`,
+  `decode/write_kv_cache.rs`, `prefill/paged_attn.rs` FibQuant arms; new
+  launchers in `layers/ops/`; `init.rs` prefill handle.
+
 ## Attribution
 
 FibQuant mechanism: Lee & Kim, arXiv:2605.11478. Reimplemented for Atlas under
