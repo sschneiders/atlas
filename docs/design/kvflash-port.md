@@ -156,3 +156,143 @@ run and which remain pending.
 KVFlash mechanism: Luce-Org/lucebox-hub (`optimizations/kvflash/`), Apache-2.0.
 Underlying algorithm: FlashMemory, arXiv:2606.09079.
 Reimplemented for Atlas under AGPL-3.0-only; no lucebox source code copied.
+
+---
+
+# NEXT-SESSION HANDOFF — PredictorScorer (deep recall)
+
+**Read this first.** KVFlash works (flat decode, the headline benefit). The one
+remaining functional gap is **deep recall** — under LRU, content outside the
+recent tail is dropped from attention, so long-document retrieval fails (the
+validation test's shallow-needle MISS). The fix is a relevance scorer that
+recalls relevant paged-out chunks. This section is the complete, self-contained
+brief to implement it.
+
+## Current state (verified on the gb10)
+
+- Decode-only flatness **0.92** across 512–8192 tokens with `--kvflash 1024 --kvflash-compact`
+  (cap-compaction makes attention O(pool) immediately; the 7537 cliff is fixed).
+- 9 branches pushed, all compile clean on **real CUDA** (gb10, aarch64, kernel
+  wildcard). Branch tip: `feat/kvflash-9-drafter-scorer`.
+- The scorer-driven residency mechanism is **complete and unit-tested**:
+  `page_in` (recall), `plan_reselect` (pure-logic score-driven planner),
+  `reselect`, `maybe_reselect` (τ-cadence gate). It is **dormant** — no scorer
+  is attached, so the pager is pure-LRU. Attaching ANY `KvFlashScorer` that
+  produces real per-chunk relevance scores makes residency score-driven and
+  restores deep recall.
+
+## gb10 access (the validation loop is LIVE — use it)
+
+The dev's Windows machine has passwordless SSH to the gb10. **Just use `ssh gb10`.**
+- gb10: `192.168.1.123` (`gx10-98db`, aarch64, CUDA 13), user `sascha_schneiders`.
+- Repo on gb10: `~/dev/public/atlas` (same fork: `origin` = `sschneiders/atlas`).
+- SSH alias `gb10` is in the Windows `~/.ssh/config`; key at
+  `~/Documents/keys/gb10/gb10_key` (Windows side). Test with:
+  `ssh -o BatchMode=yes gb10 "cd ~/dev/public/atlas && git rev-parse --abbrev-ref HEAD"`
+- Workflow: edit on Windows → `git push` → `ssh gb10 "cd ~/dev/public/atlas && git pull && cargo build --release"`
+  → run server + `tests/test_kvflash_validation.py` → read real output.
+- **Wildcard kernel rebuild** (needed to run the A3B): the build script
+  `/tmp/kv_wild.sh` on the gb10 sets `ATLAS_TARGET_MODEL=* ATLAS_TARGET_QUANT=*`.
+  The default `cargo build` compiles only `qwen3-next-80b-a3b` (won't load the A3B).
+  Most PTX is cached, so wildcard rebuilds are ~30s, not 15-30 min.
+- **ssh quoting gotcha**: PowerShell → ssh → bash quoting is brutal. For anything
+  non-trivial, write a script file to the gb10 first (`ssh gb10 'cat > /tmp/x.sh
+  << "SCRIPT" ... SCRIPT'`) then run it. Avoid `$()`, nested `"`, and `export VAR=*`
+  (globs!); prefix assignments `VAR=* cmd` do NOT glob and are safe.
+
+## The drafter = reuse the HSS Predictor (NOT a drafter model)
+
+The original plan (run Qwen3-0.6B + extract its attention) is **wrong for Atlas**:
+its attention kernels are fused and don't expose the weight matrix. Atlas already
+has the right mechanism — the **HSS `Predictor`** (`crates/spark-storage/src/predictor.rs`),
+which scores blocks as `Q_proj · K_lowrank` per-block relevance. It's the same
+relevance signal lucebox's drafter produces, without a second model or attention
+extraction. **Use it.**
+
+Predictor API (verified, standalone-constructible):
+- `Predictor::new_on_stream(stream, dims: PredictorDims, seed) -> Result<Self>` — loads
+  its own PTX (`q_lowrank_project`, `kv_lowrank_project`, `predictor_score`), allocates
+  the projection matrix P + the low-rank K store `A_g`. Self-contained — does NOT need
+  the HighSpeedSwap orchestrator. `PredictorDims { num_layers, num_q_heads, num_kv_heads,
+  head_dim, r (rank, try 32), block_size, max_blocks }`.
+- `project_kv_block_on_stream(stream, layer, block_id, k_block_dev)` — projects ONE K
+  block (BF16) into `A_g`. **K must be BF16** — the A3B's KV is FP8, so dequant first
+  (see below).
+- `project_q_on_stream(stream, q_dev, q_proj_dev)` — Q is `[num_q_heads, head_dim]` BF16.
+- `score_blocks_on_stream(stream, q_proj_dev, a_g_layer_ptr, block_scores_dev, max_blocks)`
+  — fills `block_scores_dev[block] = relevance` for ONE layer. Aggregate across the
+  attention layers (mean) to get per-chunk scores.
+
+## The integration (5 steps; each gets a gb10 compile + recall check)
+
+**Step 1 — Q-capture hook (spark-model). THE first step, deepest change.**
+The scorer needs the current decode Q. The decode Q is internal to the attention
+layers. Add a hook: one attention layer (or a chosen layer) writes its per-step Q
+(`[num_q_heads, head_dim]` BF16) to a pager-owned device buffer. Concretely: add a
+device buffer to the pager (or a thread-local), have the attention layer's decode
+path copy its Q there each step (`gpu.copy_d2d` or the Q is already on device — just
+stash the ptr). Then `kvflash_step` / the scorer reads it. Look at
+`crates/spark-model/src/layers/qwen3_attention/decode/run_paged_decode.rs` for where Q
+is materialized per step.
+
+**Step 2 — `A_g` population during eviction (spark-runtime pager).**
+In `kvflash_pager.rs::page_out_one`, after `kv_cache.read_block(layer, physical, gpu)`
+(which already reads K for the host store), ALSO project it into the Predictor's `A_g`
+via `project_kv_block_on_stream`. This is FREE — the K is already being read for
+eviction. `A_g` then holds the low-rank K of every paged-out block, which is exactly
+what the scorer scores to decide recall. (Always-resident blocks like the tail are
+never in `A_g` — fine, they don't need scoring; they're kept anyway.) For FP8 KV,
+dequant the read-back K to BF16 before projecting (Step 4).
+
+**Step 3 — `PredictorScorer` (spark-server).**
+New struct in `crates/spark-server/src/main_modules/serve_phases/` (near
+`load_kvflash_scorer` — it already builds a `WeightStore`-based scorer skeleton;
+replace/extend). Holds a `spark_storage::Predictor` + scratch buffers
+(`q_proj_dev`, `block_scores_dev`). Implements `KvFlashScorer`:
+`score_chunks` → `project_q` (using the stashed Q from Step 1) → loop layers:
+`score_blocks_on_stream` → aggregate to per-chunk mean → return `Vec<f32>`.
+Constructed in `install_kvflash` (needs the model dims — already available via
+`Model::kv_cache_dims()`), attached via `spark_runtime::kvflash_pager::set_scorer`.
+
+**Step 4 — FP8 dequant (the A3B's KV is FP8).**
+`PagedKvCache::read_block` returns raw FP8 bytes; the Predictor needs BF16 K. Reuse
+`crates/spark-runtime/src/kv_dequant.rs` (host-side dequant to BF16 — already used by
+the HSS predictor path, "Phase 6.2.c" per its docstring). Dequant in `page_out_one`
+before `project_kv_block`.
+
+**Step 5 — wire + validate.**
+Attach the scorer in `install_kvflash`. `maybe_reselect` already invokes `reselect`
+every τ steps when a scorer is attached (PR9) — no change needed there. Run
+`tests/test_kvflash_validation.py`: success = the **shallow-needle MISS → HIT**
+(relevant early-context chunk recalled) AND decode flatness stays ~0.92 (no
+regression from the projection/scoring overhead).
+
+## Gotchas / invariants
+
+- **`KvFlashScorer` is `Send`**; the Predictor must be movable to the scheduler thread
+  (it holds device ptrs — likely `Send` like the rest of spark-storage; verify on first
+  gb10 compile).
+- The scorer is called from `reselect`, which holds `&mut self` (pager) + `&mut kv_cache`
+  + `gpu`. The scorer (`self.scorer`) borrowing + `kv_cache` borrowing are distinct
+  objects — no aliasing, but watch the borrow in `reselect` (the existing code already
+  threads this correctly; mirror it).
+- **Don't regress the cap-compaction (PR8)**: attention must stay O(pool). The scorer
+  only decides WHICH pool-sized set is resident; it must not change the attention span.
+- The `DrafterScorer`/`CrossTokScorer` stubs in `kvflash_scorer.rs` and the
+  `load_kvflash_scorer` skeleton can be replaced/repurposed for the PredictorScorer —
+  they're dormant LRU-fallbacks.
+- `KvflashConfig.tau` (default 64) controls reselect cadence; the scorer runs every τ
+  decoded tokens. Projection/scoring cost must stay <~15% of decode or raise τ.
+
+## Validation command (on the gb10, after wiring)
+
+```bash
+# rebuild (wildcard, ~30s cached):
+ssh gb10 'cd ~/dev/public/atlas && /tmp/kv_wild.sh 2>&1 | tail -3'
+# start with the scorer (once --kvflash-policy implies scorer attach):
+ssh gb10 'cd ~/dev/public/atlas && target/release/spark serve Qwen/Qwen3.6-35B-A3B-FP8 --kvflash 1024 --kvflash-compact --port 8888 > /tmp/kv_srv.log 2>&1 &'
+# run the test:
+ssh gb10 'cd ~/dev/public/atlas && python3 tests/test_kvflash_validation.py --url http://localhost:8888 --pool 1024'
+```
+**Success**: `needle recall: {'shallow': 'HIT', ...}` (was MISS) + `decode flatness ~0.9`.
+
