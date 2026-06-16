@@ -70,6 +70,15 @@ struct SlotState {
     /// relevant paged-out chunks BEFORE the answer is generated — waiting τ
     /// steps would page them in too late. Cleared on the first reselect.
     first_reselect_pending: bool,
+    /// Number of leading logical blocks (the prompt prefix) always kept
+    /// resident — a coverage-based recall floor. Pure-LRU keeps only the
+    /// recent tail, so a fact stated early in the prompt (the shallow needle)
+    /// is paged out and unretrievable. Pinning the first `prefix_blocks`
+    /// makes the resident set "prefix + recent", covering both ends while
+    /// staying pool-sized (O(pool) attention, flatness preserved). Defaults
+    /// to pool/4 — enough to cover a ~5%-depth needle without crowding the
+    /// recent window (the deep needle stays in the recent tail).
+    prefix_blocks: usize,
 }
 
 /// The decode-loop pager. Installed thread-local after `bind_gpu_to_thread`.
@@ -190,6 +199,12 @@ impl KvflashPager {
         let mut residency = KvflashResidency::new(n);
         // Sink block 0 is always resident (FlashMemory always-resident floor).
         residency.protect(0);
+        // Prefix recall floor: pin the first `prefix_blocks` so a fact stated
+        // early in the prompt stays resident (re-asserted in sync_to_len as
+        // blocks arrive). pool/4 covers a ~5%-depth needle without crowding
+        // the recent window.
+        let prefix_blocks = (self.pool_blocks() / 4).max(1);
+        residency.protect_range(0, prefix_blocks);
         // NOTE: the trailing window is NOT protect()ed here — it slides as the
         // sequence grows, so it is derived dynamically at eviction time.
         self.slots.insert(
@@ -201,6 +216,7 @@ impl KvflashPager {
                 protected_tail_blocks,
                 steps_since_reselect: 0,
                 first_reselect_pending: true,
+                prefix_blocks,
             },
         );
     }
@@ -215,6 +231,10 @@ impl KvflashPager {
     pub fn sync_to_len(&mut self, slot: usize, new_len: usize) {
         if let Some(st) = self.slots.get_mut(&slot) {
             st.residency.grow(new_len);
+            // Re-assert the prefix recall floor as new blocks arrive (grow
+            // marks new entries unprotected; the leading prefix must stay
+            // pinned). Idempotent + clamped to total.
+            st.residency.protect_range(0, st.prefix_blocks);
         }
     }
 
