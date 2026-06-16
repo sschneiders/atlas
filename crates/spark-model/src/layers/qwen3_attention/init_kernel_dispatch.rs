@@ -163,6 +163,16 @@ pub(super) fn kernel_modules_for_dtype(
             "paged_decode_fp8",
             "paged_decode_attn_fp8",
         ),
+        // FibQuant: the .cu kernels land in Step 3; the module/fn names are
+        // fixed here so the dispatch table is exhaustive and the dtype wires
+        // end-to-end the moment the kernels are added. `init.rs` will fail at
+        // runtime (`gpu.kernel(...)?`) until then — intended incremental flow.
+        KvCacheDtype::FibQuant => (
+            "reshape_and_cache_fibquant",
+            "reshape_and_cache_flash_fibquant",
+            "paged_decode_fibquant",
+            "paged_decode_attn_fibquant",
+        ),
     }
 }
 
@@ -195,6 +205,7 @@ mod tests {
             KvCacheDtype::Turbo4KTurbo3V,
             KvCacheDtype::Turbo4KTurbo8V,
             KvCacheDtype::Turbo3KTurbo8V,
+            KvCacheDtype::FibQuant,
         ];
         for &d in ALL {
             for &hd in &[128usize, 256] {
@@ -265,6 +276,7 @@ mod tests {
             (KvCacheDtype::Turbo3, "paged_decode_attn_turbo3"),
             (KvCacheDtype::Turbo2, "paged_decode_attn_turbo2"),
             (KvCacheDtype::Turbo8, "paged_decode_attn_turbo8"),
+            (KvCacheDtype::FibQuant, "paged_decode_attn_fibquant"),
         ];
         for &(d, want) in cases {
             for &hd in &[128usize, 256] {

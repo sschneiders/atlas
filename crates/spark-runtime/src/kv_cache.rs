@@ -10,6 +10,17 @@ use anyhow::{Result, bail};
 
 pub(crate) const NVFP4_GROUP_SIZE: usize = 16;
 
+/// FibQuant block dimension `k` (arXiv:2605.11478). Must divide `head_dim`.
+/// k=4 divides every supported model's head_dim (64/128/256/512) and yields
+/// the Step-1 8× operating point (rate = log2(N)/k bits/coord) at ~0.99
+/// attention cosine on real KV. See `docs/design/fibquant-kv-compression.md`.
+pub(crate) const FIBQUANT_K: usize = 4;
+/// FibQuant codebook size `N` → 1-byte indices (N ≤ 256). With k=4 this is
+/// ~8× compression vs bf16. The codebook is a precomputed constant (no
+/// calibration); the same `(k, N, seed)` is shared by host (atlas-quant) and
+/// the `.cu` kernel (Step 3).
+pub(crate) const FIBQUANT_N: usize = 256;
+
 /// KV cache quantization dtype.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvCacheDtype {
@@ -71,6 +82,15 @@ pub enum KvCacheDtype {
     /// llama-cpp-turboquant's `q8_0/turbo2`). Best compression-to-quality
     /// ratio for turbo2 V on tested models.
     Fp8KTurbo2V,
+    /// FibQuant vector quantization (arXiv:2605.11478): normalize → shared Haar
+    /// rotation → k-dim radial-angular codebook (Beta-quantile radii ×
+    /// Fibonacci directions + Lloyd-Max). Stores `{fp16 norm, codebook index}`
+    /// per vector — ~8× compression at ~0.99 attention cosine (Step 1).
+    /// Compression-bounded residency: the full context stays resident, so
+    /// nothing is evicted and mid-depth recall is retained by construction
+    /// (the gap KVFlash paging could not close). See
+    /// `docs/design/fibquant-kv-compression.md`.
+    FibQuant,
 }
 
 impl std::fmt::Display for KvCacheDtype {
@@ -92,6 +112,7 @@ impl std::fmt::Display for KvCacheDtype {
             KvCacheDtype::Fp8KTurbo3V => write!(f, "fp8k_turbo3v"),
             KvCacheDtype::Bf16KTurbo2V => write!(f, "bf16k_turbo2v"),
             KvCacheDtype::Fp8KTurbo2V => write!(f, "fp8k_turbo2v"),
+            KvCacheDtype::FibQuant => write!(f, "fibquant"),
         }
     }
 }
@@ -167,9 +188,11 @@ impl std::str::FromStr for KvCacheDtype {
             "fp8k_turbo3v" | "fp8k3v" => Ok(KvCacheDtype::Fp8KTurbo3V),
             "bf16k_turbo2v" | "bf16k2v" => Ok(KvCacheDtype::Bf16KTurbo2V),
             "fp8k_turbo2v" | "fp8k2v" => Ok(KvCacheDtype::Fp8KTurbo2V),
+            "fibquant" => Ok(KvCacheDtype::FibQuant),
             other => bail!(
-                "Unsupported --kv-cache-dtype '{other}'. Symmetric: 'bf16', 'fp8', 'nvfp4', 'turbo4', 'turbo3', 'turbo8'. \
-                Asymmetric (TQ+): turbo*_turbo*v, bf16k_turbo[34]v (safer asym: K baseline, V compressed), fp8k_turbo[34]v."
+                "Unsupported --kv-cache-dtype '{other}'. Symmetric: 'bf16', 'fp8', 'nvfp4', \
+                 'turbo4', 'turbo3', 'turbo8', 'fibquant'. \
+                 Asymmetric (TQ+): turbo*_turbo*v, bf16k_turbo[34]v (safer asym: K baseline, V compressed), fp8k_turbo[34]v."
             ),
         }
     }
@@ -265,6 +288,13 @@ impl KvCacheConfig {
                 // a 256× precision improvement on the per-group scaling.
                 let num_groups = elems / NVFP4_GROUP_SIZE;
                 elems + num_groups * 2 // 1 byte data + BF16 scale per group
+            }
+            KvCacheDtype::FibQuant => {
+                // Per (token, kv_head) vector: 1 fp16 norm (2 B) +
+                // (head_dim / FIBQUANT_K) 1-byte codebook indices (N=256 ⇒ 1 B).
+                // ~8× vs bf16 at k=4, N=256.
+                let n_vecs = self.block_size * nkv;
+                n_vecs * (2 + hd / FIBQUANT_K)
             }
         }
     }

@@ -220,6 +220,7 @@ pub fn build_model(
             | KvCacheDtype::Fp8KTurbo3V
             | KvCacheDtype::Fp8KTurbo2V => "FP8",
             KvCacheDtype::Nvfp4 => "NVFP4",
+            KvCacheDtype::FibQuant => "FibQuant",
             KvCacheDtype::Turbo3 | KvCacheDtype::Turbo3KTurbo8V | KvCacheDtype::Turbo2 => "Turbo3",
             KvCacheDtype::Turbo4 | KvCacheDtype::Turbo4KTurbo3V | KvCacheDtype::Turbo4KTurbo8V => {
                 "Turbo4"

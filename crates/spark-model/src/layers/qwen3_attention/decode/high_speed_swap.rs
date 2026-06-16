@@ -288,6 +288,17 @@ impl Qwen3AttentionLayer {
                     dequant_turbo8_block_to_bf16(&k_raw, bs_us, nkv_us, hd_us, &mut k_host);
                     dequant_turbo8_block_to_bf16(&v_raw, bs_us, nkv_us, hd_us, &mut v_host);
                 }
+                KvCacheDtype::FibQuant => {
+                    // Host-side FibQuant dequant (codebook gather + Πᵀ) is not
+                    // wired into the HSS offload path yet (Step 3+). FibQuant's
+                    // purpose is to keep the whole context HBM-resident, so HSS
+                    // eviction is not its primary mechanism; fail loudly rather
+                    // than silently mis-dequant.
+                    anyhow::bail!(
+                        "FibQuant KV cache + --high-speed-swap is not yet supported; \
+                         run without --high-speed-swap or use a different --kv-cache-dtype"
+                    );
+                }
             }
             spark_storage::with_local(|hss| {
                 match layer_dtype {

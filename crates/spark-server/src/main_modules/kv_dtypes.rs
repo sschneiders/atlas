@@ -28,7 +28,9 @@ pub(crate) fn auto_high_precision_layers(
 ) -> Option<usize> {
     use spark_runtime::kv_cache::KvCacheDtype as D;
     match kv_dtype {
-        D::Bf16 | D::Fp8 | D::Nvfp4 => None,
+        // FibQuant is near-lossless (~0.99 attention cosine, Step 1) — like
+        // bf16/fp8 it needs no high-precision boundary layers.
+        D::Bf16 | D::Fp8 | D::Nvfp4 | D::FibQuant => None,
         D::Turbo2 | D::Bf16KTurbo3V => Some(((num_attention_layers * 4).div_ceil(5)).max(4)),
         D::Turbo3
         | D::Turbo4
