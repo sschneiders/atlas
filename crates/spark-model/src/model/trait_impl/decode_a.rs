@@ -123,7 +123,23 @@ impl TransformerModel {
                     bs,
                     self.dummy_kv_block,
                 ) {
-                    Some((resident, reduced)) => (reduced as i32, Some(resident)),
+                    Some((resident, reduced)) => {
+                        // One-shot diagnostic: confirms compaction engaged at
+                        // the decode site + the actual reduction. Remove after
+                        // PR8 validation.
+                        static COMPACT_ENGAGED: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !COMPACT_ENGAGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            tracing::info!(
+                                "KVFlash compaction ENGAGED (decode_a): {} logical blocks -> {} \
+                                 resident, seq_len {} -> {reduced}",
+                                seq.block_table.len(),
+                                resident.len(),
+                                seq.seq_len + 1
+                            );
+                        }
+                        (reduced as i32, Some(resident))
+                    }
                     None => ((seq.seq_len + 1) as i32, None),
                 }
             } else {

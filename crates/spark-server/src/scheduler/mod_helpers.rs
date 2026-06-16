@@ -90,11 +90,19 @@ pub(super) fn install_kvflash(model: &dyn Model, cfg: Option<spark_runtime::Kvfl
             // consumed by install; referencing cfg.pool_tokens afterward is a
             // use-after-move).
             let pool_blocks = cfg.pool_tokens / block_size.max(1) as usize;
+            let compact = cfg.compact;
             spark_runtime::kvflash_pager::install(cfg, block_size, num_layers);
             tracing::info!(
                 "KVFlash pager installed on scheduler thread: block_size={block_size}, \
-                 num_layers={num_layers}, pool_blocks={pool_blocks}"
+                 num_layers={num_layers}, pool_blocks={pool_blocks}, compact={compact}"
             );
+            if compact {
+                tracing::warn!(
+                    "KVFlash block compaction ENABLED — decode attention will iterate over the \
+                     resident pool only (O(pool)). Experimental (PR8): validate output \
+                     correctness vs the dummy-mask MVP."
+                );
+            }
         }
         None => {
             tracing::warn!(
