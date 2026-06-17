@@ -9,6 +9,7 @@ started with --kv-cache-dtype fibquant / fp8 to compare.
 import json
 import sys
 import time
+import urllib.error
 import urllib.request
 
 FILLER = "The quick brown fox jumps over the lazy dog by the riverbank at dawn. "
@@ -43,6 +44,10 @@ def run(url, target_tokens=131072, max_tokens=50):
     try:
         with urllib.request.urlopen(req, timeout=900) as r:
             d = json.load(r)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:500]
+        print(f"  HTTP {e.code}: {body}")
+        return
     except Exception as e:
         print(f"  ERROR: {e}")
         return
