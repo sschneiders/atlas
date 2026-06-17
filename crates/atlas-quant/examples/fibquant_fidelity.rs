@@ -18,7 +18,7 @@
 
 use std::env;
 
-use atlas_quant::fibquant::{FibQuantCodec, Rotation, attention_output_cosine, mean_vector_cosine};
+use atlas_quant::fibquant::{FibQuantCodec, Rotation, attention_output_cosine};
 use half::bf16;
 use rand::{Rng, SeedableRng};
 use rand_distr::StandardNormal;
@@ -103,26 +103,34 @@ fn run_real_kv(path: &str) {
     println!("d={d} nkv={nkv} nq={nq} T={t} (rate sweep over K and V)");
     let rates: &[(usize, usize)] = &[(2, 16), (2, 64), (2, 256), (4, 256), (4, 1024)];
     println!(
-        "{:>4} {:>6} {:>9} {:>11} {:>10} {:>12}",
-        "k", "N", "rate(b)", "compress", "k_vec_cos", "attn_cos"
+        "{:>4} {:>6} {:>9} {:>11} {:>10} {:>10} {:>10} {:>10}",
+        "k", "N", "rate(b)", "compress", "attn(K+V)", "attn(Konly)", "attn(Vonly)", "V_hurts?"
     );
     for &(k, n) in rates {
         let codec = build_codec(d, k, n);
         let kh = codec.decode_tensor(&codec.encode_tensor(&kf));
         let vh = codec.decode_tensor(&codec.encode_tensor(&vf));
-        let k_cos = mean_vector_cosine(&kf, &kh, d);
-        let attn = attention_output_cosine(&kf, &vf, &kh, &vh, &qf, t, nkv, nq, d);
+        // V-policy isolation (#8): compare symmetric (both compressed) vs K-only
+        // (K compressed, V original) vs V-only (K original, V compressed). If
+        // K-only ≈ symmetric, V compression adds nothing → ship symmetric (max
+        // compression). If K-only >> symmetric, V compression hurts quality.
+        let attn_both = attention_output_cosine(&kf, &vf, &kh, &vh, &qf, t, nkv, nq, d);
+        let attn_konly = attention_output_cosine(&kf, &vf, &kh, &vf, &qf, t, nkv, nq, d);
+        let attn_vonly = attention_output_cosine(&kf, &vf, &kf, &vh, &qf, t, nkv, nq, d);
+        let v_hurts = attn_konly - attn_both; // > 0 means V compression degrades
         println!(
-            "{:>4} {:>6} {:>9.3} {:>10.1}× {:>10.4} {:>12.4}",
+            "{:>4} {:>6} {:>9.3} {:>10.1}× {:>10.4} {:>10.4} {:>10.4} {:>+10.4}",
             k,
             n,
             codec.rate_bits(),
             codec.compression_vs_fp16(),
-            k_cos,
-            attn
+            attn_both,
+            attn_konly,
+            attn_vonly,
+            v_hurts,
         );
     }
-    println!("\nSuccess target: attn_cos ≥ 0.95 at the chosen 4×/8× rate.");
+    println!("\nV_hurts? > 0: V compression adds quality loss. ≈0: symmetric is optimal.");
 }
 
 /// Parse `FKV1` → `(d, nkv, nq, T, k[T*nkv*d], v[..], q[nq*d])` as `f64`.
