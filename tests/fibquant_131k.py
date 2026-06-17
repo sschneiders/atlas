@@ -63,5 +63,6 @@ def run(url, target_tokens=131072, max_tokens=50):
 if __name__ == "__main__":
     url = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8888"
     label = sys.argv[2] if len(sys.argv) > 2 else "?"
-    print(f"[{label}] 131K-context test:")
-    run(url)
+    target = int(sys.argv[3]) if len(sys.argv) > 3 else 131072
+    print(f"[{label}] {target//1024}K-context test:")
+    run(url, target_tokens=target)
