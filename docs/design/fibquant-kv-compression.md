@@ -266,6 +266,13 @@ Remaining (perf / feature / blocked — separate focused efforts):
   unaligned. Profile vs Turbo4, then: vectorized `uint4` index loads, norm
   broadcast, payload alignment, the paper's hierarchical list decoding (App. F).
   Needs a profiling session — not safe to do blind.
+  **Profiled: FibQuant is at parity.** Decode tok/s vs Turbo4 on the A3B:
+  63.5 vs 64.3 (260-tok ctx), 59.6 vs 59.4 (3.2K-tok ctx) — within noise. TTFT
+  identical. The A3B's MoE-dominated decode (10 attn / 40 layers) makes the
+  attention kernel a small fraction of step time, and the 4 KB codebook smem is
+  fast on sm_121. **No optimization opportunity — the clone-from-Turbo4 kernels
+  are already production-grade performance.** Profiling tools:
+  `tests/fibquant_perf.py` (short ctx) + `tests/fibquant_perf_long.py` (long ctx).
 - **#7 (tunable rate):** v1 is fixed k=4,N=256 (8×). `FIB_K`/`FIB_N` are
   compile-time `#define`s in the kernels, so a runtime rate needs either
   multiple compiled variants (like Turbo{2,3,4,8}) or parameterizing the
