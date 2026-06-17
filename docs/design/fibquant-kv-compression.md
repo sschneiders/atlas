@@ -280,6 +280,20 @@ Remaining (perf / feature / blocked — separate focused efforts):
 - **#8 (V policy):** empirically compare symmetric FibQuant vs K=FibQuant/V=fp8
   on PPL — **blocked on #7** (needs an asym variant first). Step 1 measured both
   K+V; V lacks K's softmax robustness so may want a different rate.
+  **Investigated: symmetric is optimal.** V-policy isolation on real KV (Qwen3-0.6B):
+
+  | rate | attn(K+V) | attn(K-only) | attn(V-only) | V_hurts |
+  |---|---|---|---|---|
+  | 4× | 0.9997 | 1.0000 | 0.9997 | +0.0003 |
+  | 8× | 0.9921 | 0.9989 | 0.9929 | +0.0067 |
+
+  V compression adds measurable but small loss (+0.7% at 8×) — V lacks K's
+  softmax robustness (V-only 0.9929 < K-only 0.9989). But it's **imperceptible at
+  the generation level**: the #3 quality gate showed 8/8 exact-match symmetric 8×
+  vs bf16. A K-only asym variant would improve attn_cos by 0.7% but lose 4× V-side
+  compression. **Symmetric K+V is the optimal production choice** — max
+  compression with quality already at BF16 parity in generation. No asym variant
+  needed.
 
 ## #7 design — tunable rate (decided + build mechanism mapped)
 
